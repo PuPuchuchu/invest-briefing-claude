@@ -12,6 +12,7 @@ from src.fundamentals.sec_history import (
     validate_history,
 )
 from src.fundamentals.sec_normalizer import find_concept
+from src.fundamentals.sec_historical import CONCEPT_MAP
 
 
 # ============================================================
@@ -19,15 +20,6 @@ from src.fundamentals.sec_normalizer import find_concept
 # ============================================================
 
 RAW_DIR = Path("data/raw/sec")
-
-TICKERS = {
-    "MSFT": {
-        "revenue_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
-    },
-    "NVDA": {
-        "revenue_concept": "RevenueFromContractWithCustomerExcludingAssessedTax",
-    },
-}
 
 
 # ============================================================
@@ -47,21 +39,67 @@ def load_companyfacts(ticker: str) -> dict:
 
 
 def get_revenue_concept(data: dict, ticker: str) -> dict:
-    concept_name = TICKERS[ticker]["revenue_concept"]
+    """
+    Resolve the revenue concept to use for real-data tests.
 
-    concept = find_concept(
-        data,
-        "us-gaap",
-        concept_name,
-    )
+    Different companies tag revenue under different us-gaap
+    concepts depending on filing type and period (e.g. NVDA's
+    10-K filings use RevenueFromContractWithCustomerExcludingAssessedTax
+    while its 10-Q filings use the older Revenues tag -- confirmed
+    directly against data.sec.gov/api/xbrl/companyconcept/).
 
-    if concept is None:
-        pytest.skip(
-            f"{ticker}: revenue concept not found: "
-            f"{concept_name}"
+    Reuses the same candidate priority order already established
+    for production normalization (src/fundamentals/sec_historical.py
+    CONCEPT_MAP["revenue"]) rather than hardcoding a single concept
+    per ticker, so this test does not silently diverge from how the
+    pipeline itself resolves revenue.
+
+    Among the candidates that exist for this company, prefers one
+    that actually carries 10-Q (quarterly) observations, since that
+    is what standalone-quarter reconstruction requires. Falls back
+    to the first candidate with any data if none has quarterly
+    observations.
+    """
+    candidates = CONCEPT_MAP["revenue"]
+
+    fallback = None
+    fallback_name = None
+
+    for namespace, concept_name in candidates:
+
+        concept = find_concept(
+            data,
+            namespace,
+            concept_name,
         )
 
-    return concept
+        if concept is None:
+            continue
+
+        if fallback is None:
+            fallback = concept
+            fallback_name = concept_name
+
+        units = concept.get("units", {})
+
+        has_quarterly = any(
+            isinstance(observation, dict)
+            and observation.get("form") == "10-Q"
+            for unit_observations in units.values()
+            if isinstance(unit_observations, list)
+            for observation in unit_observations
+        )
+
+        if has_quarterly:
+            return concept
+
+    if fallback is not None:
+        return fallback
+
+    pytest.skip(
+        f"{ticker}: no revenue concept found among candidates: "
+        f"{[name for _, name in candidates]}"
+    )
 
 
 # ============================================================
@@ -145,7 +183,11 @@ def test_real_annual_history_has_numeric_values(ticker):
     assert len(history) >= 1
 
     for record in history:
-        assert isinstance(record["value"], (int, float))
+        # extract_annual_history() preserves the original SEC
+        # observation as-is, so the numeric field is "val" (SEC's
+        # real field name), not "value" (only used by synthetic
+        # test fixtures elsewhere in this codebase).
+        assert isinstance(record["val"], (int, float))
         assert record.get("start") is not None
         assert record.get("end") is not None
         assert record.get("filed") is not None
@@ -177,15 +219,18 @@ def test_real_standalone_quarters_have_provenance(ticker):
 
     assert len(standalone) >= 1
 
+    # Note: reconstruct_standalone_quarters() (src/fundamentals/
+    # sec_history.py) has no "status" or "period_type" field -- a
+    # quarter is either successfully reconstructed and present in
+    # this list, or not reconstructable and simply absent (there is
+    # no separate "FAILED" entry). The per-quarter fields actually
+    # produced are: quarter, value, period_start, period_end,
+    # filed, form, fy, accession, reconstructed, source (with
+    # source["current"] / source["previous"]).
     for quarter in standalone:
-        assert quarter["status"] == "OK"
         assert isinstance(
             quarter["value"],
             (int, float),
-        )
-
-        assert quarter["period_type"] == (
-            "standalone_quarter"
         )
 
         assert quarter["quarter"] in {
@@ -199,7 +244,7 @@ def test_real_standalone_quarters_have_provenance(ticker):
         assert quarter["filed"] is not None
 
         assert "source" in quarter
-        assert "current_observation" in quarter["source"]
+        assert "current" in quarter["source"]
 
 
 # ============================================================
