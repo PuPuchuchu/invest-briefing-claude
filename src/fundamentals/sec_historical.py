@@ -52,6 +52,13 @@ CONCEPT_MAP = {
     ],
     "noncurrent_debt": [
         ("us-gaap", "LongTermDebtNoncurrent"),
+        # Fallback confirmed against real SEC data: Oracle
+        # (CIK 0001341439) has zero observations under
+        # LongTermDebtNoncurrent (404 from data.sec.gov) and
+        # instead tags its noncurrent debt under LongTermNotesPayable
+        # (86 real observations spanning 2009-2026, e.g. $122.3B as
+        # of FY2026-05-31, filed 2026-06-22, form 10-K).
+        ("us-gaap", "LongTermNotesPayable"),
     ],
     "shares_outstanding": [
         ("dei", "EntityCommonStockSharesOutstanding"),
