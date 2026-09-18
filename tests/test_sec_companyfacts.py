@@ -724,6 +724,15 @@ def normalize_company(
             data,
             "current_debt",
             [
+                # Confirmed against real SEC data: Oracle
+                # (CIK 0001341439) tags its current debt under
+                # DebtCurrent (87 real observations, e.g. $7.2B as
+                # of FY2026-05-31, filed 2026-06-22, form 10-K) --
+                # this candidate was previously missing here even
+                # though it was already present in the production
+                # concept map (src/fundamentals/sec_historical.py),
+                # so this list is now brought in line with that.
+                "DebtCurrent",
                 "LongTermDebtCurrent",
                 "ShortTermBorrowings",
                 "ShortTermDebt",
@@ -749,6 +758,14 @@ def normalize_company(
             "noncurrent_debt",
             [
                 "LongTermDebtNoncurrent",
+                # Confirmed against real SEC data: Oracle
+                # (CIK 0001341439) has zero observations under
+                # LongTermDebtNoncurrent (404 from data.sec.gov)
+                # and instead tags its noncurrent debt under
+                # LongTermNotesPayable (86 real observations
+                # spanning 2009-2026, e.g. $122.3B as of
+                # FY2026-05-31, filed 2026-06-22, form 10-K).
+                "LongTermNotesPayable",
             ],
         )
 
