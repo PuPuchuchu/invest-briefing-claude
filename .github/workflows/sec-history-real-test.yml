@@ -23,6 +23,7 @@ jobs:
           pip install pytest
 
       - name: Fetch SEC Company Facts
+        continue-on-error: true
         env:
           SEC_USER_AGENT: "invest-briefing-claude/0.1 chks7788@gmail.com"
         run: |
