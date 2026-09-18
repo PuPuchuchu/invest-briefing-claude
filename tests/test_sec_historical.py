@@ -1497,6 +1497,80 @@ def test_find_best_concept_resolves_salesrevenuenet_only_company():
     assert result["observations"][0]["val"] == 500
 
 
+def test_noncurrent_debt_concept_map_includes_longtermnotespayable():
+    """
+    Regression test (2026-09-18): CONCEPT_MAP's noncurrent_debt
+    candidates previously only listed LongTermDebtNoncurrent.
+    Confirmed against real SEC data that Oracle Corporation
+    (CIK 0001341439) has zero observations under LongTermDebtNoncurrent
+    (404 from data.sec.gov/api/xbrl/companyconcept/) and instead tags
+    its noncurrent debt under LongTermNotesPayable (86 real
+    observations spanning 2009-2026, e.g. $122.3B as of
+    FY2026-05-31, filed 2026-06-22, form 10-K) -- a company relying
+    solely on that tag would previously resolve noncurrent_debt as
+    missing here even though the real data exists.
+    """
+    assert (
+        "us-gaap",
+        "LongTermNotesPayable",
+    ) in CONCEPT_MAP["noncurrent_debt"]
+
+    # LongTermDebtNoncurrent stays the primary (semantically precise)
+    # candidate; LongTermNotesPayable is the fallback for companies
+    # (like Oracle) that only tag the alternate concept.
+    noncurrent_debt_candidates = CONCEPT_MAP["noncurrent_debt"]
+    assert noncurrent_debt_candidates.index(
+        ("us-gaap", "LongTermDebtNoncurrent")
+    ) < noncurrent_debt_candidates.index(
+        ("us-gaap", "LongTermNotesPayable")
+    )
+
+
+def test_find_best_concept_resolves_longtermnotespayable_only_company():
+    """
+    A company that only ever tagged noncurrent debt as
+    LongTermNotesPayable (no LongTermDebtNoncurrent) must still
+    resolve via find_best_concept(). Before the CONCEPT_MAP fix,
+    this returned None -- the exact Oracle case confirmed against
+    real SEC data (see test above).
+    """
+    observation, unit = make_observation(
+        122_342_000_000,
+        start=None,
+        end="2026-05-31",
+        filed="2026-06-22",
+        form="10-K",
+        fy=2026,
+        fp="FY",
+        accn="0000000000-26-000002",
+    )
+
+    data = {
+        "cik": 2,
+        "entityName": "ORACLE-LIKE CO",
+        "facts": {
+            "us-gaap": {
+                "LongTermNotesPayable": {
+                    "label": "Long-term Notes Payable",
+                    "units": {
+                        unit: [observation],
+                    },
+                },
+            },
+        },
+    }
+
+    result = find_best_concept(
+        data,
+        "noncurrent_debt",
+        instant=True,
+    )
+
+    assert result is not None
+    assert result["concept"] == "LongTermNotesPayable"
+    assert result["observations"][0]["val"] == 122_342_000_000
+
+
 # ============================================================
 # OPTIONAL REAL SEC CACHE SMOKE TESTS
 # ============================================================
