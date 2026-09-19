@@ -36,7 +36,7 @@ from datetime import date, datetime
 from typing import Any
 
 from src.fundamentals.sec_normalizer import find_concept
-from src.fundamentals.sec_history import extract_concept_history
+from src.fundamentals.sec_history import extract_concept_history, validate_history
 
 SCHEMA_VERSION = "point_in_time_v0.1"
 
@@ -206,4 +206,141 @@ def get_point_in_time_history(
     history["namespace"] = namespace
     history["concept"] = concept_name
 
+    # This is the one function in the whole SEC data pipeline whose
+    # entire job is preventing look-ahead bias (see module docstring),
+    # so its own output is self-validated here rather than left to be
+    # checked only if a caller happens to remember to. See
+    # validate_point_in_time_history() below for what this actually
+    # checks -- notably, it independently re-verifies filed <=
+    # evaluation_date on every underlying observation, not just that
+    # the shape of the result looks right.
+    validation_failures = validate_point_in_time_history(
+        history,
+        evaluation_date,
+    )
+
+    if validation_failures:
+        raise ValueError(
+            f"get_point_in_time_history() produced invalid output for "
+            f"{namespace}:{concept_name} as of "
+            f"{evaluation_date.isoformat()}: {validation_failures}"
+        )
+
     return history
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def _all_observation_filed_dates(record: dict) -> list[Any]:
+    """
+    Collect every 'filed' value referenced by one annual/quarterly/
+    standalone-quarter record -- including, for a derived standalone
+    quarter, the filed dates buried inside its "source" sub-observations
+    (see sec_history._make_reconstructed_quarter) -- so
+    validate_point_in_time_history() below can check ALL of them, not
+    just the top-level one. A derived quarter (e.g. Q2 = H1 - Q1) is
+    only genuinely point-in-time-safe if BOTH the current and the
+    previous cumulative observation it was built from were filed on or
+    before evaluation_date.
+    """
+    dates = [record.get("filed")]
+
+    source = record.get("source")
+
+    if isinstance(source, dict):
+        for key in ("current", "previous"):
+            sub = source.get(key)
+
+            if isinstance(sub, dict):
+                dates.append(sub.get("filed"))
+
+    return dates
+
+
+def validate_point_in_time_history(
+    result: dict | None,
+    evaluation_date: Any,
+) -> list[str]:
+    """
+    Validate the output of get_point_in_time_history().
+
+    A None result (the concept did not exist in the source data at all)
+    is a valid, expected outcome -- callers must check for None
+    themselves before calling this; passing None here is reported as a
+    failure, not silently accepted.
+
+    Beyond the base structural checks already performed by
+    sec_history.validate_history() (schema_version/annual/quarterly/
+    standalone_quarters), this adds the two things that are specific to
+    -- and the entire reason for -- this module:
+
+        1. the three point-in-time provenance fields this layer adds
+           (evaluation_date/namespace/concept) are present, and
+           evaluation_date on the result matches what the caller
+           actually asked for;
+        2. every single observation actually used to build annual,
+           quarterly AND standalone_quarters (including the raw
+           observations buried inside a derived quarter's own "source"
+           block) was genuinely filed on or before evaluation_date --
+           i.e. the look-ahead-bias gate this whole module exists to
+           enforce was not violated by a bug upstream in
+           sec_normalizer.find_concept or
+           sec_history.extract_concept_history. This is checked
+           independently here rather than trusted, because it is the
+           single most consequential invariant in this codebase.
+
+    Returns:
+        [] when valid
+        list[str] of failure identifiers otherwise
+    """
+    if not isinstance(result, dict):
+        return ["root"]
+
+    failures = list(validate_history(result))
+
+    for key in ("evaluation_date", "namespace", "concept"):
+        if key not in result:
+            failures.append(key)
+
+    cutoff = coerce_evaluation_date(evaluation_date)
+
+    result_cutoff = _parse_date(result.get("evaluation_date"))
+
+    if result_cutoff is None:
+        failures.append("evaluation_date")
+    elif result_cutoff != cutoff:
+        failures.append("evaluation_date_mismatch")
+
+    def _check_records(label: str, records: Any) -> None:
+        if not isinstance(records, list):
+            return
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            for filed_value in _all_observation_filed_dates(record):
+                filed = _parse_date(filed_value)
+
+                if filed is None or filed > cutoff:
+                    failures.append(f"{label}.look_ahead_bias")
+                    return
+
+    # "annual" and "standalone_quarters" are flat lists of records.
+    _check_records("annual", result.get("annual"))
+    _check_records("standalone_quarters", result.get("standalone_quarters"))
+
+    # "quarterly" (see sec_history.extract_quarterly_history) is NOT a
+    # flat list -- it is a dict of raw-observation buckets (q1/ytd_6m/
+    # ytd_9m/unknown), already checked structurally above via
+    # validate_history(). Each bucket still needs the same look-ahead
+    # check as everything else.
+    quarterly = result.get("quarterly")
+
+    if isinstance(quarterly, dict):
+        for bucket_name, bucket_records in quarterly.items():
+            _check_records(f"quarterly.{bucket_name}", bucket_records)
+
+    return failures
