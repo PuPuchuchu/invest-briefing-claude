@@ -696,6 +696,26 @@ def calculate_derived_metrics(
             capex_history,
         )
 
+    # --------------------------------------------------------
+    # Self-validation (2026-09-19): validate_derived_metrics() below
+    # already existed and was already exercised by
+    # tests/test_derived_metrics.py, but was never actually called from
+    # within calculate_derived_metrics() itself -- so a real bug that
+    # produced malformed output would have gone uncaught outside of the
+    # specific fixtures the test suite happens to cover. A
+    # validate_derived_metrics() failure here means this function's OWN
+    # output doesn't match its own documented schema, which is a
+    # programming defect, not a data-availability question (those are
+    # already handled per-metric via OK/MISSING/INVALID status) -- so
+    # it fails loudly rather than silently returning malformed data.
+    validation_failures = validate_derived_metrics(result)
+
+    if validation_failures:
+        raise ValueError(
+            f"calculate_derived_metrics() produced invalid output for "
+            f"{ticker!r}: {validation_failures}"
+        )
+
     return result
 
 
