@@ -1172,6 +1172,25 @@ def calculate_quality(
             "reason": financial_note,
         }
 
+    # --------------------------------------------------------
+    # Self-validation (2026-09-19): validate_quality() below already
+    # existed and was already exercised by tests/test_quality.py, but
+    # was never actually called from within calculate_quality() itself
+    # -- so a real bug that produced malformed output would have gone
+    # uncaught outside of the specific fixtures the test suite happens
+    # to cover. A validate_quality() failure here means this function's
+    # OWN output doesn't match its own documented schema, which is a
+    # programming defect, not a data-availability question (those are
+    # already handled per-component via OK/MISSING/INVALID status) --
+    # so it fails loudly rather than silently returning malformed data.
+    validation_failures = validate_quality(result)
+
+    if validation_failures:
+        raise ValueError(
+            f"calculate_quality() produced invalid output for "
+            f"{ticker!r}: {validation_failures}"
+        )
+
     return result
 
 
