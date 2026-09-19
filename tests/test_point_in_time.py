@@ -19,6 +19,7 @@ from src.fundamentals.point_in_time import (
     filter_observations_as_of,
     as_of_concept_data,
     get_point_in_time_history,
+    validate_point_in_time_history,
 )
 
 
@@ -273,3 +274,164 @@ def test_get_point_in_time_history_carries_metadata():
 
 def test_module_has_its_own_schema_version():
     assert SCHEMA_VERSION == "point_in_time_v0.1"
+
+
+# ============================================================
+# validate_point_in_time_history
+# ============================================================
+# Regression coverage (2026-09-19): validate_point_in_time_history()
+# was added alongside wiring get_point_in_time_history() to
+# self-validate its own output (see that function's docstring). These
+# tests exercise the validator directly with hand-crafted results,
+# since get_point_in_time_history()'s own gating already prevents a
+# real look-ahead-bias leak through the public API -- the whole point
+# of this validator is to catch that leak if a future bug in
+# sec_normalizer.find_concept or sec_history.extract_concept_history
+# ever reintroduces one upstream of it.
+
+def _valid_synthetic_result():
+    """A hand-built, already-valid get_point_in_time_history()-shaped
+    result, used as the baseline that individual tests below corrupt
+    one field at a time."""
+    return {
+        "schema_version": "sec_history_v0.1",
+        "label": "Revenues",
+        "description": None,
+        "annual": [
+            {
+                "start": "2024-01-01",
+                "end": "2024-12-31",
+                "val": 1000,
+                "filed": "2025-02-01",
+                "form": "10-K",
+                "fy": 2024,
+                "fp": "FY",
+                "accn": "0000000000-25-000001",
+            },
+        ],
+        "quarterly": {
+            "q1": [
+                {
+                    "start": "2025-01-01",
+                    "end": "2025-03-31",
+                    "val": 250,
+                    "filed": "2025-05-01",
+                    "form": "10-Q",
+                    "fy": 2025,
+                    "fp": "Q1",
+                    "accn": "0000000000-25-000002",
+                },
+            ],
+            "ytd_6m": [],
+            "ytd_9m": [],
+            "unknown": [],
+        },
+        "standalone_quarters": [
+            {
+                "quarter": "Q1",
+                "value": 250,
+                "period_start": "2025-01-01",
+                "period_end": "2025-03-31",
+                "filed": "2025-05-01",
+                "form": "10-Q",
+                "fy": 2025,
+                "accession": "0000000000-25-000002",
+                "reconstructed": False,
+                "source": {
+                    "current": {
+                        "filed": "2025-05-01",
+                        "val": 250,
+                    },
+                    "previous": None,
+                },
+            },
+        ],
+        "evaluation_date": "2025-06-01",
+        "namespace": "us-gaap",
+        "concept": "Revenues",
+    }
+
+
+def test_validate_point_in_time_history_passes_for_valid_result():
+    result = _valid_synthetic_result()
+
+    assert validate_point_in_time_history(result, "2025-06-01") == []
+
+
+def test_validate_point_in_time_history_rejects_none():
+    assert validate_point_in_time_history(None, "2025-06-01") == ["root"]
+
+
+def test_validate_point_in_time_history_passes_for_real_get_point_in_time_history():
+    """End-to-end sanity check: a real result produced by
+    get_point_in_time_history() itself must also validate clean --
+    otherwise get_point_in_time_history() would already be raising
+    (it self-validates before returning), so this mainly guards
+    against the two functions' expectations silently drifting apart."""
+    data = _companyfacts_with_fy2024_and_fy2025()
+
+    result = get_point_in_time_history(data, "us-gaap", "Revenues", "2026-03-01")
+
+    assert validate_point_in_time_history(result, "2026-03-01") == []
+
+
+def test_validate_point_in_time_history_catches_evaluation_date_mismatch():
+    result = _valid_synthetic_result()
+    result["evaluation_date"] = "2025-06-01"
+
+    # Validating against a DIFFERENT evaluation_date than the one
+    # baked into the result must be flagged, not silently accepted.
+    failures = validate_point_in_time_history(result, "2026-01-01")
+
+    assert "evaluation_date_mismatch" in failures
+
+
+def test_validate_point_in_time_history_catches_look_ahead_bias_in_annual():
+    result = _valid_synthetic_result()
+
+    # Corrupt the annual record's filed date to be AFTER the
+    # evaluation_date it's supposed to respect.
+    result["annual"][0]["filed"] = "2025-12-31"
+
+    failures = validate_point_in_time_history(result, "2025-06-01")
+
+    assert "annual.look_ahead_bias" in failures
+
+
+def test_validate_point_in_time_history_catches_look_ahead_bias_in_quarterly_bucket():
+    result = _valid_synthetic_result()
+
+    result["quarterly"]["q1"][0]["filed"] = "2025-12-31"
+
+    failures = validate_point_in_time_history(result, "2025-06-01")
+
+    assert "quarterly.q1.look_ahead_bias" in failures
+
+
+def test_validate_point_in_time_history_catches_look_ahead_bias_in_derived_quarter_source():
+    """The top-level 'filed' on a standalone quarter can look fine while
+    a cumulative observation buried in its own "source" block (used to
+    derive it, e.g. Q2 = H1 - Q1) was actually filed too late -- this
+    must still be caught, not just the top-level field."""
+    result = _valid_synthetic_result()
+
+    result["standalone_quarters"][0]["source"]["previous"] = {
+        "filed": "2025-12-31",
+        "val": 100,
+    }
+
+    failures = validate_point_in_time_history(result, "2025-06-01")
+
+    assert "standalone_quarters.look_ahead_bias" in failures
+
+
+def test_validate_point_in_time_history_reuses_base_structural_checks():
+    """validate_point_in_time_history() must not reinvent
+    sec_history.validate_history()'s own structural checks -- a missing
+    required key should still be caught via that reuse."""
+    result = _valid_synthetic_result()
+    del result["annual"]
+
+    failures = validate_point_in_time_history(result, "2025-06-01")
+
+    assert "annual" in failures
