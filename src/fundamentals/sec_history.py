@@ -1016,7 +1016,7 @@ def extract_concept_history(
         )
     )
 
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "label": concept_data.get(
             "label"
@@ -1028,6 +1028,27 @@ def extract_concept_history(
         "quarterly": quarterly,
         "standalone_quarters": standalone_quarters,
     }
+
+    # --------------------------------------------------------
+    # Self-validation (2026-09-19): validate_history() below already
+    # existed and was already exercised by tests/test_sec_history.py
+    # and tests/test_sec_history_real.py, but was never actually called
+    # from within extract_concept_history() itself -- so a real bug
+    # that produced malformed output would have gone uncaught outside
+    # of the specific fixtures the test suite happens to cover. A
+    # validate_history() failure here means this function's OWN output
+    # doesn't match its own documented schema, which is a programming
+    # defect -- so it fails loudly rather than silently returning
+    # malformed data.
+    validation_failures = validate_history(result)
+
+    if validation_failures:
+        raise ValueError(
+            f"extract_concept_history() produced invalid output: "
+            f"{validation_failures}"
+        )
+
+    return result
 
 
 # ============================================================
