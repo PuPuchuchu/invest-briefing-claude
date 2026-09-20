@@ -47,6 +47,7 @@ from urllib.request import Request, urlopen
 
 SEC_COMPANYFACTS_BASE_URL = "https://data.sec.gov/api/xbrl/companyfacts"
 SEC_SUBMISSIONS_BASE_URL = "https://data.sec.gov/submissions"
+SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_RAW_FILENAME_TEMPLATE = "{ticker}_companyfacts.json"
 DEFAULT_SUBMISSIONS_FILENAME_TEMPLATE = "{cik}_submissions.json"
@@ -101,6 +102,28 @@ def build_submissions_url(cik: str) -> str:
     "0000320193").
     """
     return f"{SEC_SUBMISSIONS_BASE_URL}/CIK{cik}.json"
+
+
+def fetch_company_tickers(
+    user_agent: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    verbose: bool = True,
+) -> dict:
+    """Fetch SEC's bulk ticker->CIK mapping file
+    (www.sec.gov/files/company_tickers.json). Confirmed shape (live,
+    2026-09-20): an object keyed by numeric string index, each value
+    {"cik_str": <int, NOT zero-padded>, "ticker": <str>, "title": <str>}
+    -- e.g. {"0": {"cik_str": 1045810, "ticker": "NVDA", "title": "NVIDIA CORP"}, ...}.
+
+    This is the ONLY SEC source this repo uses for ticker->CIK
+    resolution -- deliberately separate from build_submissions_url's CIK-
+    keyed lookup, which requires already knowing the CIK. No validation,
+    no normalization -- just the fetch. See src/sec/identity.py's
+    resolve_cik_for_ticker() for the pure lookup logic against this data.
+    """
+    return fetch_json(
+        SEC_COMPANY_TICKERS_URL, user_agent=user_agent, timeout=timeout, verbose=verbose
+    )
 
 
 def fetch_json(
