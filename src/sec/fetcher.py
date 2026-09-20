@@ -46,8 +46,10 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 SEC_COMPANYFACTS_BASE_URL = "https://data.sec.gov/api/xbrl/companyfacts"
+SEC_SUBMISSIONS_BASE_URL = "https://data.sec.gov/submissions"
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_RAW_FILENAME_TEMPLATE = "{ticker}_companyfacts.json"
+DEFAULT_SUBMISSIONS_FILENAME_TEMPLATE = "{cik}_submissions.json"
 
 
 class SECUserAgentNotConfigured(RuntimeError):
@@ -78,6 +80,27 @@ def get_user_agent(default: str | None = None) -> str:
 def build_companyfacts_url(cik: str) -> str:
     """Build the SEC XBRL Company Facts API URL for a given CIK."""
     return f"{SEC_COMPANYFACTS_BASE_URL}/CIK{cik}.json"
+
+
+def build_submissions_url(cik: str) -> str:
+    """Build the SEC Submissions API URL for a given CIK.
+
+    Unlike Company Facts, which has no notion of SIC / industry classification
+    or ticker-exchange mappings, the Submissions endpoint
+    (data.sec.gov/submissions/CIK{cik}.json) is the ONLY SEC source this
+    repository uses that carries "sic" / "sicDescription" / "name" /
+    "tickers" (array) / "exchanges" (array). Confirmed via live fetch
+    (2026-09-19): a single CIK can legitimately map to MULTIPLE tickers --
+    e.g. Alphabet (CIK 0001652044) returns
+    tickers=["GOOGL","GOOG","GOOGM","GOOGN"] -- so this endpoint's own data
+    shape is fundamentally CIK-keyed, not ticker-keyed. See
+    src/sec/identity.py for how the ticker-level records are derived from
+    this. `cik` is expected zero-padded to 10 digits, matching the existing
+    build_companyfacts_url convention (confirmed live: the response's own
+    top-level "cik" field is itself a zero-padded string, e.g.
+    "0000320193").
+    """
+    return f"{SEC_SUBMISSIONS_BASE_URL}/CIK{cik}.json"
 
 
 def fetch_json(
@@ -138,6 +161,20 @@ def fetch_companyfacts(
     return fetch_json(url, user_agent=user_agent, timeout=timeout, verbose=verbose)
 
 
+def fetch_submissions(
+    cik: str,
+    user_agent: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    verbose: bool = True,
+) -> dict:
+    """Fetch the raw Submissions JSON for a CIK. No validation, no
+    normalization -- just the fetch (mirrors fetch_companyfacts). SIC /
+    identity normalization lives in src/sec/identity.py, not here -- this
+    module's only responsibility is getting raw bytes off data.sec.gov."""
+    url = build_submissions_url(cik)
+    return fetch_json(url, user_agent=user_agent, timeout=timeout, verbose=verbose)
+
+
 def save_raw_json(path: Path, data: dict) -> Path:
     """
     Write `data` as UTF-8 JSON (indent=2, ensure_ascii=False), creating
@@ -183,5 +220,44 @@ def fetch_and_cache_companyfacts(
 
     if verbose:
         print(f"[PASS] Raw cache written: {raw_path}")
+
+    return data, raw_path
+
+
+def fetch_and_cache_submissions(
+    cik: str,
+    raw_dir: Path,
+    user_agent: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    filename_template: str = DEFAULT_SUBMISSIONS_FILENAME_TEMPLATE,
+    required_keys: tuple[str, ...] = ("cik", "sic", "tickers", "exchanges"),
+    verbose: bool = True,
+) -> tuple[dict, Path]:
+    """
+    Fetch a company's raw Submissions JSON from SEC EDGAR, check that the
+    required top-level keys are present, and write it to `raw_dir`. Mirrors
+    fetch_and_cache_companyfacts's fetch -> validate-keys -> save sequence.
+
+    Deliberately keyed by CIK alone (no `ticker` parameter) -- unlike
+    Company Facts, one Submissions response legitimately covers multiple
+    tickers (see build_submissions_url's docstring), so keying the cache
+    filename by a single caller-chosen ticker would misrepresent what the
+    cached file actually contains. Callers that need a ticker-level record
+    derive it from this cached response via src/sec/identity.py.
+
+    Returns (data, path_written). Deliberately does NOT normalize --
+    callers needing that use src/sec/identity.py.
+    """
+    data = fetch_submissions(cik, user_agent=user_agent, timeout=timeout, verbose=verbose)
+
+    for key in required_keys:
+        if key not in data:
+            raise ValueError(f"CIK {cik}: missing required key '{key}' in SEC submissions response")
+
+    raw_path = Path(raw_dir) / filename_template.format(cik=cik)
+    save_raw_json(raw_path, data)
+
+    if verbose:
+        print(f"[PASS] Raw submissions cache written: {raw_path}")
 
     return data, raw_path
