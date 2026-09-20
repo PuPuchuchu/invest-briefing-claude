@@ -1,0 +1,22 @@
+cik,sector,industry,peer_group,classification_source,classification_status,mapping_version,effective_from,classification_available_date,effective_to,reviewed_at,review_reason,notes
+0000002488,,Semiconductors & Related Devices,sic_3674,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000019617,,National Commercial Banks,sic_6021,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000040545,,Electronic & Other Electrical Equipment (No Computer Equip),sic_3600,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000050863,,Semiconductors & Related Devices,sic_3674,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000059478,,Pharmaceutical Preparations,sic_2834,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000320193,,Electronic Computers,sic_3571,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000723125,,Semiconductors & Related Devices,sic_3674,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000731766,,Hospital & Medical Service Plans,sic_6324,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000789019,,Services-Prepackaged Software,sic_7372,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0000936468,,Guided Missiles & Space Vehicles & Parts,sic_3760,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001045810,,Semiconductors & Related Devices,sic_3674,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001065280,,Services-Video Tape Rental,sic_7841,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001321655,,Services-Prepackaged Software,sic_7372,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001326801,,"Services-Computer Programming, Data Processing, Etc.",sic_7370,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001341439,,Services-Prepackaged Software,sic_7372,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001375365,,Electronic Computers,sic_3571,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001652044,,"Services-Computer Programming, Data Processing, Etc.",sic_7370,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001717115,,"Services-Computer Programming, Data Processing, Etc.",sic_7370,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001730168,,Semiconductors & Related Devices,sic_3674,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0001769628,,Services-Prepackaged Software,sic_7372,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
+0002012383,,"Security Brokers, Dealers & Flotation Companies",sic_6211,SIC_DERIVED,SIC_DERIVED,v1,2026-09-20,2026-09-20,,,,Auto-generated SIC_DERIVED candidate -- not yet human-reviewed.
