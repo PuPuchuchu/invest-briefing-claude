@@ -3,12 +3,14 @@ Unit tests for src/fundamentals/peer_classification.py.
 
 Pure Unit Tests in the taxonomy sense: no network, no file I/O, synthetic
 fixtures only. These exist specifically to prove the properties required by
-the 2026-09-19 design review's final 6-point round:
+the 2026-09-19 design review's final 6-point round (status/source enum
+values updated by the 2026-09-20 ChatGPT design round -- see
+src/fundamentals/peer_classification.py's module docstring):
 
     1. classification_status vs classification_source are validated as two
        separate axes with an explicit valid/invalid combination allow-list.
     2. Peer-comparison usability is a policy (REVIEWED usable primary,
-       SIC_DERIVED candidate-only, PENDING_REVIEW/UNCLASSIFIED blocked).
+       PENDING_REVIEW candidate-only, UNCLASSIFIED blocked).
     3. get_peer_mapping_as_of() returns a rich (lookup_status, mapping,
        reason) result distinguishing all failure modes, never one flat
        UNVERIFIED.
@@ -75,12 +77,13 @@ def _reviewed_row(**overrides):
         "cik": "0000320193",
         "mapping_version": "v1",
         "classification_status": "REVIEWED",
-        "classification_source": "MANUAL",
+        "classification_source": "MANUAL_REVIEW",
         "peer_group": "hardware_devices",
         "effective_from": "2025-01-01",
         "effective_to": None,
         "classification_available_date": "2025-01-05",
         "reviewed_at": "2025-01-05",
+        "next_review_due": "2025-07-05",
     }
     row.update(overrides)
     return row
@@ -90,10 +93,10 @@ def test_validate_peer_mapping_row_accepts_valid_reviewed_row():
     assert validate_peer_mapping_row(_reviewed_row()) == []
 
 
-def test_validate_peer_mapping_row_accepts_valid_sic_derived_row():
+def test_validate_peer_mapping_row_accepts_valid_pending_review_row():
     row = _reviewed_row(
-        classification_status="SIC_DERIVED",
-        classification_source="SIC_DERIVED",
+        classification_status="PENDING_REVIEW",
+        classification_source="SEC_SIC",
     )
     assert validate_peer_mapping_row(row) == []
 
@@ -110,20 +113,20 @@ def test_validate_peer_mapping_row_accepts_valid_unclassified_row():
     assert validate_peer_mapping_row(row) == []
 
 
-def test_validate_peer_mapping_row_rejects_manual_source_with_sic_derived_status():
-    # A MANUAL-sourced row cannot sit in SIC_DERIVED status -- that status
-    # specifically means "mechanically derived, no human has touched this".
-    row = _reviewed_row(classification_status="SIC_DERIVED", classification_source="MANUAL")
+def test_validate_peer_mapping_row_rejects_reviewed_status_with_no_source():
+    # A row cannot claim REVIEWED (or PENDING_REVIEW) with no source at
+    # all -- (None, ...) is only valid paired with UNCLASSIFIED.
+    row = _reviewed_row(classification_status="REVIEWED", classification_source=None)
     assert "classification_source_status_combination" in validate_peer_mapping_row(row)
 
 
 def test_validate_peer_mapping_row_rejects_unclassified_with_a_source():
-    row = _reviewed_row(classification_status="UNCLASSIFIED", classification_source="MANUAL")
+    row = _reviewed_row(classification_status="UNCLASSIFIED", classification_source="MANUAL_REVIEW")
     assert "classification_source_status_combination" in validate_peer_mapping_row(row)
 
 
-def test_validate_peer_mapping_row_rejects_sic_derived_source_with_unclassified_status():
-    row = _reviewed_row(classification_status="UNCLASSIFIED", classification_source="SIC_DERIVED")
+def test_validate_peer_mapping_row_rejects_sec_sic_source_with_unclassified_status():
+    row = _reviewed_row(classification_status="UNCLASSIFIED", classification_source="SEC_SIC")
     assert "classification_source_status_combination" in validate_peer_mapping_row(row)
 
 
@@ -149,22 +152,31 @@ def test_validate_peer_mapping_row_requires_classification_available_date_for_re
     assert "classification_available_date_missing" in validate_peer_mapping_row(row)
 
 
-def test_validate_peer_mapping_row_requires_classification_available_date_for_sic_derived():
+def test_validate_peer_mapping_row_requires_classification_available_date_for_pending_review():
+    # 2026-09-20: PENDING_REVIEW absorbed the old SIC_DERIVED status's role
+    # as the "usable at the candidate tier" state (see
+    # CANDIDATE_COMPARISON_STATUSES), so it now carries the same
+    # classification_available_date requirement REVIEWED always had --
+    # anything usable even as a candidate must be point-in-time gated.
     row = _reviewed_row(
-        classification_status="SIC_DERIVED",
-        classification_source="SIC_DERIVED",
+        classification_status="PENDING_REVIEW",
+        classification_source="SEC_SIC",
+        peer_group=None,
         classification_available_date=None,
     )
     assert "classification_available_date_missing" in validate_peer_mapping_row(row)
 
 
-def test_validate_peer_mapping_row_does_not_require_availability_date_for_pending_review():
-    row = _reviewed_row(
-        classification_status="PENDING_REVIEW",
-        classification_source="SIC_DERIVED",
-        peer_group=None,
-        classification_available_date=None,
-    )
+def test_validate_peer_mapping_row_does_not_require_availability_date_for_unclassified():
+    row = {
+        "cik": "0000000001",
+        "mapping_version": "v1",
+        "classification_status": "UNCLASSIFIED",
+        "classification_source": None,
+        "peer_group": None,
+        "effective_from": "2025-01-01",
+        "classification_available_date": None,
+    }
     failures = validate_peer_mapping_row(row)
     assert "classification_available_date_missing" not in failures
 
@@ -322,18 +334,24 @@ def test_get_peer_mapping_as_of_reviewed_row_missing_availability_date_fails_str
 
 
 def test_get_peer_mapping_as_of_missing_availability_date():
-    # PENDING_REVIEW does NOT structurally require classification_available_date,
-    # so a PENDING_REVIEW/SIC_DERIVED row lacking it CAN pass structural
-    # validation and be selected as "covering" -- this is the real path
-    # that reaches the MISSING_AVAILABILITY_DATE branch: the availability
-    # gate is checked before the usable_statuses gate, so this fires ahead
-    # of an UNVERIFIED verdict.
-    row = _reviewed_row(
-        classification_status="PENDING_REVIEW",
-        classification_source="SIC_DERIVED",
-        peer_group=None,
-        classification_available_date=None,
-    )
+    # 2026-09-20: REVIEWED and PENDING_REVIEW both now structurally
+    # require classification_available_date (see the two tests above), so
+    # the only status left that can pass structural validation WITHOUT it
+    # is UNCLASSIFIED. That's the real path that reaches the
+    # MISSING_AVAILABILITY_DATE branch: the availability gate is checked
+    # before the usable_statuses gate, so this fires ahead of an
+    # UNVERIFIED verdict even though an UNCLASSIFIED row would never be
+    # usable anyway.
+    row = {
+        "cik": "0000320193",
+        "mapping_version": "v1",
+        "classification_status": "UNCLASSIFIED",
+        "classification_source": None,
+        "peer_group": None,
+        "effective_from": "2025-01-01",
+        "effective_to": None,
+        "classification_available_date": None,
+    }
     result = get_peer_mapping_as_of(
         "0000320193", "2025-06-01", [row], usable_statuses=CANDIDATE_COMPARISON_STATUSES
     )
@@ -368,8 +386,8 @@ def test_get_peer_mapping_as_of_availability_date_exactly_on_evaluation_date_is_
 
 def test_get_peer_mapping_as_of_unverified_when_status_not_usable():
     row = _reviewed_row(
-        classification_status="SIC_DERIVED",
-        classification_source="SIC_DERIVED",
+        classification_status="PENDING_REVIEW",
+        classification_source="SEC_SIC",
         effective_from="2025-01-01",
         effective_to=None,
         classification_available_date="2025-01-05",
@@ -378,10 +396,10 @@ def test_get_peer_mapping_as_of_unverified_when_status_not_usable():
     assert result["lookup_status"] == LOOKUP_UNVERIFIED
 
 
-def test_get_peer_mapping_as_of_sic_derived_is_ok_under_candidate_comparison_statuses():
+def test_get_peer_mapping_as_of_pending_review_is_ok_under_candidate_comparison_statuses():
     row = _reviewed_row(
-        classification_status="SIC_DERIVED",
-        classification_source="SIC_DERIVED",
+        classification_status="PENDING_REVIEW",
+        classification_source="SEC_SIC",
         effective_from="2025-01-01",
         effective_to=None,
         classification_available_date="2025-01-05",
@@ -473,15 +491,15 @@ def test_schema_version_is_a_non_empty_string():
 
 def test_primary_and_candidate_comparison_statuses_are_consistent():
     assert PRIMARY_COMPARISON_STATUSES == {"REVIEWED"}
-    assert CANDIDATE_COMPARISON_STATUSES == {"REVIEWED", "SIC_DERIVED"}
+    assert CANDIDATE_COMPARISON_STATUSES == {"REVIEWED", "PENDING_REVIEW"}
     assert PRIMARY_COMPARISON_STATUSES.issubset(CANDIDATE_COMPARISON_STATUSES)
 
 
 def test_classification_sources_and_statuses_are_as_documented():
-    assert CLASSIFICATION_SOURCES == {"SIC_DERIVED", "MANUAL"}
+    # RULE_BASED is deliberately NOT included yet -- see module docstring.
+    assert CLASSIFICATION_SOURCES == {"SEC_SIC", "MANUAL_REVIEW"}
     assert CLASSIFICATION_STATUSES == {
         "REVIEWED",
         "PENDING_REVIEW",
-        "SIC_DERIVED",
         "UNCLASSIFIED",
     }
