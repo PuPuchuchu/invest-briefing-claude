@@ -1,0 +1,22 @@
+cik,issuer_name,sic,sic_description,sec_tickers,sec_exchanges,source_raw_path,normalized_at
+0000002488,ADVANCED MICRO DEVICES INC,3674,Semiconductors & Related Devices,AMD,Nasdaq,data/raw/sec/0000002488_submissions.json,2026-09-20T07:33:57Z
+0000019617,JPMORGAN CHASE & CO,6021,National Commercial Banks,JPM|JPM-PC|AMJB|JPM-PD|JPM-PJ|JPM-PK|JPM-PL|JPM-PM|VYLD,NYSE|NYSE|NYSE|NYSE|NYSE|NYSE|NYSE|NYSE|NYSE,data/raw/sec/0000019617_submissions.json,2026-09-20T07:33:57Z
+0000040545,GENERAL ELECTRIC CO,3600,Electronic & Other Electrical Equipment (No Computer Equip),GE,NYSE,data/raw/sec/0000040545_submissions.json,2026-09-20T07:33:57Z
+0000050863,INTEL CORP,3674,Semiconductors & Related Devices,INTC,Nasdaq,data/raw/sec/0000050863_submissions.json,2026-09-20T07:33:57Z
+0000059478,ELI LILLY & Co,2834,Pharmaceutical Preparations,LLY,NYSE,data/raw/sec/0000059478_submissions.json,2026-09-20T07:33:57Z
+0000320193,Apple Inc.,3571,Electronic Computers,AAPL,Nasdaq,data/raw/sec/0000320193_submissions.json,2026-09-20T07:33:57Z
+0000723125,MICRON TECHNOLOGY INC,3674,Semiconductors & Related Devices,MU,Nasdaq,data/raw/sec/0000723125_submissions.json,2026-09-20T07:33:57Z
+0000731766,UNITEDHEALTH GROUP INC,6324,Hospital & Medical Service Plans,UNH,NYSE,data/raw/sec/0000731766_submissions.json,2026-09-20T07:33:57Z
+0000789019,MICROSOFT CORP,7372,Services-Prepackaged Software,MSFT,Nasdaq,data/raw/sec/0000789019_submissions.json,2026-09-20T07:33:57Z
+0000936468,LOCKHEED MARTIN CORP,3760,Guided Missiles & Space Vehicles & Parts,LMT,NYSE,data/raw/sec/0000936468_submissions.json,2026-09-20T07:33:57Z
+0001045810,NVIDIA CORP,3674,Semiconductors & Related Devices,NVDA,Nasdaq,data/raw/sec/0001045810_submissions.json,2026-09-20T07:33:57Z
+0001065280,NETFLIX INC,7841,Services-Video Tape Rental,NFLX,Nasdaq,data/raw/sec/0001065280_submissions.json,2026-09-20T07:33:57Z
+0001321655,Palantir Technologies Inc.,7372,Services-Prepackaged Software,PLTR,Nasdaq,data/raw/sec/0001321655_submissions.json,2026-09-20T07:33:57Z
+0001326801,"Meta Platforms, Inc.",7370,"Services-Computer Programming, Data Processing, Etc.",META,Nasdaq,data/raw/sec/0001326801_submissions.json,2026-09-20T07:33:57Z
+0001341439,ORACLE CORP,7372,Services-Prepackaged Software,ORCL|ORCL-PD,NYSE|NYSE,data/raw/sec/0001341439_submissions.json,2026-09-20T07:33:57Z
+0001375365,"Super Micro Computer, Inc.",3571,Electronic Computers,SMCI|SMCIP,Nasdaq|Nasdaq,data/raw/sec/0001375365_submissions.json,2026-09-20T07:33:57Z
+0001652044,Alphabet Inc.,7370,"Services-Computer Programming, Data Processing, Etc.",GOOGL|GOOG|GOOGM|GOOGN,Nasdaq|Nasdaq|Nasdaq|Nasdaq,data/raw/sec/0001652044_submissions.json,2026-09-20T07:33:57Z
+0001717115,"Tempus AI, Inc.",7370,"Services-Computer Programming, Data Processing, Etc.",TEM,Nasdaq,data/raw/sec/0001717115_submissions.json,2026-09-20T07:33:57Z
+0001730168,Broadcom Inc.,3674,Semiconductors & Related Devices,AVGO,Nasdaq,data/raw/sec/0001730168_submissions.json,2026-09-20T07:33:57Z
+0001769628,"CoreWeave, Inc.",7372,Services-Prepackaged Software,CRWV,Nasdaq,data/raw/sec/0001769628_submissions.json,2026-09-20T07:33:57Z
+0002012383,"BlackRock, Inc.",6211,"Security Brokers, Dealers & Flotation Companies",BLK,NYSE,data/raw/sec/0002012383_submissions.json,2026-09-20T07:33:57Z
