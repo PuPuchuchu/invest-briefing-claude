@@ -22,15 +22,60 @@ Classification is a judgment about a BUSINESS, not about which ticker
 happens to trade it (see src/sec/identity.py's module docstring for why
 those are different things).
 
+2026-09-20 revision (ChatGPT design round, applied by 명호's explicit
+direction)
+------------------------------------------------------------------------
+The original 2026-09-19 design used classification_status = "SIC_DERIVED"
+as both a *source* label and a *review-state* label at once -- a row
+mechanically derived from SIC sat in a status literally named
+"SIC_DERIVED", conflating "where this classification came from" with
+"how trustworthy/reviewed it is". This round removes that overload:
+
+    classification_source  -- HOW a row's sector/industry/peer_group was
+                               produced: "SEC_SIC" (mechanically derived
+                               from the raw SIC code, no judgment) or
+                               "MANUAL_REVIEW" (a human, informed by
+                               ChatGPT's economic analysis, chose it).
+                               ("RULE_BASED" is reserved for a future
+                               automated-but-non-SIC classifier and is
+                               deliberately NOT added to
+                               CLASSIFICATION_SOURCES yet -- there is no
+                               such classifier implemented.)
+
+    classification_status  -- ONLY the review-state: "REVIEWED" (human-
+                               confirmed, usable for Primary comparison),
+                               "PENDING_REVIEW" (a row exists -- source
+                               may be SEC_SIC or MANUAL_REVIEW -- but has
+                               not been confirmed), or "UNCLASSIFIED"
+                               (nothing at all yet).
+
+A second, independent change (same round): whether a Peer Group is
+REVIEWED must never be conflated with whether that Peer Group currently
+has enough OTHER watchlist members to compare against. A single-member
+Peer Group (e.g. "Defense Primes" today has only LMT in the 21-stock
+Watchlist Universe) can still be REVIEWED -- its economic classification
+is settled even though its *current comparison coverage*, tracked
+separately as peer_adequacy_status (see classify_peer_adequacy() /
+build_comparison_peers() below), is INSUFFICIENT_PEERS. Widening that
+coverage is the job of a future Core Market Universe expansion (adding
+real, financial-data-tracked external peers) -- deliberately OUT OF SCOPE
+for this module and for this design round. See
+scripts/seed_identity_reference.py's module docstring for the Watchlist
+Universe vs Core Market Universe distinction this implies.
+
 Date semantics (2026-09-19 design, points 4 and 5 -- do not conflate
-these three):
+these three; next_review_due below is a fourth, deliberately separate,
+concept added 2026-09-20):
 
     effective_from / effective_to
         When this classification is considered to describe the business,
         as a HALF-OPEN interval: [effective_from, effective_to). A row
         with effective_to = "2025-01-01" is expired exactly AT
         2025-01-01 -- that date itself already belongs to whatever comes
-        next, not to this row.
+        next, not to this row. effective_to is set ONLY when the
+        classification actually stopped describing the business (a real
+        reclassification event -- M&A, spinoff, segment reorg, SIC
+        change, etc.), never as a stand-in for a review deadline.
 
     classification_available_date
         When this classification became something the SYSTEM could
@@ -43,6 +88,20 @@ these three):
         evaluation_date must never be treated as usable -- see
         get_peer_mapping_as_of() below, which is the single place this
         two-part gate is enforced.
+
+    next_review_due (2026-09-20)
+        When this classification is next SCHEDULED to be re-examined --
+        completely separate from effective_to. Baseline cadence is
+        semi-annual (반기); an event trigger (new watchlist addition,
+        IPO, business-structure change, segment reorg, M&A/spinoff, SIC
+        change, economic peer relationship shift) can force an earlier
+        review regardless of what next_review_due says. Reaching
+        next_review_due does NOT expire the mapping and does NOT require
+        closing effective_to -- a row can sail past its next_review_due
+        date and remain fully in force (effective_to still None) until
+        an actual reclassification event happens. This column is
+        advisory/scheduling metadata only; get_peer_mapping_as_of() below
+        does not read it at all.
 
     evaluation_date
         The point-in-time an evaluation is being made as of (caller-
@@ -68,7 +127,7 @@ from typing import Any
 
 from src.fundamentals.point_in_time import coerce_evaluation_date
 
-SCHEMA_VERSION = "peer_classification_v0.1"
+SCHEMA_VERSION = "peer_classification_v0.2"
 
 
 # ============================================================
@@ -103,45 +162,65 @@ def _ranges_overlap(
 # CONFIGURATION / ALLOWED VALUES
 # ============================================================
 
-CLASSIFICATION_SOURCES = {"SIC_DERIVED", "MANUAL"}
+# 2026-09-20: RULE_BASED intentionally NOT included yet -- no automated,
+# non-SIC classifier exists in this codebase. Add it only when that
+# classifier is actually implemented (see module docstring).
+CLASSIFICATION_SOURCES = {"SEC_SIC", "MANUAL_REVIEW"}
 
+# 2026-09-20: "SIC_DERIVED" removed as a status value -- it described a
+# classification METHOD, not a REVIEW STATE, and belongs on
+# classification_source instead (as "SEC_SIC"). A mechanically-derived
+# row now sits in PENDING_REVIEW status until a human confirms it.
 CLASSIFICATION_STATUSES = {
     "REVIEWED",
     "PENDING_REVIEW",
-    "SIC_DERIVED",
     "UNCLASSIFIED",
 }
 
 # classification_source describes WHERE a classification came from.
 # classification_status describes its review/usability state. These are
 # deliberately two separate axes (2026-09-19 design, point 1) -- but not
-# every combination is meaningful. A MANUAL-sourced row sitting in
-# SIC_DERIVED status is a contradiction (SIC_DERIVED status specifically
-# means "mechanically derived, no human has touched this yet"); an
-# UNCLASSIFIED row must have no source at all, since nothing was actually
-# classified. validate_peer_mapping_row() rejects any combination not
-# listed here.
+# every combination is meaningful. An UNCLASSIFIED row must have no
+# source at all, since nothing was actually classified.
+# validate_peer_mapping_row() rejects any combination not listed here.
 _VALID_SOURCE_STATUS_COMBINATIONS = {
-    ("SIC_DERIVED", "SIC_DERIVED"),
-    ("SIC_DERIVED", "PENDING_REVIEW"),
-    ("SIC_DERIVED", "REVIEWED"),
-    ("MANUAL", "REVIEWED"),
-    ("MANUAL", "PENDING_REVIEW"),
+    ("SEC_SIC", "PENDING_REVIEW"),
+    ("SEC_SIC", "REVIEWED"),
+    ("MANUAL_REVIEW", "PENDING_REVIEW"),
+    ("MANUAL_REVIEW", "REVIEWED"),
     (None, "UNCLASSIFIED"),
 }
 
 # Which classification_status values make a mapping usable for actual
 # Primary Peer Group comparison, vs merely a review candidate (2026-09-19
-# design, point 2). SIC_DERIVED is deliberately NOT given the same trust
-# as a human-REVIEWED mapping for the default (primary) comparison mode --
-# it is a candidate pool, not a confirmed peer group.
+# design, point 2). PENDING_REVIEW -- whether its source is SEC_SIC
+# (mechanically derived) or MANUAL_REVIEW (proposed but not yet
+# confirmed) -- is deliberately NOT given the same trust as a human-
+# REVIEWED mapping for the default (primary) comparison mode; it is a
+# candidate pool, not a confirmed peer group.
 PRIMARY_COMPARISON_STATUSES = frozenset({"REVIEWED"})
-CANDIDATE_COMPARISON_STATUSES = frozenset({"REVIEWED", "SIC_DERIVED"})
+CANDIDATE_COMPARISON_STATUSES = frozenset({"REVIEWED", "PENDING_REVIEW"})
 
 
 # ============================================================
 # PEER ADEQUACY
 # ============================================================
+#
+# IMPORTANT -- peer_adequacy_status (below, and as returned by
+# build_comparison_peers()) is a COMPLETELY SEPARATE axis from
+# classification_status. classification_status answers "has this
+# business's Peer Group been economically reviewed and confirmed?";
+# peer_adequacy_status answers "how many OTHER members of that (already-
+# confirmed) Peer Group currently exist inside the comparison universe
+# passed in?". A row can be classification_status="REVIEWED" with
+# peer_adequacy_status="INSUFFICIENT_PEERS" at the same time -- e.g. "AI
+# Cloud Infrastructure" (CRWV) or "Defense Primes" (LMT) are both settled,
+# confirmed classifications in the 21-stock Watchlist Universe that
+# simply don't have another watchlist member sharing them yet. This is
+# expected and correct; it is not a reason to leave the classification
+# itself at PENDING_REVIEW. Widening peer_adequacy_status for these
+# groups is a Core Market Universe scope question (adding real, financial
+# -data-tracked external peers), not a re-classification question.
 
 def classify_peer_adequacy(valid_peer_count: int) -> str:
     """
@@ -200,11 +279,12 @@ def validate_peer_mapping_row(row: dict) -> list[str]:
     if status == "UNCLASSIFIED" and peer_group:
         failures.append("peer_group_present_for_unclassified")
 
-    # A mapping actually in force (REVIEWED or SIC_DERIVED -- i.e.
+    # A mapping actually in force (REVIEWED or PENDING_REVIEW -- i.e.
     # anything that could be looked up and used, even at the candidate
-    # tier) must carry classification_available_date. reviewed_at is
-    # never an acceptable substitute (2026-09-19 design, point 5).
-    if status in ("REVIEWED", "SIC_DERIVED") and not row.get("classification_available_date"):
+    # tier via CANDIDATE_COMPARISON_STATUSES) must carry
+    # classification_available_date. reviewed_at is never an acceptable
+    # substitute (2026-09-19 design, point 5).
+    if status in ("REVIEWED", "PENDING_REVIEW") and not row.get("classification_available_date"):
         failures.append("classification_available_date_missing")
 
     effective_from = _parse_date(row.get("effective_from"))
@@ -224,6 +304,13 @@ def validate_peer_mapping_row(row: dict) -> list[str]:
     available_raw = row.get("classification_available_date")
     if available_raw and _parse_date(available_raw) is None:
         failures.append("classification_available_date_format")
+
+    # 2026-09-20: next_review_due is advisory scheduling metadata (see
+    # module docstring) -- never required, but if present it must parse
+    # as an ISO date, same as effective_to.
+    next_review_due_raw = row.get("next_review_due")
+    if next_review_due_raw and _parse_date(next_review_due_raw) is None:
+        failures.append("next_review_due_format")
 
     return failures
 
@@ -345,8 +432,8 @@ def get_peer_mapping_as_of(
         }
 
     usable_statuses defaults to PRIMARY_COMPARISON_STATUSES (REVIEWED
-    only). Pass CANDIDATE_COMPARISON_STATUSES to also accept SIC_DERIVED
-    candidates for non-primary, exploratory use.
+    only). Pass CANDIDATE_COMPARISON_STATUSES to also accept
+    PENDING_REVIEW candidates for non-primary, exploratory use.
     """
     eval_date = coerce_evaluation_date(evaluation_date)
 
@@ -458,6 +545,13 @@ def build_comparison_peers(target_cik: str, peer_group_members: list[str]) -> di
     INCLUDING target_cik itself (Peer Group Membership includes self --
     2026-09-19 design). The returned comparison set EXCLUDES target_cik,
     so a company is never compared against itself.
+
+    peer_adequacy_status here reflects ONLY how many other CIKs were
+    passed in `peer_group_members` -- it says nothing about whether the
+    Peer Group itself is REVIEWED (that is classification_status, on the
+    peer_groups.csv row, checked separately via get_peer_mapping_as_of()).
+    See the "PEER ADEQUACY" section comment above for why these two axes
+    must never be conflated.
     """
     peer_group_size = len(peer_group_members)
     comparison_peers = [cik for cik in peer_group_members if cik != target_cik]
