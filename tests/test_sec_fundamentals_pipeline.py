@@ -38,11 +38,35 @@ PROCESSED_DIR = Path("data/processed/fundamentals")
 METRIC_CANDIDATES = {
 
     "revenue": [
-        "Revenue",
-        "Revenues",
-        "SalesRevenueNet",
-        "SalesRevenueGoodsNet",
+        # Regression fix (2026-09-18): this list previously put the
+        # legacy "Revenues" tag ahead of the modern one. extract_metric()
+        # below takes the FIRST candidate in this list that has ANY
+        # observations -- it does not compare freshness across
+        # candidates -- so ordering here is a correctness-critical
+        # priority, not cosmetic.
+        #
+        # Confirmed against real SEC data (data.sec.gov) for Microsoft
+        # (CIK 0000789019): "Revenues" exists (31 observations) but its
+        # most recent observation is dated 2011-01-27 (10-Q, FY2011 Q2)
+        # -- a dead/abandoned tag. "RevenueFromContractWithCustomer
+        # ExcludingAssessedTax" exists with 149 observations, including
+        # 10-Q data, through the current FY2026 10-K (filed 2026-07-29,
+        # $331.839B). With the old ordering, extract_metric() silently
+        # returned MSFT's ~15-year-stale 2011 revenue as if it were
+        # current data.
+        #
+        # New order matches the already-validated priority used
+        # elsewhere in this codebase (src/fundamentals/sec_historical.py
+        # CONCEPT_MAP, tests/test_sec_companyfacts.py): modern tag
+        # first, then the pre-ASC-606 legacy tag, then the older
+        # generic tags as last-resort fallbacks (unverified against
+        # real data for any current-universe ticker, kept only because
+        # removing them was not data-justified either).
         "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet",
+        "Revenues",
+        "SalesRevenueGoodsNet",
+        "Revenue",
     ],
 
     "net_income": [
