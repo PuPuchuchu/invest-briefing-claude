@@ -112,15 +112,18 @@ def test_full_pipeline_raw_to_identity_to_peer_lookup():
 
     # ---- Stage 3: Peer Mapping reference data (managed classification,
     # built on top of -- but never equal to -- the SIC pulled in Stage 1) ----
-    # Apple and Super Micro share SIC 3571, which makes them SIC-derived
-    # peer CANDIDATES; only Apple has actually been human-REVIEWED into the
-    # "hardware_devices" Primary Peer Group as of this fixture.
+    # Apple and Super Micro share SIC 3571 in issuer_identity.csv, but
+    # (2026-09-20 revision) that shared SIC is never auto-copied into a
+    # peer_group -- Super Micro's row below sits at PENDING_REVIEW with no
+    # peer_group at all, a candidate awaiting MANUAL_REVIEW, while only
+    # Apple has actually been human-REVIEWED into the "hardware_devices"
+    # Primary Peer Group as of this fixture.
     peer_rows = [
         {
             "cik": "0000320193",
             "mapping_version": "v1",
             "classification_status": "REVIEWED",
-            "classification_source": "MANUAL",
+            "classification_source": "MANUAL_REVIEW",
             "peer_group": "hardware_devices",
             "effective_from": "2020-01-01",
             "effective_to": None,
@@ -129,9 +132,9 @@ def test_full_pipeline_raw_to_identity_to_peer_lookup():
         {
             "cik": "0001375365",
             "mapping_version": "v1",
-            "classification_status": "SIC_DERIVED",
-            "classification_source": "SIC_DERIVED",
-            "peer_group": "hardware_devices",
+            "classification_status": "PENDING_REVIEW",
+            "classification_source": "SEC_SIC",
+            "peer_group": None,
             "effective_from": "2020-01-01",
             "effective_to": None,
             "classification_available_date": "2020-01-01",
@@ -140,7 +143,7 @@ def test_full_pipeline_raw_to_identity_to_peer_lookup():
             "cik": "0001652044",
             "mapping_version": "v1",
             "classification_status": "REVIEWED",
-            "classification_source": "MANUAL",
+            "classification_source": "MANUAL_REVIEW",
             "peer_group": "internet_services",
             "effective_from": "2020-01-01",
             "effective_to": None,
@@ -153,13 +156,13 @@ def test_full_pipeline_raw_to_identity_to_peer_lookup():
 
     # ---- Stage 4: Point-in-time Primary peer lookup ----
     # As of 2025-06-01, Apple's REVIEWED mapping is usable for Primary
-    # comparison; Super Micro's SIC_DERIVED mapping is NOT (candidate-only).
+    # comparison; Super Micro's PENDING_REVIEW mapping is NOT (candidate-only).
     apple_lookup = get_peer_mapping_as_of("0000320193", "2025-06-01", peer_rows)
     assert apple_lookup["lookup_status"] == LOOKUP_OK
     assert apple_lookup["mapping"]["peer_group"] == "hardware_devices"
 
     smci_lookup = get_peer_mapping_as_of("0001375365", "2025-06-01", peer_rows)
-    assert smci_lookup["lookup_status"] != LOOKUP_OK  # SIC_DERIVED, not usable at PRIMARY tier
+    assert smci_lookup["lookup_status"] != LOOKUP_OK  # PENDING_REVIEW, not usable at PRIMARY tier
 
     # Retroactive-use prevention: evaluating Apple as of a date BEFORE its
     # mapping became available must fail closed.
@@ -191,7 +194,7 @@ def test_full_pipeline_detects_a_planted_reference_data_integrity_problem():
             "cik": "0000320193",
             "mapping_version": "v1",
             "classification_status": "REVIEWED",
-            "classification_source": "MANUAL",
+            "classification_source": "MANUAL_REVIEW",
             "peer_group": "hardware_devices",
             "effective_from": "2020-01-01",
             "effective_to": None,
@@ -201,7 +204,7 @@ def test_full_pipeline_detects_a_planted_reference_data_integrity_problem():
             "cik": "0000320193",
             "mapping_version": "v2",
             "classification_status": "REVIEWED",
-            "classification_source": "MANUAL",
+            "classification_source": "MANUAL_REVIEW",
             "peer_group": "consumer_electronics",
             "effective_from": "2022-06-01",  # overlaps v1's open-ended range
             "effective_to": None,
