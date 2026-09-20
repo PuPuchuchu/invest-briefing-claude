@@ -5,8 +5,8 @@ The script itself needs live network (data.sec.gov, www.sec.gov -- see
 its own module docstring for why that can't run in this sandbox). This
 test mocks the two network calls with small synthetic fixtures so the
 script's actual logic -- CIK resolution, issuer/security normalization,
-SIC_DERIVED grouping, CSV writing -- is still exercised on every
-`pytest -q` run, with zero network dependency.
+PENDING_REVIEW placeholder-row generation, CSV writing -- is still
+exercised on every `pytest -q` run, with zero network dependency.
 """
 
 import json
@@ -76,14 +76,26 @@ def test_seed_script_multi_ticker_cik_produces_all_tickers_in_security_rows(tmp_
     assert googl_tickers == {"GOOGL", "GOOG", "GOOGM", "GOOGN"}
 
 
-def test_seed_script_groups_shared_sic_into_same_sic_derived_peer_group(tmp_path, monkeypatch):
-    # AAPL and SMCI both carry SIC 3571 -- the script must place them in
-    # the same auto-generated candidate peer_group.
+def test_seed_script_never_copies_sic_into_industry_or_peer_group(tmp_path, monkeypatch):
+    # 2026-09-20 revision: AAPL and SMCI both carry SIC 3571, but the
+    # script must NOT turn that shared SIC into a peer_group (or industry)
+    # value of any kind -- sector/industry/peer_group are Managed
+    # Classification, never auto-derived from raw SIC. The raw SIC itself
+    # stays available via issuer_identity.csv (checked separately below)
+    # and is echoed into `notes` for reviewer convenience only.
     ref_dir = _run_seed_script(tmp_path, ["AAPL", "SMCI", "GOOGL"], monkeypatch)
     peer_rows = read_peer_groups_csv(ref_dir / "peer_groups.csv")
     by_cik = {row["cik"]: row for row in peer_rows}
-    assert by_cik["0000320193"]["peer_group"] == by_cik["0001375365"]["peer_group"] == "sic_3571"
-    assert by_cik["0001652044"]["peer_group"] == "sic_7370"
+    for row in by_cik.values():
+        assert row["sector"] is None
+        assert row["industry"] is None
+        assert row["peer_group"] is None
+
+    issuer_rows = read_issuer_identity_csv(ref_dir / "issuer_identity.csv")
+    issuer_by_cik = {row["cik"]: row for row in issuer_rows}
+    assert issuer_by_cik["0000320193"]["sic"] == issuer_by_cik["0001375365"]["sic"] == "3571"
+    assert issuer_by_cik["0001652044"]["sic"] == "7370"
+    assert "3571" in by_cik["0000320193"]["notes"]
 
 
 def test_seed_script_never_writes_a_reviewed_row(tmp_path, monkeypatch):
@@ -91,9 +103,10 @@ def test_seed_script_never_writes_a_reviewed_row(tmp_path, monkeypatch):
     # has no authority to assert a human-reviewed peer group.
     ref_dir = _run_seed_script(tmp_path, ["AAPL", "SMCI", "GOOGL"], monkeypatch)
     peer_rows = read_peer_groups_csv(ref_dir / "peer_groups.csv")
-    assert all(row["classification_status"] == "SIC_DERIVED" for row in peer_rows)
-    assert all(row["classification_source"] == "SIC_DERIVED" for row in peer_rows)
+    assert all(row["classification_status"] == "PENDING_REVIEW" for row in peer_rows)
+    assert all(row["classification_source"] == "SEC_SIC" for row in peer_rows)
     assert all(row["reviewed_at"] is None for row in peer_rows)
+    assert all(row["next_review_due"] is None for row in peer_rows)
 
 
 def test_seed_script_issuer_rows_carry_provenance_back_to_raw_file(tmp_path, monkeypatch):
