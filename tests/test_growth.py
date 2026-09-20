@@ -1,3 +1,5 @@
+import math
+
 from src.fundamentals.growth import (
     GROWTH_METRICS,
     GROWTH_WEIGHTS,
@@ -218,7 +220,16 @@ def test_growth_configuration():
         "revenue_cagr_3y",
     }
 
-    assert sum(GROWTH_WEIGHTS.values()) == 1.0
+    # 2026-09-20: direct == 1.0 comparison is unsafe here -- Python's binary
+    # floating-point representation makes 0.25 + 0.20 + 0.25 + 0.20 + 0.10
+    # evaluate to 0.9999999999999999, not exactly 1.0, even though the
+    # weights are mathematically correct. math.isclose() with a tight
+    # abs_tol is the correct comparison for a sum of literal float weights.
+    # This is a pure floating-point-comparison fix (ChatGPT design review,
+    # 2026-09-20) -- it does NOT change or finalize the weight values
+    # themselves, which remain a provisional policy pending Historical
+    # Validation (see GROWTH_WEIGHTS' own module-level comment).
+    assert math.isclose(sum(GROWTH_WEIGHTS.values()), 1.0, rel_tol=0.0, abs_tol=1e-12)
     assert MIN_VALID_COMPONENTS == 3
 
 
