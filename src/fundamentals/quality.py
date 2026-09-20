@@ -32,6 +32,23 @@ QUALITY_METRICS = [
     "profit_to_cash_consistency",
 ]
 
+# 2026-09-20: promoted out of _calculate_quality_score()'s local `weights`
+# dict into a public, importable constant -- src/fundamentals/metric_specs.py
+# (Percentile Engine's Factor Score weighting) needs the SAME already-approved
+# v0.1 weights rather than a second, hand-copied set that could drift out of
+# sync. This is a pure refactor: the values themselves are unchanged, and
+# _calculate_quality_score() below now reads from this constant instead of
+# its own local dict.
+QUALITY_WEIGHTS = {
+    "operating_margin": 0.20,
+    "net_margin": 0.10,
+    "fcf_margin": 0.20,
+    "fcf_conversion": 0.20,
+    "net_debt_to_fcf": 0.15,
+    "debt_to_cash": 0.05,
+    "profit_to_cash_consistency": 0.10,
+}
+
 
 # ============================================================
 # BASIC HELPERS
@@ -759,15 +776,7 @@ def _calculate_quality_score(
     four of the seven components are available.
     """
 
-    weights = {
-        "operating_margin": 0.20,
-        "net_margin": 0.10,
-        "fcf_margin": 0.20,
-        "fcf_conversion": 0.20,
-        "net_debt_to_fcf": 0.15,
-        "debt_to_cash": 0.05,
-        "profit_to_cash_consistency": 0.10,
-    }
+    weights = QUALITY_WEIGHTS
 
     weighted_sum = 0.0
     available_weight = 0.0
@@ -1405,6 +1414,7 @@ def validate_quality(
 __all__ = [
     "SCHEMA_VERSION",
     "QUALITY_METRICS",
+    "QUALITY_WEIGHTS",
     "calculate_fcf_conversion",
     "calculate_net_debt_to_fcf",
     "calculate_profit_to_cash_consistency",
