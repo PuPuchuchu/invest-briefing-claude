@@ -14,6 +14,19 @@ other row list this repo passes around.
 Unlike data/reference/issuer_identity.csv (see src/sec/reference_io.py),
 every peer_groups.csv column is a plain scalar -- no list-typed columns,
 so no delimiter convention is needed here.
+
+2026-09-20 schema revision: added next_review_due (see
+src/fundamentals/peer_classification.py's module docstring for why this
+is a deliberately separate concept from effective_to) and reordered the
+date columns to match the confirmed column order. This module does not
+validate rows -- see that reminder in the module docstring above -- so
+this reorder needed no logic change here, only the fieldnames list.
+
+Deliberately NOT added here: sec_sic / sec_sic_description. Those stay
+Single Source of Truth in data/reference/issuer_identity.csv (joined by
+cik) -- duplicating them into peer_groups.csv would give the raw SIC two
+places to drift out of sync, which is exactly the kind of raw-vs-managed
+boundary confusion this module's design exists to prevent.
 """
 
 from __future__ import annotations
@@ -30,9 +43,10 @@ PEER_GROUPS_FIELDNAMES = [
     "classification_status",
     "mapping_version",
     "effective_from",
-    "classification_available_date",
     "effective_to",
+    "classification_available_date",
     "reviewed_at",
+    "next_review_due",
     "review_reason",
     "notes",
 ]
