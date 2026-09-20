@@ -21,6 +21,7 @@ from src.sec.identity import (
     validate_issuer_identity_provenance,
     normalize_security_identities,
     validate_security_identity,
+    resolve_cik_for_ticker,
     resolve_identity_status,
 )
 
@@ -239,6 +240,46 @@ def test_validate_security_identity_none_identity_status_is_fine():
 
 def test_validate_security_identity_rejects_non_dict():
     assert validate_security_identity(42) == ["root"]
+
+
+# ============================================================
+# resolve_cik_for_ticker
+# ============================================================
+
+def _company_tickers_fixture():
+    """Real shape confirmed live 2026-09-20 (www.sec.gov/files/company_tickers.json):
+    object keyed by numeric string index, cik_str is an int, NOT zero-padded."""
+    return {
+        "0": {"cik_str": 1045810, "ticker": "NVDA", "title": "NVIDIA CORP"},
+        "1": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+        "2": {"cik_str": 1652044, "ticker": "GOOGL", "title": "Alphabet Inc."},
+    }
+
+
+def test_resolve_cik_for_ticker_zero_pads_to_ten_digits():
+    assert resolve_cik_for_ticker(_company_tickers_fixture(), "AAPL") == "0000320193"
+
+
+def test_resolve_cik_for_ticker_case_insensitive():
+    assert resolve_cik_for_ticker(_company_tickers_fixture(), "aapl") == "0000320193"
+
+
+def test_resolve_cik_for_ticker_returns_none_when_not_found():
+    assert resolve_cik_for_ticker(_company_tickers_fixture(), "ZZZZZ") is None
+
+
+def test_resolve_cik_for_ticker_rejects_non_dict():
+    try:
+        resolve_cik_for_ticker([], "AAPL")
+        assert False, "expected TypeError"
+    except TypeError:
+        pass
+
+
+def test_resolve_cik_for_ticker_seven_digit_cik_still_zero_pads():
+    # NVDA's cik_str (1045810) is 7 digits -- confirms zfill(10) pads
+    # correctly rather than assuming a fixed input width.
+    assert resolve_cik_for_ticker(_company_tickers_fixture(), "NVDA") == "0001045810"
 
 
 # ============================================================
