@@ -230,6 +230,39 @@ def validate_security_identity(row: dict) -> list[str]:
 
 
 # ============================================================
+# TICKER -> CIK RESOLUTION (pure lookup against a bulk fetch result)
+# ============================================================
+
+def resolve_cik_for_ticker(company_tickers: dict, ticker: str) -> str | None:
+    """
+    Look up `ticker`'s CIK in an already-fetched
+    fetch_company_tickers() result (src/sec/fetcher.py), zero-padded to
+    10 digits to match build_submissions_url's / build_companyfacts_url's
+    convention (both confirmed live to expect/return this format).
+
+    Pure function -- no network, no file I/O, matching this module's own
+    contract. Case-insensitive on the ticker (SEC's own file uses
+    upper-case tickers, but callers should not have to know that).
+
+    Returns None if `ticker` is not found -- never guesses, never returns
+    a partial/best-effort match.
+    """
+    if not isinstance(company_tickers, dict):
+        raise TypeError("company_tickers must be a dict.")
+
+    ticker_upper = ticker.upper()
+    for entry in company_tickers.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("ticker", "")).upper() == ticker_upper:
+            cik_str = entry.get("cik_str")
+            if cik_str is None:
+                return None
+            return str(cik_str).zfill(10)
+    return None
+
+
+# ============================================================
 # IDENTITY RESOLUTION (cross-check our reference data vs fresh SEC data)
 # ============================================================
 
@@ -305,5 +338,6 @@ __all__ = [
     "validate_issuer_identity_provenance",
     "normalize_security_identities",
     "validate_security_identity",
+    "resolve_cik_for_ticker",
     "resolve_identity_status",
 ]
