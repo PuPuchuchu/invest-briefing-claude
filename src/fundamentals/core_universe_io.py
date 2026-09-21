@@ -184,25 +184,39 @@ SEC_AVAILABILITY_STATUSES = frozenset(
 INCLUSION_STATUSES = frozenset(
     {
         "CANDIDATE_PROPOSED",  # listed here, not yet SEC-verified
-        "CANDIDATE_VERIFIED",  # SEC-verified (sec_availability=CONFIRMED),
-        # awaiting economic-comparability sign-off before promotion
+        "UNDER_REVIEW",  # SEC-verified (sec_availability=CONFIRMED),
+        # awaiting economic-comparability sign-off before promotion.
+        # 2026-09-21 rename: this status was previously named
+        # CANDIDATE_VERIFIED -- ChatGPT's 2026-09-21 design round renamed
+        # it to UNDER_REVIEW to match the confirmed lifecycle
+        # CANDIDATE_PROPOSED -> UNDER_REVIEW -> PROMOTED / REJECTED. The
+        # two names are never allowed to coexist; every existing
+        # CANDIDATE_VERIFIED reference (code, tests, CSV data) was
+        # migrated in the same round -- see
+        # tests/test_core_universe_io.py and
+        # data/reference/core_universe_candidates.csv.
         "PROMOTED",  # sign-off complete; a REVIEWED row now exists in
         # peer_groups.csv for this CIK -- this row is a historical record,
-        # not a duplicate source of truth
+        # not a duplicate source of truth. Per
+        # src/fundamentals/core_promotion_consistency.py (2026-09-21), a
+        # PROMOTED row SHOULD also have a corresponding CORE+ACTIVE row
+        # in data/reference/universe_membership.csv as of the current
+        # evaluation date -- that cross-file consistency is checked
+        # there, not by this module.
         "REJECTED",  # considered and explicitly rejected (e.g. structural
         # comparability concerns found during review) -- kept for audit
         # trail rather than deleted
     }
 )
 
-# A CANDIDATE_VERIFIED or PROMOTED row must have a resolved CIK and
+# A UNDER_REVIEW or PROMOTED row must have a resolved CIK and
 # CONFIRMED SEC availability; a fabricated/guessed CIK is never
 # acceptable at any status.
 _VALID_STATUS_AVAILABILITY_COMBINATIONS = frozenset(
     {
         ("CANDIDATE_PROPOSED", "UNVERIFIED"),
         ("CANDIDATE_PROPOSED", "NOT_FOUND"),
-        ("CANDIDATE_VERIFIED", "CONFIRMED"),
+        ("UNDER_REVIEW", "CONFIRMED"),
         ("PROMOTED", "CONFIRMED"),
         ("REJECTED", "UNVERIFIED"),
         ("REJECTED", "CONFIRMED"),
@@ -354,7 +368,7 @@ def validate_core_universe_row(row: dict) -> list[str]:
     if sec_availability == "CONFIRMED" and not cik:
         failures.append("cik_missing_for_confirmed_sec_availability")
 
-    if inclusion_status in ("CANDIDATE_VERIFIED", "PROMOTED") and not cik:
+    if inclusion_status in ("UNDER_REVIEW", "PROMOTED") and not cik:
         failures.append("cik_missing_for_verified_or_promoted")
 
     # -- SEC verification metadata (2026-09-20 SAP/IFRS + AVGO policy round) --
