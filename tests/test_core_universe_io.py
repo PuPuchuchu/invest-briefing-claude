@@ -123,7 +123,7 @@ def test_valid_verified_row_passes():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
     )
     assert validate_core_universe_row(row) == []
 
@@ -169,7 +169,7 @@ def test_verified_status_without_cik_fails():
     row = _proposed_row(
         cik=None,
         sec_availability="UNVERIFIED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
     )
     failures = validate_core_universe_row(row)
     # Wrong status/availability combination AND missing CIK both flagged.
@@ -244,7 +244,7 @@ def test_valid_ifrs_unsupported_not_eligible_row_passes():
         ticker="SAP",
         cik="0001000184",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         sec_filing_type="20-F",
         accounting_basis="IFRS",
         normalization_status="UNSUPPORTED",
@@ -275,7 +275,7 @@ def test_eligible_requires_supported_normalization():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="UNVERIFIED",
         business_model_status="COMPARABLE",
         business_mix_status="PURE_PLAY",
@@ -289,7 +289,7 @@ def test_eligible_requires_comparable_or_conditional_business_model():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="SUPPORTED",
         business_model_status="NOT_COMPARABLE",
         business_mix_status="PURE_PLAY",
@@ -303,7 +303,7 @@ def test_eligible_requires_determined_business_mix():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="SUPPORTED",
         business_model_status="COMPARABLE",
         business_mix_status="UNVERIFIED",
@@ -317,7 +317,7 @@ def test_eligible_requires_determined_metric_eligibility_policy():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="SUPPORTED",
         business_model_status="COMPARABLE",
         business_mix_status="PURE_PLAY",
@@ -347,7 +347,7 @@ def test_unknown_sec_filing_type_fails():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         sec_filing_type="40-F",
     )
     assert "sec_filing_type" in validate_core_universe_row(row)
@@ -357,7 +357,7 @@ def test_unknown_accounting_basis_fails():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         accounting_basis="LOCAL_GAAP",
     )
     assert "accounting_basis" in validate_core_universe_row(row)
@@ -395,7 +395,7 @@ def test_ifrs_cannot_be_normalization_supported():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         accounting_basis="IFRS",
         normalization_status="SUPPORTED",
     )
@@ -406,7 +406,7 @@ def test_unsupported_normalization_cannot_be_production_eligible():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="UNSUPPORTED",
         production_eligibility="ELIGIBLE",
     )
@@ -422,7 +422,7 @@ def test_not_eligible_without_reason_fails():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         production_eligibility="NOT_ELIGIBLE",
         eligibility_reason=None,
     )
@@ -433,7 +433,7 @@ def test_not_eligible_with_reason_passes_that_check():
     row = _proposed_row(
         cik="0000123456",
         sec_availability="CONFIRMED",
-        inclusion_status="CANDIDATE_VERIFIED",
+        inclusion_status="UNDER_REVIEW",
         normalization_status="UNSUPPORTED",
         accounting_basis="IFRS",
         production_eligibility="NOT_ELIGIBLE",
