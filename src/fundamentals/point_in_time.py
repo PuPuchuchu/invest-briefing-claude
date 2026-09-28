@@ -35,7 +35,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from src.fundamentals.sec_normalizer import find_concept
+from src.fundamentals.sec_normalizer import find_concept, get_all_concepts, validate_companyfacts
 from src.fundamentals.sec_history import extract_concept_history, validate_history
 
 SCHEMA_VERSION = "point_in_time_v0.1"
@@ -162,6 +162,88 @@ def as_of_concept_data(
 
     result = dict(concept_data)
     result["units"] = gated_units
+
+    return result
+
+
+# ============================================================
+# WHOLE-DOCUMENT-LEVEL GATING
+# ============================================================
+
+def gate_companyfacts_as_of(
+    data: dict,
+    evaluation_date: Any,
+) -> dict:
+    """
+    Gate an ENTIRE raw SEC Company Facts document (every namespace and
+    concept, not just one already-identified concept) to what was
+    publicly available as of evaluation_date.
+
+    Added 2026-09-28 for Framework v2.1 Architecture v5, implementation
+    step 3 ("Thin Production Orchestrator"). Why this exists: this
+    module's other gating functions (is_observation_available_as_of /
+    filter_observations_as_of / as_of_concept_data) all operate on ONE
+    already-identified concept block. But sec_normalizer.py's own
+    multi-candidate concept SELECTION logic (find_best_instant_concept /
+    find_best_annual_concept -- e.g. the candidate list inside
+    normalize_company()'s noncurrent_debt branch) reads directly from
+    `data["facts"]`, unfiltered, and picks the "best" (latest period end,
+    then latest filed date) observation among several candidate
+    concepts. If normalize_company() were called on raw, ungated data,
+    it could legitimately select an observation that was not yet public
+    as of evaluation_date -- a look-ahead-bias violation exactly as
+    serious as the one point_in_time.py's other functions already exist
+    to prevent for a single concept.
+
+    This function closes that gap WITHOUT introducing any new economic
+    or selection logic of its own: it is pure composition of two
+    already-validated, already-tested primitives --
+    sec_normalizer.get_all_concepts() (enumerate every namespace/concept
+    pair present) and this module's own as_of_concept_data() (gate one
+    concept block) -- applied to every concept in the document. The
+    candidate-selection logic itself (which concept wins, e.g.
+    LongTermDebtNoncurrent vs LongTermNotesPayable) is left entirely to
+    sec_normalizer.py, unmodified; this function only ensures that by
+    the time that selection logic runs, every observation it can
+    possibly see was genuinely public as of evaluation_date.
+
+    Returns a new dict of the same top-level shape as `data` (cik /
+    entityName / other top-level keys preserved unchanged, `facts`
+    replaced with a gated copy). `data` itself is never mutated. A
+    concept with zero observations surviving the gate is kept in the
+    output as an empty-units concept block (mirrors as_of_concept_data's
+    own "nothing was public yet" semantics -- not an error, not
+    silently dropped, since sec_normalizer.find_concept() must still be
+    able to find the concept key and correctly conclude "no usable
+    observation" rather than "concept does not exist at all").
+    """
+    validate_companyfacts(data)
+
+    evaluation_date = coerce_evaluation_date(evaluation_date)
+
+    gated_facts: dict[str, dict[str, dict]] = {}
+
+    for entry in get_all_concepts(data):
+        namespace = entry["namespace"]
+        concept_name = entry["concept"]
+        concept_data = entry["data"]
+
+        if not isinstance(concept_data, dict):
+            # Malformed concept block -- preserved as-is, exactly as
+            # get_all_concepts() itself does no shape enforcement here;
+            # as_of_concept_data() would raise on this, and a single
+            # malformed concept among hundreds must not abort gating the
+            # rest of the document.
+            gated_facts.setdefault(namespace, {})[concept_name] = concept_data
+            continue
+
+        gated_facts.setdefault(namespace, {})[concept_name] = as_of_concept_data(
+            concept_data,
+            evaluation_date,
+        )
+
+    result = dict(data)
+    result["facts"] = gated_facts
 
     return result
 
