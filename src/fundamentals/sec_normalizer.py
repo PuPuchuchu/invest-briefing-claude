@@ -711,6 +711,20 @@ def normalize_company(
             "noncurrent_debt",
             [
                 "LongTermDebtNoncurrent",
+                # Fallback migrated from src/fundamentals/sec_historical.py's
+                # CONCEPT_MAP (2026-09-28, Framework v2.1 Architecture v5,
+                # implementation step 1 -- "ORCL fallback migration").
+                # Confirmed against real SEC data (2026-09-18 investigation):
+                # Oracle (CIK 0001341439) has zero observations under
+                # LongTermDebtNoncurrent (404 from data.sec.gov) and instead
+                # tags its noncurrent debt under LongTermNotesPayable (86 real
+                # observations spanning 2009-2026, e.g. $122.3B as of
+                # FY2026-05-31, filed 2026-06-22, form 10-K). Before this
+                # migration, this candidate list -- the one actually used by
+                # the production path (point_in_time.py -> sec_normalizer.
+                # find_concept / normalize_company) -- did not have this
+                # fallback; only the non-production sec_historical.py did.
+                "LongTermNotesPayable",
             ],
         )
 
