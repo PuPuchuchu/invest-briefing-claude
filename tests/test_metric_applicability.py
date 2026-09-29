@@ -47,6 +47,7 @@ from src.fundamentals.metric_applicability import (
     MAPPING_SOURCES,
     MODIFIER_CONFLICT_PRIORITY,
     MODIFIER_RESULT_STATUSES,
+    POLICY_VERSIONS,
     PRODUCTION_METRICS,
     PROFILE_IDS,
     RESOLVER_IDS,
@@ -329,6 +330,7 @@ def _valid_applicable_row(**overrides) -> dict:
         "applicability_status": "APPLICABLE",
         "resolver_id": None,
         "policy_owner": "ChatGPT design round",
+        "policy_version": "v1.0",
     }
     row.update(overrides)
     return row
@@ -341,6 +343,7 @@ def _valid_conditional_row(**overrides) -> dict:
         "applicability_status": "CONDITIONAL",
         "resolver_id": "MODIFIER_TABLE_RESOLVER",
         "policy_owner": "ChatGPT design round",
+        "policy_version": "v1.0",
     }
     row.update(overrides)
     return row
@@ -378,6 +381,20 @@ def test_applicability_row_rejects_unknown_metric_name():
 def test_applicability_row_requires_policy_owner():
     row = _valid_applicable_row(policy_owner=None)
     assert "policy_owner" in validate_metric_applicability_row(row)
+
+
+def test_applicability_row_requires_policy_version():
+    row = _valid_applicable_row(policy_version=None)
+    assert "policy_version" in validate_metric_applicability_row(row)
+
+
+def test_applicability_row_rejects_unknown_policy_version():
+    row = _valid_applicable_row(policy_version="v2.0")
+    assert "policy_version_unknown" in validate_metric_applicability_row(row)
+
+
+def test_policy_versions_contains_only_v1_0_so_far():
+    assert POLICY_VERSIONS == {"v1.0"}
 
 
 def _full_84_row_matrix(conditional_key: tuple[str, str] | None = None) -> list[dict]:
@@ -453,6 +470,7 @@ def _valid_modifier_row(**overrides) -> dict:
         "rationale": "Diversified business mix distorts pure-play comparison.",
         "effective_from": "2026-09-28",
         "effective_to": None,
+        "policy_version": "v1.0",
     }
     row.update(overrides)
     return row
@@ -505,6 +523,16 @@ def test_modifier_row_rejects_conditional_as_result():
 def test_modifier_row_requires_reason_fields(field):
     row = _valid_modifier_row(**{field: None})
     assert field in validate_metric_applicability_modifier_row(row)
+
+
+def test_modifier_row_requires_policy_version():
+    row = _valid_modifier_row(policy_version=None)
+    assert "policy_version" in validate_metric_applicability_modifier_row(row)
+
+
+def test_modifier_row_rejects_unknown_policy_version():
+    row = _valid_modifier_row(policy_version="v2.0")
+    assert "policy_version_unknown" in validate_metric_applicability_modifier_row(row)
 
 
 def test_modifier_row_open_ended_effective_to_allowed():
@@ -709,3 +737,144 @@ def test_resolve_metric_applicability_missing_row_is_unverified_never_default_ap
     )
     assert result["status"] == "UNVERIFIED"
     assert result["source"] == "base_policy"
+
+
+# ============================================================
+# STEP 5A RUNTIME MODIFIER VERIFICATION (2026-09-28 confirmation round)
+#
+# This section adds NO new production logic -- resolve_metric_applicability()
+# / evaluate_modifiers() above are Step 4 code, unchanged by this round (see
+# their own docstrings). This section exists purely to verify, with explicit
+# test coverage, that the already-implemented contract matches every rule
+# the 2026-09-28 confirmation document restates as authoritative -- in
+# particular the headline correction that "trigger 값이 확정되어 있고 modifier
+# row가 없으면 Base Policy 유지" is NOT used; the tested fail-closed UNVERIFIED
+# behavior from Step 4 is authoritative instead. None of the tests above are
+# modified.
+# ============================================================
+
+def test_step5a_conditional_matching_modifier_applicable_result():
+    applicability_rows = [_valid_conditional_row()]
+    modifier_rows = [_valid_modifier_row(result="APPLICABLE", reason_code="BUSINESS_MIX_PURE_PLAY_CONFIRMS")]
+    result = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert result["status"] == "APPLICABLE"
+    assert result["source"] == "modifier_resolution"
+
+
+def test_step5a_conditional_matching_modifier_not_applicable_result():
+    applicability_rows = [_valid_conditional_row()]
+    modifier_rows = [_valid_modifier_row(result="NOT_APPLICABLE")]
+    result = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert result["status"] == "NOT_APPLICABLE"
+
+
+def test_step5a_conditional_trigger_fact_unknown_is_unverified():
+    """runtime_facts simply doesn't have the field this modifier reacts to
+    -- a "trigger unknown" case distinct from an unrecognized/malformed
+    value."""
+    applicability_rows = [_valid_conditional_row()]
+    modifier_rows = [_valid_modifier_row()]
+    result = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {},
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert result["status"] == "UNVERIFIED"
+
+
+def test_step5a_conditional_trigger_confirmed_no_matching_modifier_is_unverified():
+    """The 2026-09-28 confirmation document's own headline example:
+    Base=CONDITIONAL, business_mix_status=PURE_PLAY confirmed, but no
+    PURE_PLAY modifier row exists -> UNVERIFIED. NOT APPLICABLE, and NOT a
+    fallback to Base Policy / default_applicability."""
+    applicability_rows = [_valid_conditional_row()]
+    modifier_rows = [_valid_modifier_row(trigger="business_mix_status=DIVERSIFIED")]
+    result = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {"business_mix_status": "PURE_PLAY"},
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert result["status"] == "UNVERIFIED"
+    assert result["source"] == "modifier_resolution"
+
+
+def test_step5a_applicable_base_with_modifier_present_stays_applicable():
+    applicability_rows = [_valid_applicable_row(applicability_status="APPLICABLE")]
+    poisoned_modifier_rows = [_valid_modifier_row(result="NOT_APPLICABLE")]
+    result = resolve_metric_applicability(
+        "GENERAL_CORPORATE", "fcf_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2026-09-28", applicability_rows, poisoned_modifier_rows,
+    )
+    assert result == {"status": "APPLICABLE", "source": "base_policy", "matched_modifier_ids": []}
+
+
+def test_step5a_not_applicable_base_with_modifier_present_stays_not_applicable():
+    applicability_rows = [_valid_applicable_row(applicability_status="NOT_APPLICABLE")]
+    poisoned_modifier_rows = [_valid_modifier_row(result="APPLICABLE")]
+    result = resolve_metric_applicability(
+        "GENERAL_CORPORATE", "fcf_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2026-09-28", applicability_rows, poisoned_modifier_rows,
+    )
+    assert result == {"status": "NOT_APPLICABLE", "source": "base_policy", "matched_modifier_ids": []}
+
+
+def test_step5a_unverified_base_with_modifier_present_stays_unverified():
+    applicability_rows = [_valid_applicable_row(applicability_status="UNVERIFIED")]
+    poisoned_modifier_rows = [_valid_modifier_row(result="APPLICABLE")]
+    result = resolve_metric_applicability(
+        "GENERAL_CORPORATE", "fcf_margin", {}, "2026-09-28", applicability_rows, poisoned_modifier_rows,
+    )
+    assert result == {"status": "UNVERIFIED", "source": "base_policy", "matched_modifier_ids": []}
+
+
+def test_step5a_evaluation_date_gates_resolve_metric_applicability_end_to_end():
+    """evaluation_date must actually flow through resolve_metric_applicability()
+    into the modifier's effective_from/effective_to gate, not just be
+    accepted and ignored."""
+    applicability_rows = [_valid_conditional_row()]
+    modifier_rows = [_valid_modifier_row(effective_from="2027-01-01")]
+
+    before_effective = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert before_effective["status"] == "UNVERIFIED"
+
+    after_effective = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", {"business_mix_status": "DIVERSIFIED"},
+        "2027-06-01", applicability_rows, modifier_rows,
+    )
+    assert after_effective["status"] == "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize(
+    "base_status,runtime_facts,modifier_rows",
+    [
+        ("APPLICABLE", {}, []),
+        ("NOT_APPLICABLE", {}, []),
+        ("UNVERIFIED", {}, []),
+        ("CONDITIONAL", {"business_mix_status": "DIVERSIFIED"}, [_valid_modifier_row()]),
+        ("CONDITIONAL", {"business_mix_status": "PURE_PLAY"}, [_valid_modifier_row()]),
+        ("CONDITIONAL", {}, []),
+        ("CONDITIONAL", {"business_mix_status": "GARBAGE"}, [_valid_modifier_row()]),
+    ],
+)
+def test_step5a_final_result_never_conditional(base_status, runtime_facts, modifier_rows):
+    """2026-09-28 confirmation: 'runtime 결과는 반드시 APPLICABLE / NOT_APPLICABLE /
+    UNVERIFIED 중 하나 -- 최종 결과로 CONDITIONAL을 절대 반환하지 않음.' Swept across
+    every base status and every modifier-matching scenario above."""
+    if base_status == "CONDITIONAL":
+        applicability_rows = [_valid_conditional_row()]
+    else:
+        applicability_rows = [_valid_applicable_row(applicability_status=base_status)]
+
+    result = resolve_metric_applicability(
+        "FABLESS_SEMICONDUCTOR", "operating_margin", runtime_facts,
+        "2026-09-28", applicability_rows, modifier_rows,
+    )
+    assert result["status"] in {"APPLICABLE", "NOT_APPLICABLE", "UNVERIFIED"}
+    assert result["status"] != "CONDITIONAL"
