@@ -52,13 +52,80 @@ annual records use SEC's own "end"/"val" keys, while
 derived_metrics.py's `*_history` parameters expect "period_end"/
 "value"; renaming those keys is plumbing, not a new economic decision).
 
-Explicitly NOT wired in this round (Framework v2.1 final approval,
+2026-09-29 update -- GROWTH and DATA_SUFFICIENCY are now wired
+-----------------------------------------------------------------------
+Per the Framework v2.1 Step 5B production-path verification round
+(2026-09-29), this orchestrator now also runs
+src.fundamentals.growth.calculate_growth() (a new GROWTH stage) and
+src.fundamentals.data_sufficiency.classify_growth_data_sufficiency() (a
+new DATA_SUFFICIENCY stage) as two more real stages in the same one
+execution path, using the SAME PIT-gated companyfacts and the SAME
+already-selected concepts every earlier stage uses (see
+_pit_history_for_selected_concept() / _growth_historical_slice() /
+_GROWTH_HISTORY_CONCEPTS / _GROWTH_METRIC_CONCEPT_DEPENDENCIES below).
+Neither calculate_growth()'s own formulas nor
+classify_growth_data_sufficiency()'s own classification rules were
+changed to wire this in -- only plumbing (concept selection -> PIT
+history -> shape adaptation -> already-existing function call),
+matching this module's "thin" philosophy throughout. This does NOT
+mean quality.py, Metric Applicability, Runtime Modifier, Relative
+Evaluation, or Factor aggregation are wired -- see below, still
+current.
+
+IMPORTANT -- this GROWTH -> DATA_SUFFICIENCY placement is NOT the final
+Framework v5 Production Execution Order (ChatGPT confirmation,
+2026-09-29 approval of Step 5)
+-----------------------------------------------------------------------
+The current stage order in this function
+(... -> derived_metrics -> GROWTH -> DATA_SUFFICIENCY -> peer_group ->
+...) exists ONLY as Step 5B integration/verification wiring -- proof
+that concept_found genuinely reaches
+classify_growth_data_sufficiency() through a real execution path, per
+the 2026-09-29 production-path verification round. It is explicitly
+NOT confirmed, documented, or to be treated anywhere else in this
+codebase as the final economic execution order.
+
+The confirmed final Framework v5 order is:
+
+    Primary Peer Group -> Metric Profile -> Base Applicability ->
+    Runtime Modifier -> Data Sufficiency Preflight -> Metric
+    Calculation -> Relative Evaluation
+
+Two consequences that follow directly from that confirmed order and do
+NOT hold in this file's current (temporary) wiring:
+  1. If Applicability resolves to NOT_APPLICABLE for a metric, that
+     metric's calculation must never even be attempted -- Applicability
+     gates Calculation, not the other way around. This orchestrator's
+     GROWTH stage currently runs unconditionally (Metric Applicability
+     isn't wired here at all yet -- see the metric_applicability stage
+     below, still NOT_WIRED), so this gating does not yet exist here.
+  2. Data Sufficiency belongs BEFORE Metric Calculation in the final
+     order (a "Preflight"), not after it as a post-hoc relabeling of
+     calculate_growth()'s own output the way it runs today.
+  3. quality.py Note: this round's constraint list also directs this
+     Step 5 round not to add wiring beyond what verification required;
+     quality.py accordingly remains completely unwired here.
+
+Re-sequencing GROWTH/DATA_SUFFICIENCY into their correct position
+relative to Metric Applicability / Runtime Modifier / Relative
+Evaluation is explicitly deferred to Step 6, when Metric Applicability
++ Data Sufficiency + Metric Calculation get their real, final
+production connection -- at that point the current temporary wiring
+here gets relocated, not re-invented (the underlying calls --
+_pit_history_for_selected_concept(), _growth_historical_slice(),
+calculate_growth(), classify_growth_data_sufficiency() -- stay the
+same; only WHEN they run, relative to Applicability, changes). Nothing
+in Step 5 should be read as declaring this stage order final, and
+nothing in Step 6 should assume this file's current stage order is a
+constraint to preserve.
+
+Still explicitly NOT wired (Framework v2.1 final approval,
 constraint (1) -- "Step 3 완료를 10C activation으로 간주하지 않는다")
 -----------------------------------------------------------------------
 Metric Profile / Base Applicability / Runtime Modifier / Final Runtime
-Applicability / Data Sufficiency Preflight, Relative Evaluation
-(percentile scoring against real peer raw values), and Factor
-aggregation are all deliberately left OUT of this orchestrator's
+Applicability, Relative Evaluation (percentile scoring against real
+peer raw values), Factor aggregation, and quality.py (Quality Factor
+calculation) are all deliberately left OUT of this orchestrator's
 execution path -- not stubbed, not faked, not approximated. Reasons:
 
     - The Metric Applicability reference data (metric_profiles.csv,
@@ -108,7 +175,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from src.fundamentals.data_sufficiency import classify_growth_data_sufficiency
 from src.fundamentals.derived_metrics import calculate_derived_metrics
+from src.fundamentals.growth import calculate_growth
 from src.fundamentals.peer_classification import get_peer_mapping_as_of
 from src.fundamentals.point_in_time import (
     coerce_evaluation_date,
@@ -131,6 +200,43 @@ SCHEMA_VERSION = "orchestrator_v0.1"
 # economic decision (the underlying calculate_yoy formula, and which
 # metrics HAVE a YoY component at all, are calculate_derived_metrics()'s
 # and metric_specs.py's decisions, already made elsewhere).
+# src.fundamentals.growth.calculate_growth()'s `historical` parameter
+# reads exactly these 5 normalize_company() metric keys (see growth.py's
+# calculate_growth(): historical.get("revenue"/"operating_income"/
+# "diluted_eps"/"cfo"/"capex")). Added 2026-09-29 (production-path
+# verification round, Step 5B wiring) -- a naming/wiring table, not an
+# economic decision, exactly like _YOY_HISTORY_METRICS above. Overlaps
+# with _YOY_HISTORY_METRICS on revenue/operating_income/cfo/capex
+# (both derived_metrics.py and growth.py independently need those same
+# 4 concepts' PIT history) and additionally needs diluted_eps, which
+# derived_metrics.py's YoY kwargs never required.
+_GROWTH_HISTORY_CONCEPTS = [
+    "revenue",
+    "operating_income",
+    "diluted_eps",
+    "cfo",
+    "capex",
+]
+
+# Which of growth.py's 5 GROWTH_METRICS depends on which
+# _GROWTH_HISTORY_CONCEPTS concept(s), for concept_found propagation
+# into data_sufficiency.classify_growth_data_sufficiency() (2026-09-29).
+# fcf_yoy depends on BOTH cfo and capex (calculate_growth() builds FCF
+# history as cfo + capex before computing YoY on it -- see growth.py's
+# _build_fcf_history()); a concept-coverage gap in EITHER one is a
+# concept-coverage gap for fcf_yoy too, so both must have been found for
+# fcf_yoy's concept_found to be True. This mapping is plumbing (which
+# already-selected concept feeds which already-defined growth
+# component) -- it does not decide which metrics exist or how they are
+# computed; that is growth.py's own GROWTH_METRICS/GROWTH_WEIGHTS.
+_GROWTH_METRIC_CONCEPT_DEPENDENCIES = {
+    "revenue_yoy": ("revenue",),
+    "operating_income_yoy": ("operating_income",),
+    "eps_yoy": ("diluted_eps",),
+    "fcf_yoy": ("cfo", "capex"),
+    "revenue_cagr_3y": ("revenue",),
+}
+
 _YOY_HISTORY_METRICS = {
     "revenue": "revenue_history",
     "net_income": "net_income_history",
@@ -240,6 +346,101 @@ def _pit_annual_history_for_selected_concept(
     return history.get("annual") or []
 
 
+def _pit_history_for_selected_concept(
+    gated_data: dict,
+    evaluation_date: date,
+    metric_result: dict | None,
+) -> dict | None:
+    """
+    Like _pit_annual_history_for_selected_concept() above, but returns
+    the FULL point_in_time.get_point_in_time_history() result (annual +
+    quarterly + standalone_quarters), not just the annual slice.
+
+    Added 2026-09-29 (production-path verification round, Step 5B
+    wiring) because src.fundamentals.growth.calculate_growth() needs
+    BOTH series: revenue_cagr_3y compares two annual observations, but
+    revenue_yoy / operating_income_yoy / eps_yoy / fcf_yoy all compare
+    consecutive-year QUARTERS (see growth.py's
+    _select_latest_quarter_pair(), called with period="quarterly") --
+    something the existing annual-only helper never fetched, because the
+    derived_metrics stage above only ever needed the annual series.
+
+    Returns None under the exact same two conditions
+    _pit_annual_history_for_selected_concept() already documents:
+    metric_result is not an OK sec_normalizer.normalize_company() result
+    (no concept was ever resolved for this metric at all), or the
+    resolved concept genuinely is not present in gated_data. This
+    None-vs-a-real-(possibly-empty)-history-dict distinction is exactly
+    the "concept found or not" signal
+    data_sufficiency.classify_component_sufficiency()'s concept_found
+    parameter was added (2026-09-29) to consume -- see that module's
+    docstring for why growth.py's own MISSING status cannot make this
+    distinction by itself. Deliberately NOT collapsed into an empty
+    history the way _pit_annual_history_for_selected_concept()'s callers
+    already do for the annual-only derived_metrics stage.
+    """
+    if not isinstance(metric_result, dict):
+        return None
+
+    if metric_result.get("status") != "OK":
+        return None
+
+    namespace = metric_result.get("namespace")
+    concept = metric_result.get("concept")
+
+    if not namespace or not concept:
+        return None
+
+    # Idempotent re-gate -- see _pit_annual_history_for_selected_concept()
+    # above for why calling get_point_in_time_history() again here on
+    # already-gated data is harmless.
+    return get_point_in_time_history(
+        gated_data,
+        namespace,
+        concept,
+        evaluation_date,
+    )
+
+
+def _growth_historical_slice(history: dict | None) -> dict[str, list[dict]]:
+    """
+    Shape-adapt one concept's full PIT history dict into the
+    {"annual": [...], "quarterly": [...]} shape
+    src.fundamentals.growth.calculate_growth()'s `historical[concept]`
+    expects (added 2026-09-29, Step 5B wiring).
+
+    Pure shape adaptation, no new selection/reconstruction logic (see
+    module docstring's "shape adaptation" section and
+    _history_records_for_yoy() above for the established precedent this
+    follows):
+
+      - "annual": sec_history.py's raw annual records use SEC's own
+        "end"/"val" keys -- renamed via the SAME
+        _history_records_for_yoy() helper the derived_metrics stage
+        already uses above, unchanged.
+      - "quarterly": growth.py's YoY components compare CONSECUTIVE-YEAR
+        QUARTERS, which is exactly what sec_history.py's already-tested
+        reconstruct_standalone_quarters() already computes (Q1=Q1,
+        Q2=H1-Q1, Q3=9M-H1, Q4=FY-9M) and get_point_in_time_history()
+        already exposes as history["standalone_quarters"] -- NOT the
+        same as history["quarterly"] (that field groups raw 10-Q
+        observations by cumulative-duration TYPE -- q1/ytd_6m/ytd_9m/
+        unknown -- it is not a flat per-quarter series and growth.py
+        does not consume it). Standalone-quarter records already use
+        growth.py's own {"period_end", "value", "fy", "quarter"} field
+        names natively (see sec_history._make_reconstructed_quarter()),
+        so -- unlike the annual records -- no key renaming is needed or
+        applied here.
+    """
+    if history is None:
+        return {"annual": [], "quarterly": []}
+
+    return {
+        "annual": _history_records_for_yoy(history.get("annual") or []),
+        "quarterly": list(history.get("standalone_quarters") or []),
+    }
+
+
 # ============================================================
 # ORCHESTRATOR
 # ============================================================
@@ -324,6 +525,8 @@ def run_fundamentals_pipeline(
                 "normalization": {"status": ..., "normalized": {...} },
                 "annual_history": {"status": ..., "history": {metric: [...]}},
                 "derived_metrics": {"status": ..., "derived": {...}},
+                "growth": {"status": ..., "growth": {...}},
+                "data_sufficiency": {"status": ..., "sufficiency": {metric: {...}}},
                 "peer_group": {"status": ...},
                 "universe_membership": {"status": ..., "watchlist": ..., "core": ...},
                 "metric_applicability": {"status": "NOT_WIRED", "reason": "..."},
@@ -452,6 +655,80 @@ def run_fundamentals_pipeline(
     }
 
     # --------------------------------------------------------
+    # STAGE: GROWTH (2026-09-29, production-path verification round --
+    # Step 5B Data Sufficiency wiring)
+    #
+    # Invents no new economic/selection logic -- see
+    # _pit_history_for_selected_concept() / _growth_historical_slice()
+    # above. Reuses the SAME PIT-gated companyfacts and the SAME
+    # already-selected concepts (normalized["metrics"]) as every other
+    # stage above; calculate_growth() itself is untouched.
+    #
+    # NOT the final Framework v5 execution order -- see the module
+    # docstring's "IMPORTANT -- this GROWTH -> DATA_SUFFICIENCY
+    # placement is NOT the final Framework v5 Production Execution
+    # Order" section (ChatGPT's 2026-09-29 Step 5 approval). Runs
+    # unconditionally here because Metric Applicability isn't wired
+    # into this orchestrator at all yet (see the metric_applicability
+    # stage below, still NOT_WIRED) -- the final order gates
+    # Calculation on Applicability (NOT_APPLICABLE must never even
+    # attempt calculation) and runs Data Sufficiency as a Preflight
+    # BEFORE Calculation, not after it as a relabeling of
+    # calculate_growth()'s own output the way it runs today. Step 6
+    # relocates this wiring into that correct position; it does not
+    # re-invent it.
+    # --------------------------------------------------------
+
+    growth_historical: dict[str, dict[str, list[dict]]] = {}
+    concept_found_by_concept: dict[str, bool] = {}
+
+    for concept_key in _GROWTH_HISTORY_CONCEPTS:
+        metric_result = normalized["metrics"].get(concept_key)
+        concept_history = _pit_history_for_selected_concept(
+            gated_companyfacts,
+            eval_date,
+            metric_result,
+        )
+        concept_found_by_concept[concept_key] = concept_history is not None
+        growth_historical[concept_key] = _growth_historical_slice(concept_history)
+
+    growth_result = calculate_growth(normalized, derived, historical=growth_historical)
+    stages["growth"] = {
+        "status": STAGE_OK,
+        "growth": growth_result,
+    }
+
+    # --------------------------------------------------------
+    # STAGE: DATA_SUFFICIENCY (2026-09-29, production-path verification
+    # round -- Step 5B). Pure relabeling of the GROWTH stage's own
+    # already-computed OK/MISSING/INVALID output (see
+    # data_sufficiency.py's module docstring) -- classify_growth_data_
+    # sufficiency() is called exactly as-is, unmodified this round. The
+    # only new wiring is concept_found_by_metric, threaded from the
+    # concept-level lookups just above via
+    # _GROWTH_METRIC_CONCEPT_DEPENDENCIES, so a metric whose underlying
+    # SEC concept was never found at all is never mislabeled
+    # INSUFFICIENT_HISTORY (see data_sufficiency.py's CONCEPT_NOT_FOUND).
+    # --------------------------------------------------------
+
+    concept_found_by_growth_metric = {
+        growth_metric: all(
+            concept_found_by_concept.get(concept_key, False)
+            for concept_key in concept_keys
+        )
+        for growth_metric, concept_keys in _GROWTH_METRIC_CONCEPT_DEPENDENCIES.items()
+    }
+
+    sufficiency = classify_growth_data_sufficiency(
+        growth_result,
+        concept_found_by_metric=concept_found_by_growth_metric,
+    )
+    stages["data_sufficiency"] = {
+        "status": STAGE_OK,
+        "sufficiency": sufficiency,
+    }
+
+    # --------------------------------------------------------
     # STAGE: PEER_GROUP (optional)
     # --------------------------------------------------------
 
@@ -495,11 +772,17 @@ def run_fundamentals_pipeline(
         "status": STAGE_NOT_WIRED,
         "reason": (
             "Metric Profile / Base Applicability / Runtime Modifier / "
-            "Final Runtime Applicability / Data Sufficiency Preflight "
-            "reference data (metric_profiles.csv, "
-            "peer_group_metric_profile.csv, metric_applicability.csv, "
-            "metric_applicability_modifiers.csv) does not exist yet -- "
-            "Framework v2.1 implementation step 4."
+            "Final Runtime Applicability reference data "
+            "(metric_profiles.csv, peer_group_metric_profile.csv, "
+            "metric_applicability.csv, metric_applicability_modifiers.csv) "
+            "is only header-only reference scaffolding so far -- the real "
+            "economic policy rows (Framework v2.1 implementation step 4's "
+            "actual content) do not exist yet. Note: Data Sufficiency "
+            "(2026-09-29) is now wired separately -- see the "
+            "'data_sufficiency' stage above; it is deliberately NOT part "
+            "of this NOT_WIRED bucket any more, since Data Sufficiency "
+            "and Applicability are two different questions (see "
+            "src.fundamentals.data_sufficiency's module docstring)."
         ),
     }
     stages["relative_evaluation"] = {
