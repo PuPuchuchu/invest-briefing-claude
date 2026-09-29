@@ -56,6 +56,7 @@ METRIC_APPLICABILITY_FIELDNAMES = [
     "applicability_status",
     "resolver_id",
     "policy_owner",
+    "policy_version",
 ]
 
 METRIC_APPLICABILITY_MODIFIERS_FIELDNAMES = [
@@ -69,6 +70,7 @@ METRIC_APPLICABILITY_MODIFIERS_FIELDNAMES = [
     "rationale",
     "effective_from",
     "effective_to",
+    "policy_version",
 ]
 
 
