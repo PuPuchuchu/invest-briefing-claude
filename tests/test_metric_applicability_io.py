@@ -49,6 +49,7 @@ def test_metric_applicability_fieldnames_match_confirmed_schema():
         "applicability_status",
         "resolver_id",
         "policy_owner",
+        "policy_version",
     ]
 
 
@@ -64,6 +65,7 @@ def test_metric_applicability_modifiers_fieldnames_match_confirmed_schema():
         "rationale",
         "effective_from",
         "effective_to",
+        "policy_version",
     ]
 
 
@@ -113,6 +115,7 @@ def test_metric_applicability_csv_round_trip(tmp_path):
             "applicability_status": "APPLICABLE",
             "resolver_id": None,
             "policy_owner": "ChatGPT design round",
+            "policy_version": "v1.0",
         },
         {
             "profile_id": "FABLESS_SEMICONDUCTOR",
@@ -120,6 +123,7 @@ def test_metric_applicability_csv_round_trip(tmp_path):
             "applicability_status": "CONDITIONAL",
             "resolver_id": "MODIFIER_TABLE_RESOLVER",
             "policy_owner": "ChatGPT design round",
+            "policy_version": "v1.0",
         },
     ]
     path = tmp_path / "metric_applicability.csv"
@@ -140,6 +144,7 @@ def test_metric_applicability_modifiers_csv_round_trip(tmp_path):
             "rationale": "Diversified business mix.",
             "effective_from": "2026-09-28",
             "effective_to": None,
+            "policy_version": "v1.0",
         }
     ]
     path = tmp_path / "metric_applicability_modifiers.csv"
