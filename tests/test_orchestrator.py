@@ -340,3 +340,217 @@ def test_malformed_companyfacts_raises():
             company_type="NON_FINANCIAL",
             raw_companyfacts={"missing": "required keys"},
         )
+
+
+# ============================================================
+# GROWTH + DATA_SUFFICIENCY (2026-09-29, production-path verification
+# round -- Step 5B wiring). Five required cases per ChatGPT's
+# verification spec:
+#   A. concept never found at all       -> MISSING, CONCEPT_NOT_FOUND
+#   B. concept found, history missing   -> MISSING, INSUFFICIENT_HISTORY
+#   C. concept found, history sufficient -> OK (existing calc path)
+#   D. SNDK/spin-off shape (one quarter + one annual observation only)
+#   E. existing normal company -> zero regression in already-wired
+#      stages (sec_fetch..universe_membership)
+# ============================================================
+
+def test_growth_and_data_sufficiency_stages_are_wired():
+    """Baseline: both new stages actually run (STAGE_OK), and the
+    previously-NOT_WIRED stages this same round left untouched are
+    still exactly the 3 they always were (metric_applicability,
+    relative_evaluation, factor) -- data_sufficiency is no longer one
+    of them."""
+    result = _run("2026-09-28")
+    stages = result["stages"]
+
+    assert stages["growth"]["status"] == STAGE_OK
+    assert stages["data_sufficiency"]["status"] == STAGE_OK
+    assert set(stages["growth"]["growth"]["components"].keys()) == {
+        "revenue_yoy",
+        "operating_income_yoy",
+        "eps_yoy",
+        "fcf_yoy",
+        "revenue_cagr_3y",
+    }
+    assert set(stages["data_sufficiency"]["sufficiency"].keys()) == {
+        "revenue_yoy",
+        "operating_income_yoy",
+        "eps_yoy",
+        "fcf_yoy",
+        "revenue_cagr_3y",
+    }
+
+    for stage_name in ("metric_applicability", "relative_evaluation", "factor"):
+        assert stages[stage_name]["status"] == STAGE_NOT_WIRED
+
+
+def test_case_a_concept_never_found_is_concept_not_found_never_insufficient_history():
+    """Case A: the ORCL fixture only ever defines LongTermNotesPayable
+    and Revenue concepts -- operating_income / diluted_eps / cfo / capex
+    were never found for this company at all. Every growth metric that
+    depends solely on one of THOSE concepts must resolve to MISSING with
+    reason_code=CONCEPT_NOT_FOUND, never INSUFFICIENT_HISTORY (that
+    would misrepresent a concept-coverage gap as a "just wait for more
+    history" problem)."""
+    result = _run("2026-09-28")
+    sufficiency = result["stages"]["data_sufficiency"]["sufficiency"]
+
+    for metric_name in ("operating_income_yoy", "eps_yoy", "fcf_yoy"):
+        assert sufficiency[metric_name]["calculation_status"] == "MISSING"
+        assert sufficiency[metric_name]["reason_code"] == "CONCEPT_NOT_FOUND"
+        assert sufficiency[metric_name]["reason_code"] != "INSUFFICIENT_HISTORY"
+
+
+def test_case_b_concept_found_but_history_missing_is_insufficient_history():
+    """Case B: Revenue WAS found (normalize_company() selected it, per
+    test_pipeline_connects_raw_through_derived_metrics_as_one_path), but
+    the ORCL fixture has zero 10-Q quarterly filings and only 2 annual
+    fiscal years (not 3 apart) -- so revenue_yoy and revenue_cagr_3y
+    must resolve to MISSING/INSUFFICIENT_HISTORY, the concept-found
+    branch, never CONCEPT_NOT_FOUND."""
+    result = _run("2026-09-28")
+    sufficiency = result["stages"]["data_sufficiency"]["sufficiency"]
+
+    for metric_name in ("revenue_yoy", "revenue_cagr_3y"):
+        assert sufficiency[metric_name]["calculation_status"] == "MISSING"
+        assert sufficiency[metric_name]["reason_code"] == "INSUFFICIENT_HISTORY"
+        assert sufficiency[metric_name]["reason_code"] != "CONCEPT_NOT_FOUND"
+
+
+# Revenue with two comparable same-quarter (Q1) 10-Q filings one fiscal
+# year apart, added on top of ORCL_FIXTURE's existing annual revenue --
+# ORCL's fiscal year starts 2025-06-01/2024-06-01 (see the existing
+# annual "start" values above), so Q1 covers roughly the first ~90 days
+# of each fiscal year.
+_ORCL_FIXTURE_WITH_QUARTERLY_REVENUE = copy.deepcopy(ORCL_FIXTURE)
+_ORCL_FIXTURE_WITH_QUARTERLY_REVENUE["facts"]["us-gaap"][
+    "RevenueFromContractWithCustomerExcludingAssessedTax"
+]["units"]["USD"].extend(
+    [
+        {
+            "start": "2024-06-01",
+            "end": "2024-08-31",
+            "val": 13300000000,
+            "accn": "0000950170-24-999001",
+            "fy": 2025,
+            "fp": "Q1",
+            "form": "10-Q",
+            "filed": "2024-09-15",
+        },
+        {
+            "start": "2025-06-01",
+            "end": "2025-08-31",
+            "val": 14800000000,
+            "accn": "0000950170-25-999001",
+            "fy": 2026,
+            "fp": "Q1",
+            "form": "10-Q",
+            "filed": "2025-09-15",
+        },
+    ]
+)
+
+
+def test_case_c_concept_found_with_sufficient_history_reaches_ok():
+    """Case C: same concept as Case B, but with a comparable same-quarter
+    (Q1) pair one fiscal year apart now present -- revenue_yoy must
+    reach the existing OK calculation path (calculate_growth()'s own,
+    unmodified, formula), proving this wiring doesn't just detect
+    absence -- it also lets a genuinely sufficient case flow all the way
+    through to a real computed value."""
+    result = _run(
+        "2026-09-28",
+        raw_companyfacts=copy.deepcopy(_ORCL_FIXTURE_WITH_QUARTERLY_REVENUE),
+    )
+    revenue_yoy = result["stages"]["growth"]["growth"]["components"]["revenue_yoy"]
+    assert revenue_yoy["status"] == "OK"
+    assert revenue_yoy["value"] == pytest.approx(14800000000 / 13300000000 - 1)
+
+    sufficiency = result["stages"]["data_sufficiency"]["sufficiency"]["revenue_yoy"]
+    assert sufficiency["calculation_status"] == "OK"
+    assert sufficiency["reason_code"] is None
+
+
+def test_case_d_sndk_style_single_period_company_is_insufficient_history_at_orchestrator_level():
+    """Case D: a company with exactly ONE annual and ONE quarterly
+    revenue observation -- concept genuinely exists (this is a real,
+    filing company), but no PIT-gated comparison observation exists yet
+    (a newly-listed/spun-off company, the SNDK case already covered at
+    the unit level by tests/test_data_sufficiency.py). Run through the
+    REAL orchestrator path this time: must resolve to
+    MISSING/INSUFFICIENT_HISTORY, never CONCEPT_NOT_FOUND (the concept
+    WAS found) and never an Applicability-vocabulary status (this
+    orchestrator doesn't wire Applicability at all, so there is nothing
+    for the two to be confused with here -- Data Sufficiency stands on
+    its own)."""
+    spinoff_fixture = {
+        "cik": 9999999,
+        "entityName": "Newly Listed Spinoff Inc",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "label": "Revenue",
+                    "units": {
+                        "USD": [
+                            {
+                                "start": "2026-01-01",
+                                "end": "2026-03-31",
+                                "val": 150000000,
+                                "accn": "0001999999-26-000001",
+                                "fy": 2026,
+                                "fp": "Q1",
+                                "form": "10-Q",
+                                "filed": "2026-04-15",
+                            },
+                            {
+                                "start": "2026-01-01",
+                                "end": "2026-12-31",
+                                "val": 600000000,
+                                "accn": "0001999999-27-000001",
+                                "fy": 2026,
+                                "fp": "FY",
+                                "form": "10-K",
+                                "filed": "2027-02-15",
+                            },
+                        ]
+                    },
+                },
+            }
+        },
+    }
+
+    result = run_fundamentals_pipeline(
+        ticker="SPINOFF",
+        cik="9999999",
+        evaluation_date="2027-03-01",
+        company_type="NON_FINANCIAL",
+        raw_companyfacts=spinoff_fixture,
+    )
+
+    sufficiency = result["stages"]["data_sufficiency"]["sufficiency"]
+    for metric_name in ("revenue_yoy", "revenue_cagr_3y"):
+        assert sufficiency[metric_name]["calculation_status"] == "MISSING"
+        assert sufficiency[metric_name]["reason_code"] == "INSUFFICIENT_HISTORY"
+        assert sufficiency[metric_name]["reason_code"] != "CONCEPT_NOT_FOUND"
+
+
+def test_case_e_existing_stages_have_zero_regression_with_growth_wired():
+    """Case E: adding the GROWTH / DATA_SUFFICIENCY stages must not
+    change a single value any earlier stage already produced --
+    identical assertions to
+    test_pipeline_connects_raw_through_derived_metrics_as_one_path,
+    re-asserted here as an explicit regression guard for this round."""
+    result = _run("2026-09-28")
+    stages = result["stages"]
+
+    noncurrent_debt = stages["normalization"]["normalized"]["metrics"]["noncurrent_debt"]
+    assert noncurrent_debt["status"] == "OK"
+    assert noncurrent_debt["value"] == 122342000000
+
+    revenue = stages["normalization"]["normalized"]["metrics"]["revenue"]
+    assert revenue["status"] == "OK"
+    assert revenue["value"] == 66894000000
+
+    revenue_yoy_derived = stages["derived_metrics"]["derived"]["derived_metrics"]["revenue_yoy"]
+    assert revenue_yoy_derived["status"] == "OK"
+    assert revenue_yoy_derived["value"] == pytest.approx(66894000000 / 57399000000 - 1)
