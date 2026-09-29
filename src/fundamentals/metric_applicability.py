@@ -40,13 +40,31 @@ Four reference files, one module
                                        policy table, re-published wholesale
                                        when policy changes, not layered over
                                        time the way peer/profile mappings are.
+                                       It IS edition-versioned via
+                                       policy_version (2026-09-28
+                                       confirmation round -- see
+                                       POLICY_VERSIONS below): existing rows
+                                       are never edited in place, and a
+                                       policy change ships as a new
+                                       policy_version so that "same
+                                       evaluation_date + same policy_version
+                                       + same underlying PIT data" stays
+                                       reproducible for Historical
+                                       Validation to pin against.
     metric_applicability_modifiers.csv
                                     -- (profile_id, metric_name, trigger) ->
                                        result, PIT versioned. Resolves a
                                        CONDITIONAL Base Applicability entry
                                        into a concrete final status once a
                                        company's runtime facts (e.g.
-                                       business_mix_status) are known.
+                                       business_mix_status) are known. Also
+                                       policy_version-stamped (2026-09-29
+                                       verification round) -- this file is
+                                       part of the same Applicability Policy
+                                       as metric_applicability.csv, so a
+                                       policy_version claim about one alone
+                                       cannot guarantee reproducibility of
+                                       the CONDITIONAL rows it resolves.
 
 All four are tightly coupled (peer_group_metric_profile feeds profile_id
 into metric_applicability; metric_applicability's CONDITIONAL rows are
@@ -246,6 +264,43 @@ RESOLVER_IDS = frozenset({"MODIFIER_TABLE_RESOLVER"})
 # a circular definition (a modifier's job is to end the conditionality,
 # never to restate it).
 MODIFIER_RESULT_STATUSES = frozenset({"APPLICABLE", "NOT_APPLICABLE", "UNVERIFIED"})
+
+# 2026-09-28 (ChatGPT confirmation round, reproducibility/versioning
+# policy for metric_applicability.csv): this file's rows are policy data,
+# not free-floating facts -- every row is stamped with the policy edition
+# that produced it. Convention (NOT database-enforced -- see
+# validate_metric_applicability_row() below, which only checks the value
+# is a known version, never that a row was left unmodified):
+#   - existing policy rows are NEVER edited in place to change what a past
+#     evaluation would have produced;
+#   - a policy change ships as a NEW policy_version, added alongside
+#     (never overwriting) the rows of the previous version;
+#   - "same evaluation_date + same policy_version + same underlying PIT
+#     data -> same result" is the invariant this buys, and it is what lets
+#     Historical Validation later pin which policy_version it evaluated
+#     against.
+# This is deliberately NOT the same thing as this file's own
+# effective_from/effective_to point-in-time semantics (which
+# peer_group_metric_profile.csv and metric_applicability_modifiers.csv
+# use) -- metric_applicability.csv still has no PIT columns of its own;
+# policy_version versions the whole table's *edition*, not individual
+# rows' temporal validity. Detailed temporal schema (if this file ever
+# needs effective_from/effective_to too) is explicitly deferred to the
+# Historical Validation phase, per the same confirmation round.
+# Only "v1.0" exists so far -- this set grows only when a new policy
+# edition is actually confirmed and shipped, exactly like RESOLVER_IDS
+# above.
+#
+# 2026-09-29 (ChatGPT verification round): shared, unchanged, by
+# metric_applicability_modifiers.csv too (see validate_metric_applicability_modifier_row()
+# below). The Applicability Policy is the base table AND the modifier
+# table together -- a CONDITIONAL row's meaning is incomplete without
+# the modifier rows that resolve it, so "policy_version=v1.0" names one
+# edition of BOTH files jointly, never the base file alone. This is
+# strictly narrower than a claim about Peer Mapping or Historical
+# Validation methodology versioning, which remain unversioned and
+# undesigned this round (2026-09-28 confirmation, section 8).
+POLICY_VERSIONS = frozenset({"v1.0"})
 
 # 2026-09-28: reused, not reinvented -- see module docstring. Only the
 # fields already tracked as company-level runtime facts in
@@ -693,6 +748,12 @@ def validate_metric_applicability_row(row: dict) -> list[str]:
     if not row.get("policy_owner"):
         failures.append("policy_owner")
 
+    policy_version = row.get("policy_version")
+    if not policy_version:
+        failures.append("policy_version")
+    elif policy_version not in POLICY_VERSIONS:
+        failures.append("policy_version_unknown")
+
     return failures
 
 
@@ -833,6 +894,19 @@ def validate_metric_applicability_modifier_row(row: dict) -> list[str]:
     for key in ("reason_code", "policy_owner", "rationale"):
         if not row.get(key):
             failures.append(key)
+
+    # 2026-09-29 (ChatGPT verification round): metric_applicability_modifiers.csv
+    # is part of the same Applicability Policy as metric_applicability.csv --
+    # a policy_version="v1.0" claim about the base file alone cannot
+    # guarantee reproducibility if the modifier rows that resolve its
+    # CONDITIONAL entries aren't pinned to the same edition. Same
+    # POLICY_VERSIONS allow-list and same immutable-by-convention rule as
+    # the base file (see POLICY_VERSIONS docstring above).
+    policy_version = row.get("policy_version")
+    if not policy_version:
+        failures.append("policy_version")
+    elif policy_version not in POLICY_VERSIONS:
+        failures.append("policy_version_unknown")
 
     effective_from = _parse_date(row.get("effective_from"))
     if not row.get("effective_from"):
@@ -1113,6 +1187,7 @@ __all__ = [
     "APPLICABILITY_STATUSES",
     "MAPPING_SOURCES",
     "RESOLVER_IDS",
+    "POLICY_VERSIONS",
     "MODIFIER_RESULT_STATUSES",
     "TRIGGER_FIELDS",
     "TRIGGER_FIELD_VALUES",
