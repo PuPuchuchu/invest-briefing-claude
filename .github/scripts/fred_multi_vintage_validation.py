@@ -22,9 +22,9 @@ from pit.py's real behavior. This is still validation-only infrastructure
 for Step 10I: kept outside src/, workflow_dispatch-only trigger, no
 CSV/state/regime output of any kind.
 
-CORRECTION HISTORY (2026-10-04, same day, v2 of this script):
-The v1 version of this script assumed `output_type=2` would return one
-JSON object per (observation_date, vintage) pair, each carrying its own
+CORRECTION HISTORY (2026-10-04, same day):
+v1 -> v2: v1 assumed `output_type=2` would return one JSON object per
+(observation_date, vintage) pair, each carrying its own
 `realtime_start`/`realtime_end`/`value` fields -- i.e. the same per-row
 shape as the DEFAULT `output_type=1` response. That assumption was WRONG.
 A real run against GitHub Actions (performed directly by the project
@@ -35,12 +35,25 @@ is instead a DYNAMICALLY NAMED COLUMN on that same row, named
 "{series_id}_{YYYYMMDD}" (no separators in the date suffix -- confirmed
 from the real response's own key names, e.g. "CPIAUCSL_20150226",
 "CPIAUCSL_20150324", ... "CPIAUCSL_20261004"), holding that
-observation_date's value AS OF that vintage date. This file is v2: it
-replaces the v1 per-row parser with a crosstab (wide-format) parser that
-reads these dynamic columns directly, per the project owner's and
-ChatGPT's joint review of the v1 results. See
+observation_date's value AS OF that vintage date. v2 replaced the v1
+per-row parser with a crosstab (wide-format) parser that reads these
+dynamic columns directly.
+
+v2 -> v3 (this file): v2's Layer 7 computed the repository-root
+`sys.path` insertion INSIDE `layer7_pit_compatibility()`, at call time.
+A real GitHub Actions run of v2 failed that import with
+`ModuleNotFoundError: No module named 'src.macro'`. v3 moves the
+repo-root resolution to MODULE IMPORT TIME, at the top of this file
+(immediately after the stdlib imports, before anything else runs), using
+`Path(__file__).resolve().parents[2]` so it no longer depends on the
+process's current working directory at all -- only on this script's own
+fixed location two directories below the repository root
+(`<repo_root>/.github/scripts/this_file.py`). This is purely an
+import-path fix inside this validation script; `src/macro/pit.py` itself
+is untouched, still imported verbatim, never reimplemented. See
 claude/2026-10-04-step10i-fred-multi-vintage-validation.md section
-"Why the first validator was wrong" for the full writeup.
+"Why the first validator was wrong" for the full writeup covering both
+corrections.
 
 SECURITY: FRED_API_KEY is read from the environment (injected by the
 calling workflow from secrets.FRED_API_KEY) and is NEVER printed or
@@ -71,6 +84,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from pathlib import Path
+
+# Resolve the repository root at IMPORT TIME (not inside a function called
+# later), from this file's own fixed location: <repo_root>/.github/scripts/
+# fred_multi_vintage_validation.py -- parents[0]=.github/scripts,
+# parents[1]=.github, parents[2]=repo_root. This does not depend on the
+# process's current working directory, unlike the v2 version of this
+# script, which computed an equivalent path only inside
+# layer7_pit_compatibility() and failed on a real GitHub Actions run with
+# ModuleNotFoundError: No module named 'src.macro' (see CORRECTION HISTORY
+# above). Only sys.path is touched here -- no src/macro/* file is modified.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 FRED_OBSERVATIONS_BASE = "https://api.stlouisfed.org/fred/series/observations"
 FRED_VINTAGEDATES_BASE = "https://api.stlouisfed.org/fred/series/vintagedates"
@@ -136,8 +163,6 @@ def _build_url(base: str, params: dict) -> str:
     query["api_key"] = api_key
     query["file_type"] = "json"
     return f"{base}?{urllib.parse.urlencode(query)}"
-
-
 def _request(url: str, timeout: int = 30):
     """Returns (status, parsed_json_or_None, error_classification_or_None, detail).
     Never raises. Never includes the raw (unredacted) URL in any returned
@@ -212,7 +237,6 @@ def _extract_vintage_cells(row: dict, series_id: str) -> dict[str, str]:
         cells[vintage_iso] = value
     return cells
 
-
 def _parse_crosstab(observations: list[dict], series_id: str) -> list[dict]:
     """
     Converts a real output_type=2 crosstab response into normalized
@@ -271,7 +295,6 @@ def _print_multi_vintage_sample(label: str, obs_date: str, records: list[dict], 
     print(f"    observation_date={obs_date!r}")
     for record in sorted(records, key=lambda r: r["vintage_date"])[:limit]:
         print(f"    vintage={record['vintage_date']!r} value={record['value']!r}")
-
 
 # ============================================================
 # LAYER 1/2 -- output_type=2 crosstab, correctly parsed (CPIAUCSL, PAYEMS)
@@ -339,7 +362,6 @@ def layer1_output_type2_cpi() -> list[dict]:
 
 def layer2_output_type2_payems() -> list[dict]:
     return _multi_vintage_layer(SERIES_PAYEMS, "LAYER2_OUTPUT_TYPE2_PAYEMS")
-
 
 # ============================================================
 # LAYER 3 -- daily market-data series (T10Y2Y, VIXCLS) under
@@ -427,7 +449,6 @@ def layer3_output_type2_market_data() -> None:
             sample_date, sample_recs = sorted(multi.items(), key=lambda kv: -len(kv[1]))[0]
             _print_multi_vintage_sample(result_key, sample_date, sample_recs, limit=5)
 
-
 # ============================================================
 # LAYER 4 -- fred/series/vintagedates (unchanged from v1 -- already
 # confirmed working)
@@ -489,7 +510,6 @@ def layer5_series_metadata() -> None:
             f"observation_end={info.get('observation_end')!r}"
         )
 
-
 # ============================================================
 # LAYER 6 -- parameter experiments (sort_order, limit) -- unchanged from
 # v1, on CPIAUCSL's default (non-output_type=2) endpoint to avoid
@@ -538,7 +558,6 @@ def layer6_parameter_experiments() -> None:
         RESULTS[result_key] = "PASS" if len(obs) <= 2 else "FAIL"
         print(f"{result_key}: {'PASS' if len(obs) <= 2 else 'FAIL'} rows_returned={len(obs)} (requested limit=2)")
 
-
 # ============================================================
 # LAYER 7 -- PIT compatibility, against REAL data and the ACTUAL,
 # unmodified src/macro/pit.py (item 6). This is the one place this script
@@ -550,28 +569,30 @@ def layer6_parameter_experiments() -> None:
 def layer7_pit_compatibility(cpi_records: list[dict], payems_records: list[dict]) -> None:
     result_key = "LAYER7_PIT_COMPATIBILITY"
 
-    # Repo root is two levels up from .github/scripts/
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
+    # REPO_ROOT was already inserted into sys.path at module import time
+    # (top of this file) -- see CORRECTION HISTORY (v2 -> v3). Nothing
+    # further to do here except the import itself.
     try:
         from src.macro.pit import select_latest_vintage_as_of  # noqa: E402  (deliberate, read-only, see module docstring)
     except Exception as e:
         RESULTS[result_key] = "FAIL"
-        print(f"{result_key}: FAIL (could not import src.macro.pit: {type(e).__name__}: {e})")
+        print(f"PIT_IMPORT: FAIL ({type(e).__name__}: {e})")
+        print(f"{result_key}: FAIL (could not import src.macro.pit)")
         return
+
+    print("PIT_IMPORT: PASS")
+    print("PIT_FUNCTION: select_latest_vintage_as_of")
 
     # Prefer whichever of CPI/PAYEMS actually produced an observation_date
     # with the most distinct published vintages -- that is the strongest
     # real-data test case available this run.
-    candidates: list[tuple[str, list[dict]]] = []
+    candidates: list[tuple[str, str, list[dict]]] = []
     for label, records in (("CPI", cpi_records), ("PAYEMS", payems_records)):
         groups = _group_records_by_observation_date(records)
         if not groups:
             continue
         best_date, best_recs = max(groups.items(), key=lambda kv: len(kv[1]))
-        candidates.append((label, best_date, best_recs))  # type: ignore[arg-type]
+        candidates.append((label, best_date, best_recs))
 
     if not candidates:
         RESULTS[result_key] = "FAIL"
@@ -587,66 +608,80 @@ def layer7_pit_compatibility(cpi_records: list[dict], payems_records: list[dict]
 
     ordered = sorted(best_recs, key=lambda r: r["vintage_date"])
     vintage_dates = [r["vintage_date"] for r in ordered]
-    print(f"{result_key}: using {label} observation_date={best_date!r} with real vintages {vintage_dates}")
+    values_by_vintage = {r["vintage_date"]: r["value"] for r in ordered}
+    print(f"{result_key}: using {label} observation_date={best_date!r} with real vintages/values: "
+          f"{[(v, values_by_vintage[v]) for v in vintage_dates]}")
 
     def _day_before(iso: str) -> date:
         return date.fromisoformat(iso) - timedelta(days=1)
 
+    def _check(case_key: str, as_of: date, expected_vintage: str | None, excluded_vintage: str | None = None) -> bool:
+        selected = select_latest_vintage_as_of(ordered, as_of)
+        selected_vintage = selected["vintage_date"] if selected else None
+        selected_value = selected["value"] if selected else None
+        vintage_ok = selected_vintage == expected_vintage
+        excluded_ok = excluded_vintage is None or selected_vintage != excluded_vintage
+        value_ok = expected_vintage is None or (
+            selected_value is not None and selected_value == values_by_vintage.get(expected_vintage)
+        )
+        ok = vintage_ok and excluded_ok and value_ok
+        RESULTS[case_key] = "PASS" if ok else "FAIL"
+        print(
+            f"  {case_key}: as_of={as_of.isoformat()} selected_vintage={selected_vintage!r} "
+            f"selected_value={selected_value!r} expected_vintage={expected_vintage!r} "
+            f"expected_value={values_by_vintage.get(expected_vintage) if expected_vintage else None!r} "
+            f"{'(must NOT be ' + repr(excluded_vintage) + ')' if excluded_vintage else ''} -> "
+            f"{'PASS' if ok else 'FAIL'}"
+        )
+        return ok
+
     all_pass = True
 
-    # Case: as_of strictly before the first known vintage -> no selection (UNVERIFIED upstream)
-    as_of = _day_before(vintage_dates[0])
-    selected = select_latest_vintage_as_of(ordered, as_of)
-    ok = selected is None
-    all_pass &= ok
-    print(f"  CASE as_of={as_of.isoformat()} (before first vintage {vintage_dates[0]}): "
-          f"selected={selected and selected['vintage_date']!r} expected=None -> {'OK' if ok else 'MISMATCH'}")
+    # Case 1: as_of strictly before the first known vintage -> no selection at all.
+    all_pass &= _check("CASE_BEFORE_FIRST", _day_before(vintage_dates[0]), expected_vintage=None)
 
-    # Case: as_of exactly on a vintage date -> that same vintage must be selected (inclusive "<=")
+    # Case 2: as_of exactly on a vintage date -> that exact vintage (and its real value).
     mid_idx = len(vintage_dates) // 2
-    as_of = date.fromisoformat(vintage_dates[mid_idx])
-    selected = select_latest_vintage_as_of(ordered, as_of)
-    ok = selected is not None and selected["vintage_date"] == vintage_dates[mid_idx]
-    all_pass &= ok
-    print(f"  CASE as_of={as_of.isoformat()} (exactly on vintage {vintage_dates[mid_idx]}): "
-          f"selected={selected and selected['vintage_date']!r} expected={vintage_dates[mid_idx]!r} -> "
-          f"{'OK' if ok else 'MISMATCH'}")
+    all_pass &= _check(
+        "CASE_EXACT_VINTAGE",
+        date.fromisoformat(vintage_dates[mid_idx]),
+        expected_vintage=vintage_dates[mid_idx],
+    )
 
-    # Case: as_of strictly between two known vintages -> the EARLIER of the two must be
-    # selected, and the LATER one must never be visible (no look-ahead).
+    # Case 3: as_of strictly between two known vintages -> the EARLIER vintage/value,
+    # and the LATER vintage must never be visible (no look-ahead).
     if len(vintage_dates) >= 2:
-        earlier, later = vintage_dates[mid_idx], vintage_dates[min(mid_idx + 1, len(vintage_dates) - 1)]
+        earlier = vintage_dates[mid_idx]
+        later = vintage_dates[min(mid_idx + 1, len(vintage_dates) - 1)]
         if earlier != later:
-            as_of = _day_before(later)
-            selected = select_latest_vintage_as_of(ordered, as_of)
-            ok = (
-                selected is not None
-                and selected["vintage_date"] == earlier
-                and selected["vintage_date"] != later
+            all_pass &= _check(
+                "CASE_BETWEEN_VINTAGES",
+                _day_before(later),
+                expected_vintage=earlier,
+                excluded_vintage=later,
             )
-            all_pass &= ok
-            print(
-                f"  CASE as_of={as_of.isoformat()} (between {earlier} and {later}, exclusive of {later}): "
-                f"selected={selected and selected['vintage_date']!r} expected={earlier!r} "
-                f"(must NOT be {later!r}) -> {'OK' if ok else 'MISMATCH'}"
-            )
+        else:
+            RESULTS["CASE_BETWEEN_VINTAGES"] = "FAIL"
+            print("  CASE_BETWEEN_VINTAGES: FAIL (fewer than 2 distinct vintage dates available to test between)")
+            all_pass = False
+    else:
+        RESULTS["CASE_BETWEEN_VINTAGES"] = "FAIL"
+        print("  CASE_BETWEEN_VINTAGES: FAIL (fewer than 2 vintages available to test between)")
+        all_pass = False
 
-    # Case: as_of after the last known vintage -> the LATEST vintage must be selected.
-    as_of = date.fromisoformat(vintage_dates[-1]) + timedelta(days=30)
-    selected = select_latest_vintage_as_of(ordered, as_of)
-    ok = selected is not None and selected["vintage_date"] == vintage_dates[-1]
-    all_pass &= ok
-    print(f"  CASE as_of={as_of.isoformat()} (well after last vintage {vintage_dates[-1]}): "
-          f"selected={selected and selected['vintage_date']!r} expected={vintage_dates[-1]!r} -> "
-          f"{'OK' if ok else 'MISMATCH'}")
+    # Case 4: as_of well after the last known vintage -> the LATEST vintage/value.
+    all_pass &= _check(
+        "CASE_AFTER_LAST",
+        date.fromisoformat(vintage_dates[-1]) + timedelta(days=30),
+        expected_vintage=vintage_dates[-1],
+    )
 
     RESULTS[result_key] = "PASS" if all_pass else "FAIL"
-    print(f"{result_key}: {'PASS' if all_pass else 'FAIL'} (no-look-ahead selection against real data, "
-          f"unmodified src/macro/pit.py)")
-
+    print(f"{result_key}: {'PASS' if all_pass else 'FAIL'} (no-look-ahead selection AND value match, "
+          f"against real data, via unmodified src/macro/pit.py)")
 
 def main() -> int:
-    print("=== Step 10I FRED Multi-Vintage Response Validation (v2 -- corrected crosstab parser) ===")
+    print("=== Step 10I FRED Multi-Vintage Response Validation (v3 -- fixed PIT import path) ===")
     print("(FRED_API_KEY value is never printed. Every logged URL has its api_key redacted.)")
     print(f"FRED_API_KEY_PRESENT: {bool(os.environ.get('FRED_API_KEY'))}")
     print(f"Revision window: observation_start={REVISION_WINDOW_START} observation_end={REVISION_WINDOW_END}")
@@ -674,7 +709,7 @@ def main() -> int:
     if summary_path:
         try:
             with open(summary_path, "a", encoding="utf-8") as f:
-                f.write("## Step 10I FRED Multi-Vintage Validation (v2)\n\n")
+                f.write("## Step 10I FRED Multi-Vintage Validation (v3)\n\n")
                 f.write("| Layer | Result |\n|---|---|\n")
                 for key in sorted(RESULTS.keys()):
                     f.write(f"| {key} | {RESULTS[key]} |\n")
