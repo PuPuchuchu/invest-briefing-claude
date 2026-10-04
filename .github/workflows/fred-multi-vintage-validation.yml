@@ -1,0 +1,23 @@
+name: FRED Multi-Vintage Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fred-multi-vintage-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run FRED multi-vintage validation
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python .github/scripts/fred_multi_vintage_validation.py
