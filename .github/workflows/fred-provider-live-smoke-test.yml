@@ -1,0 +1,37 @@
+name: FRED Provider Live Smoke Test
+
+# Step 10J-QA (2026-10-05) -- manual-only, PRODUCTION-CODE-PATH smoke
+# test. Distinct from both:
+#   - fred-connectivity-smoke-test.yml (Step 10G): raw connectivity only
+#   - fred-multi-vintage-validation.yml (Step 10I): hand-written validator
+#     script, not the production provider class
+#
+# This workflow calls src/macro/fred_provider.py::FredMacroProvider
+# DIRECTLY against the live FRED API for CPIAUCSL / PAYEMS / T10Y2Y /
+# VIXCLS, then feeds its real output into the UNCHANGED, frozen
+# src/macro/pit.py. It does NOT implement a new provider, does NOT
+# modify src/macro/*, does NOT write any CSV/dataset/macro-state/
+# regime/briefing output, and does NOT run on a schedule. See
+# claude/2026-10-05-step10j-qa-fred-provider-live-integration.md for the
+# full report once this has been run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fred-provider-live-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run FRED provider live smoke test
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python3 .github/scripts/fred_provider_live_smoke_test.py
