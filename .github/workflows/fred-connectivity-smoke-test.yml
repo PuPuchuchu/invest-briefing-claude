@@ -1,0 +1,33 @@
+name: FRED Connectivity Smoke Test
+
+# Step 10G -- manual-only connectivity smoke test. This workflow does NOT
+# implement a FRED provider, does NOT touch src/macro/*, does NOT write
+# any CSV/dataset/macro-state/regime/briefing output, and does NOT run on
+# a schedule. It exists solely to answer one question from a GitHub-hosted
+# runner (whose default network egress differs from the sandbox used to
+# author this repo's macro engine): can FRED's live API be reached,
+# authenticated against with secrets.FRED_API_KEY, and queried for a
+# plain observation, a multi-series set, a real-time-period request, and
+# a vintage-dates request. See claude/2026-10-04-step10g-github-fred-live-smoke-test.md
+# for the full report once this has been run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fred-connectivity-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run FRED connectivity smoke test
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python3 .github/scripts/fred_connectivity_smoke_test.py
