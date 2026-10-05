@@ -14,6 +14,23 @@ name: FRED Provider Live Smoke Test
 # regime/briefing output, and does NOT run on a schedule. See
 # claude/2026-10-05-step10j-qa-fred-provider-live-integration.md for the
 # full report once this has been run.
+#
+# DIAGNOSTIC-ROUND CHANGES (2026-10-05, second QA pass): the first live
+# run was externally canceled with zero script output visible in the
+# Actions log. Two changes here are purely diagnostic -- neither alters
+# this provider's HTTP timeout, retry policy, batch size, or any other
+# production behavior:
+#   1. `python3 -u` + PYTHONUNBUFFERED=1 (belt-and-suspenders): disables
+#      Python's stdout block-buffering so every print() in the smoke
+#      test / fred_provider.py's diagnostic logging reaches the Actions
+#      log immediately rather than sitting in an internal buffer that is
+#      lost if the job is later canceled.
+#   2. `timeout-minutes: 15` at the job level: turns an indefinite wait
+#      into an explicit, clearly-labeled "step timed out" outcome in the
+#      Actions UI after 15 minutes, instead of relying on someone to
+#      notice and cancel manually -- this is a GitHub Actions job-level
+#      safety net, NOT a change to fred_provider.py's own 30-second
+#      per-HTTP-request timeout (DEFAULT_TIMEOUT_SECONDS, unchanged).
 
 on:
   workflow_dispatch:
@@ -21,6 +38,7 @@ on:
 jobs:
   fred-provider-live-smoke-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -34,4 +52,6 @@ jobs:
       - name: Run FRED provider live smoke test
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python3 .github/scripts/fred_provider_live_smoke_test.py
+          PYTHONUNBUFFERED: "1"
+          FRED_PROVIDER_HTTP_DEBUG: "1"
+        run: python3 -u .github/scripts/fred_provider_live_smoke_test.py
