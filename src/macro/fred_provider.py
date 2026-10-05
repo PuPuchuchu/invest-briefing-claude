@@ -143,6 +143,7 @@ import os
 import re
 import socket
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -322,6 +323,30 @@ def _redact_url(url: str) -> str:
     return re.sub(r"(api_key=)[^&]+", r"\1REDACTED", url)
 
 
+def _http_debug_enabled() -> bool:
+    """2026-10-05 diagnostic-round addition (NOT a behavior change): gates
+    the HTTP-level START/END logging below. Defaults to OFF (os.environ
+    lookup only, no hardcoded True) so the existing offline test suite
+    and any normal production use of this module produce byte-identical
+    program behavior/output to before this round -- the only thing this
+    flag controls is whether diagnostic print() lines are emitted.
+    Enabled explicitly by fred_provider_live_smoke_test.py for this
+    diagnostic round only; never required for this module's own
+    correctness."""
+    return os.environ.get("FRED_PROVIDER_HTTP_DEBUG", "").strip() == "1"
+
+
+def _http_log(msg: str) -> None:
+    """Diagnostic-only stdout line, always flushed immediately (2026-10-05
+    diagnostic round: GitHub Actions log output is block-buffered when a
+    Python process's stdout is not a TTY, so an unflushed print() can be
+    silently lost entirely if the job is later cancelled before the
+    process exits normally -- this is why every diagnostic print in this
+    module and in fred_provider_live_smoke_test.py uses flush=True rather
+    than relying on process-exit flushing)."""
+    print(msg, flush=True)
+
+
 def _get_api_key() -> str:
     """Reads FRED_API_KEY from the environment. Raises
     FredAPIKeyMissing (never a generic KeyError/None) when unset -- this
@@ -380,19 +405,50 @@ class _FredHttpClient:
         url = self._build_url(base, params)
         redacted = _redact_url(url)
 
+        # 2026-10-05 diagnostic round: opt-in only (see _http_debug_enabled),
+        # does not alter the request itself -- series_id/output_type/
+        # vintage_dates-usage are read from `params` purely for logging.
+        debug = _http_debug_enabled()
+        series_id_for_log = params.get("series_id")
+        output_type_for_log = params.get("output_type")
+        uses_vintage_dates = "vintage_dates" in params
+        t0 = time.monotonic()
+        if debug:
+            _http_log(
+                f"HTTP START endpoint={redacted} series_id={series_id_for_log!r} "
+                f"output_type={output_type_for_log!r} uses_vintage_dates={uses_vintage_dates} "
+                f"timeout={self._timeout}s"
+            )
+
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "invest-briefing-claude-fred-provider/1.0"}
             )
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 status = resp.status
-                body = resp.read().decode("utf-8", errors="replace")
+                raw_bytes = resp.read()
+                body = raw_bytes.decode("utf-8", errors="replace")
+            if debug:
+                elapsed = time.monotonic() - t0
+                _http_log(
+                    f"HTTP END status={status} elapsed={elapsed:.3f}s "
+                    f"response_bytes={len(raw_bytes)} series_id={series_id_for_log!r}"
+                )
         except urllib.error.HTTPError as e:
             status = e.code
             try:
-                body = e.read().decode("utf-8", errors="replace")
+                raw_err_bytes = e.read()
+                body = raw_err_bytes.decode("utf-8", errors="replace")
             except Exception:
+                raw_err_bytes = b""
                 body = ""
+            if debug:
+                elapsed = time.monotonic() - t0
+                _http_log(
+                    f"HTTP END status={status} elapsed={elapsed:.3f}s "
+                    f"response_bytes={len(raw_err_bytes)} series_id={series_id_for_log!r} "
+                    f"(HTTPError, classification pending)"
+                )
             if status == 429:
                 raise FredHTTPError("RATE_LIMITED", body[:300], status, redacted_url=redacted) from None
             if status == 400:
@@ -408,9 +464,21 @@ class _FredHttpClient:
                 ) from None
             raise FredHTTPError("HTTP_FAILURE", body[:300], status, redacted_url=redacted) from None
         except ssl.SSLError as e:
+            if debug:
+                elapsed = time.monotonic() - t0
+                _http_log(
+                    f"HTTP END status=None elapsed={elapsed:.3f}s classification=TLS_FAILURE "
+                    f"series_id={series_id_for_log!r}"
+                )
             raise FredHTTPError("TLS_FAILURE", str(e)[:300], None, redacted_url=redacted) from None
         except urllib.error.URLError as e:
             reason = e.reason
+            if debug:
+                elapsed = time.monotonic() - t0
+                _http_log(
+                    f"HTTP END status=None elapsed={elapsed:.3f}s classification=URL_ERROR "
+                    f"reason={str(reason)[:120]!r} series_id={series_id_for_log!r}"
+                )
             if isinstance(reason, socket.gaierror):
                 raise FredHTTPError(
                     "DNS_FAILURE", str(reason)[:300], None, redacted_url=redacted
@@ -419,6 +487,12 @@ class _FredHttpClient:
                 "NETWORK_FAILURE", str(reason)[:300], None, redacted_url=redacted
             ) from None
         except socket.timeout:
+            if debug:
+                elapsed = time.monotonic() - t0
+                _http_log(
+                    f"HTTP END status=None elapsed={elapsed:.3f}s classification=SOCKET_TIMEOUT "
+                    f"series_id={series_id_for_log!r} (request's own {self._timeout}s timeout fired)"
+                )
             raise FredHTTPError(
                 "NETWORK_FAILURE", "socket timeout", None, redacted_url=redacted
             ) from None
