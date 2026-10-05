@@ -1,0 +1,42 @@
+name: FRED output_type=1 Live Validation (Step 10J-QA-5)
+
+# Step 10J-QA-5 (2026-10-05) -- manual-only LIVE VALIDATION of
+# output_type=1 ("Observations by Real-Time Period") against the real
+# FRED API, BEFORE any Design D ("Production PIT Snapshot") code is
+# written. Same discipline as Step 10G's fred-connectivity-smoke-test.yml
+# and Step 10I's fred-multi-vintage-validation.yml: validate the live
+# response shape first, build production code second.
+#
+# This workflow does NOT implement Design D. It does NOT modify
+# src/macro/fred_provider.py, src/macro/pit.py, src/macro/schema.py,
+# src/macro/engine.py, or any growth/inflation/policy/curve/risk state
+# module. It writes no CSV, no macro-state, no regime, no briefing
+# output, and does not run on a schedule.
+#
+# See claude/2026-10-05-step10j-qa4-design-d-pit-snapshot-review.md for
+# the design this validation is meant to de-risk, and
+# .github/scripts/fred_output_type1_validation.py's own module docstring
+# for exactly what is being checked.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fred-output-type1-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run FRED output_type=1 live validation
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u .github/scripts/fred_output_type1_validation.py
