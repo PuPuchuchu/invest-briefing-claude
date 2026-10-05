@@ -41,12 +41,42 @@ ourselves; redaction happens inside fred_provider.py before the
 exception is even raised (see 2026-10-05 QA finding: a prior fred_provider.py
 cut computed this redacted URL but never attached it to the exception --
 fixed as part of this QA round).
+
+DIAGNOSTIC INSTRUMENTATION (2026-10-05, this round -- NOT a behavior
+change): a prior live run of this workflow was externally canceled
+("The operation was canceled.") with ZERO script output visible in the
+GitHub Actions log, even though the step had been running long enough
+for this to very likely be real progress, not an instant crash. The
+most likely explanation is NOT a hang in this script's logic -- it is
+that GitHub Actions' log capture reads a non-TTY Python process's
+stdout, which Python fully block-buffers (not line-buffers) by default
+when stdout is not a terminal, so _log() output can sit in an internal
+buffer and be lost entirely if the process is killed before it exits
+normally. Every diagnostic print added in this round therefore uses
+flush=True (belt-and-suspenders with `python3 -u` / PYTHONUNBUFFERED=1
+in the workflow itself), and this script now emits START/END timing
+around every stage so a future canceled run's log shows exactly which
+stage was in progress when it was canceled, rather than nothing at all.
+This script also sets FRED_PROVIDER_HTTP_DEBUG=1 for its own process
+only (see fred_provider.py's _http_debug_enabled()), which turns on
+per-HTTP-request START/END logging (endpoint, series_id, output_type,
+vintage_dates usage, elapsed time, response byte length) inside
+fred_provider.py itself -- this is the only way to see whether a
+canceled run was stuck inside a single slow HTTP call, or was making
+many small sequential HTTP calls (e.g. T10Y2Y/VIXCLS's batched
+vintage_dates fetch) that simply added up to a long total runtime.
+Nothing about fred_provider.py's actual HTTP behavior (timeout value,
+retry policy, batch size, URL construction, exception classification)
+is changed by any of this -- see fred_provider.py's own diagnostic-round
+comment at _http_debug_enabled().
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -56,6 +86,16 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# 2026-10-05 diagnostic round: force per-HTTP-request logging on for this
+# script's own process only (see fred_provider.py's _http_debug_enabled()
+# docstring). Set BEFORE importing fred_provider so the very first
+# request already logs -- though the flag is actually read at call time,
+# not import time, so this ordering is for clarity, not correctness.
+# setdefault(), not direct assignment, so an operator/workflow that has
+# already set this env var explicitly (e.g. to "0" to opt out) is never
+# silently overridden.
+os.environ.setdefault("FRED_PROVIDER_HTTP_DEBUG", "1")
 
 from src.macro.fred_provider import (  # noqa: E402
     EXPLICIT_VINTAGE_DATES_SERIES_IDS,
@@ -69,6 +109,45 @@ from src.macro.schema import validate_raw_observation  # noqa: E402
 
 SERIES_TO_CHECK = ["CPIAUCSL", "PAYEMS", "T10Y2Y", "VIXCLS"]
 
+
+def _log(msg: str) -> None:
+    """Diagnostic print, always immediately flushed -- see the module
+    docstring's 2026-10-05 DIAGNOSTIC INSTRUMENTATION section on why
+    flush=True is mandatory here, not optional."""
+    print(msg, flush=True)
+
+
+class _Stage:
+    """Diagnostic-only START/END timing wrapper (2026-10-05 round). Prints
+    "[N] <name> START" on entry and "[N] <name> END elapsed=...s" (or
+    "FAILED" with the exception type, then re-raises) on exit, with
+    flush=True on every line -- so a canceled run's log shows exactly
+    which numbered stage was last known to be in progress, rather than
+    nothing. Adds no retry, no timeout, and does not alter control flow
+    beyond this logging -- the wrapped code's exceptions propagate
+    unchanged."""
+
+    def __init__(self, number: int, name: str):
+        self.number = number
+        self.name = name
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._t0 = time.monotonic()
+        _log(f"[{self.number}] {self.name} START")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        elapsed = time.monotonic() - self._t0
+        if exc_type is None:
+            _log(f"[{self.number}] {self.name} END elapsed={elapsed:.3f}s")
+        else:
+            _log(
+                f"[{self.number}] {self.name} FAILED elapsed={elapsed:.3f}s "
+                f"exception={exc_type.__name__}: {exc}"
+            )
+        return False  # never swallow the exception
+
 # PAYEMS observation_date to specifically probe for distinct-value
 # revisions (section F of the 2026-10-05 QA instruction) -- chosen
 # because it is a WIDE_WINDOW series with a long public history of
@@ -77,10 +156,10 @@ REVISION_PROBE_SERIES = "PAYEMS"
 
 
 def _print_header(title: str) -> None:
-    print()
-    print("=" * 88)
-    print(title)
-    print("=" * 88)
+    _log("")
+    _log("=" * 88)
+    _log(title)
+    _log("=" * 88)
 
 
 def _print_rows_sample(rows: list[dict], limit: int = 5) -> None:
@@ -88,9 +167,9 @@ def _print_rows_sample(rows: list[dict], limit: int = 5) -> None:
     vintage date / value / count only. Never prints a raw FRED response
     body or any URL (redaction, when a URL is shown at all, already
     happened inside fred_provider.py before this script ever sees it)."""
-    print(f"  row_count={len(rows)}")
+    _log(f"  row_count={len(rows)}")
     for row in rows[:limit]:
-        print(
+        _log(
             f"    series_id={row.get('series_id')!r} "
             f"observation_date={row.get('observation_date')!r} "
             f"vintage_date={row.get('vintage_date')!r} "
@@ -99,7 +178,7 @@ def _print_rows_sample(rows: list[dict], limit: int = 5) -> None:
             f"units={row.get('units')!r}"
         )
     if len(rows) > limit:
-        print(f"    ... ({len(rows) - limit} more rows not shown)")
+        _log(f"    ... ({len(rows) - limit} more rows not shown)")
 
 
 def section_a_connectivity_and_classification(provider: FredMacroProvider) -> dict:
@@ -110,7 +189,7 @@ def section_a_connectivity_and_classification(provider: FredMacroProvider) -> di
     classified = WIDE_WINDOW_SERIES_IDS | EXPLICIT_VINTAGE_DATES_SERIES_IDS
     missing = required - classified
     result = {"required_series": sorted(required), "unclassified": sorted(missing)}
-    print(f"  required series classified: {missing == set()} (missing={sorted(missing)})")
+    _log(f"  required series classified: {missing == set()} (missing={sorted(missing)})")
     if missing:
         raise SystemExit(
             f"FAIL: {sorted(missing)} have no confirmed-working fetch strategy in "
@@ -125,15 +204,16 @@ def section_b_metadata(provider: FredMacroProvider) -> dict:
     get_series() itself calls it."""
     _print_header("SECTION B -- metadata")
     out = {}
-    for series_id in SERIES_TO_CHECK:
-        meta = provider.get_series_metadata(series_id)
-        print(
-            f"  {series_id}: frequency={meta.get('frequency')!r} "
-            f"frequency_short={meta.get('frequency_short')!r} "
-            f"units={meta.get('units')!r} "
-            f"seasonal_adjustment={meta.get('seasonal_adjustment')!r}"
-        )
-        out[series_id] = meta
+    for stage_num, series_id in enumerate(SERIES_TO_CHECK, start=2):
+        with _Stage(stage_num, f"metadata {series_id}"):
+            meta = provider.get_series_metadata(series_id)
+            _log(
+                f"  {series_id}: frequency={meta.get('frequency')!r} "
+                f"frequency_short={meta.get('frequency_short')!r} "
+                f"units={meta.get('units')!r} "
+                f"seasonal_adjustment={meta.get('seasonal_adjustment')!r}"
+            )
+            out[series_id] = meta
     return out
 
 
@@ -141,23 +221,39 @@ def section_c_and_d_observations(provider: FredMacroProvider) -> dict:
     """C. current observations (incl. '.' handling if any NaN rows turn
     up). D. confirms the real output_type=2 crosstab response was
     actually flattened into normalized rows by the production parser,
-    and that every row is schema-valid."""
+    and that every row is schema-valid.
+
+    NOTE (2026-10-05 diagnostic round): this single call to
+    provider.get_series(series_id) internally issues a SECOND metadata
+    HTTP call (get_series() re-fetches metadata rather than reusing
+    section B's result -- see fred_provider.py's get_series(), which is
+    unchanged this round) plus either ONE wide-window observations call
+    (CPIAUCSL/PAYEMS) or a vintagedates call followed by potentially MANY
+    batched observations calls (T10Y2Y/VIXCLS, batch size
+    VINTAGE_DATES_BATCH_SIZE=25 -- unchanged this round). This stage's
+    START/END timing therefore covers an unknown, possibly large number
+    of underlying HTTP requests for T10Y2Y/VIXCLS; fred_provider.py's own
+    per-HTTP-request START/END log (enabled via FRED_PROVIDER_HTTP_DEBUG)
+    is what actually distinguishes "one slow call" from "many small
+    sequential calls" within this stage.
+    """
     _print_header("SECTION C/D -- observations via get_series() (output_type=2 crosstab)")
     out = {}
-    for series_id in SERIES_TO_CHECK:
-        rows = provider.get_series(series_id)
-        shape_failures = [f for row in rows for f in validate_raw_observation(row)]
-        nan_rows = [r for r in rows if isinstance(r.get("value"), float) and r["value"] != r["value"]]
-        print(f"  {series_id}:")
-        _print_rows_sample(rows)
-        print(f"    schema_validation_failures={shape_failures[:10]}")
-        print(f"    nan_value_rows={len(nan_rows)} (missing-marker '.' handling, if any occurred live)")
-        if shape_failures:
-            raise SystemExit(
-                f"FAIL: {series_id} produced {len(shape_failures)} schema-invalid row(s): "
-                f"{shape_failures[:10]}"
-            )
-        out[series_id] = rows
+    for stage_num, series_id in enumerate(SERIES_TO_CHECK, start=6):
+        with _Stage(stage_num, f"get_series {series_id} (metadata+observations+crosstab)"):
+            rows = provider.get_series(series_id)
+            shape_failures = [f for row in rows for f in validate_raw_observation(row)]
+            nan_rows = [r for r in rows if isinstance(r.get("value"), float) and r["value"] != r["value"]]
+            _log(f"  {series_id}:")
+            _print_rows_sample(rows)
+            _log(f"    schema_validation_failures={shape_failures[:10]}")
+            _log(f"    nan_value_rows={len(nan_rows)} (missing-marker '.' handling, if any occurred live)")
+            if shape_failures:
+                raise SystemExit(
+                    f"FAIL: {series_id} produced {len(shape_failures)} schema-invalid row(s): "
+                    f"{shape_failures[:10]}"
+                )
+            out[series_id] = rows
     return out
 
 
@@ -172,15 +268,15 @@ def section_e_multiple_vintages(rows_by_series: dict) -> dict:
         for row in rows:
             by_date.setdefault(row["observation_date"], set()).add(row["vintage_date"])
         multi = {d: sorted(v) for d, v in by_date.items() if len(v) > 1}
-        print(f"  {series_id}: observation_dates_with_multiple_vintages={len(multi)}")
+        _log(f"  {series_id}: observation_dates_with_multiple_vintages={len(multi)}")
         if multi:
             sample_date = next(iter(multi))
-            print(f"    sample: observation_date={sample_date!r} vintages={multi[sample_date]}")
+            _log(f"    sample: observation_date={sample_date!r} vintages={multi[sample_date]}")
         out[series_id] = len(multi)
     any_multi = any(v > 0 for v in out.values())
-    print(f"  at_least_one_series_with_multiple_vintages={any_multi}")
+    _log(f"  at_least_one_series_with_multiple_vintages={any_multi}")
     if not any_multi:
-        print(
+        _log(
             "  WARNING: no series in this run showed more than one vintage per "
             "observation_date. This can legitimately happen for a short/narrow "
             "default window -- NOT automatically a FAIL, but flagged as "
@@ -204,13 +300,13 @@ def section_f_revision_distinct_values(rows_by_series: dict) -> dict:
     revised_with_distinct_values = {
         d: vintages for d, vintages in by_date.items() if len(set(vintages.values())) > 1
     }
-    print(f"  PAYEMS observation_dates with >1 DISTINCT value across vintages: "
+    _log(f"  PAYEMS observation_dates with >1 DISTINCT value across vintages: "
           f"{len(revised_with_distinct_values)}")
     if revised_with_distinct_values:
         sample_date = next(iter(revised_with_distinct_values))
-        print(f"    sample: observation_date={sample_date!r} vintage_values={revised_with_distinct_values[sample_date]}")
+        _log(f"    sample: observation_date={sample_date!r} vintage_values={revised_with_distinct_values[sample_date]}")
     else:
-        print(
+        _log(
             "  UNVERIFIED for this run: no PAYEMS observation_date in the fetched "
             "window showed two vintages with different values. This does not by "
             "itself indicate a bug (a sufficiently old or narrow window may have "
@@ -239,7 +335,7 @@ def section_g_pit(rows_by_series: dict) -> dict:
             {r["vintage_date"] or r["realtime_start"] for r in series_rows if (r["vintage_date"] or r["realtime_start"])}
         )
         if not knowability_dates:
-            print(f"  {series_id}: no parseable knowability dates in this window -- skipping PIT probe")
+            _log(f"  {series_id}: no parseable knowability dates in this window -- skipping PIT probe")
             out[series_id] = "no_knowability_dates"
             continue
 
@@ -259,7 +355,7 @@ def section_g_pit(rows_by_series: dict) -> dict:
 
         pit_series = get_point_in_time_series(rows_by_series[series_id], series_id, latest.isoformat())
 
-        print(
+        _log(
             f"  {series_id}: before_first_vintage_selects_none={before_first is None} "
             f"after_last_date_selects_something={after_last is not None} "
             f"pit_series_rows={len(pit_series)} "
@@ -276,29 +372,38 @@ def section_g_pit(rows_by_series: dict) -> dict:
 
 
 def main() -> int:
-    provider = FredMacroProvider()
     results: dict = {}
 
     try:
+        with _Stage(1, "provider initialization"):
+            provider = FredMacroProvider()
+
         results["section_a"] = section_a_connectivity_and_classification(provider)
         results["section_b"] = section_b_metadata(provider)
         rows_by_series = section_c_and_d_observations(provider)
-        results["section_e"] = section_e_multiple_vintages(rows_by_series)
-        results["section_f"] = section_f_revision_distinct_values(rows_by_series)
-        results["section_g"] = section_g_pit(rows_by_series)
+
+        with _Stage(10, "section E -- multiple-vintage check"):
+            results["section_e"] = section_e_multiple_vintages(rows_by_series)
+
+        with _Stage(11, "section F -- revision distinct-value check"):
+            results["section_f"] = section_f_revision_distinct_values(rows_by_series)
+
+        with _Stage(12, "section G -- PIT validation"):
+            results["section_g"] = section_g_pit(rows_by_series)
     except FredHTTPError as e:
         _print_header("FRED HTTP ERROR")
-        print(f"  classification={e.classification} status={e.status}")
-        print(f"  redacted_url={e.redacted_url}")
-        print(f"  detail={e.detail[:300]!r}")
+        _log(f"  classification={e.classification} status={e.status}")
+        _log(f"  redacted_url={e.redacted_url}")
+        _log(f"  detail={e.detail[:300]!r}")
         return 1
     except FredProviderError as e:
         _print_header("FRED PROVIDER ERROR")
-        print(f"  {e}")
+        _log(f"  {e}")
         return 1
 
-    _print_header("SUMMARY (sanitized -- no API key, no unredacted URL, anywhere above)")
-    print(json.dumps(results, indent=2, default=str))
+    with _Stage(13, "final summary"):
+        _print_header("SUMMARY (sanitized -- no API key, no unredacted URL, anywhere above)")
+        _log(json.dumps(results, indent=2, default=str))
     return 0
 
 
