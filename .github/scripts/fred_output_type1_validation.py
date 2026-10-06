@@ -44,6 +44,29 @@ fred_multi_vintage_validation.py's identical discipline. This script
 never dumps os.environ, never shells out to curl, and uses only Python's
 standard library (urllib, json, os, re, sys, time, socket, ssl,
 datetime) -- no new dependency installed.
+
+Step 10J-QA-7 additions (this round, validation-infrastructure-only --
+src/macro/*.py and all SEC production code remain untouched):
+  - section_b2_monthly_precision(): isolates FRED's own server-side
+    observation_start filtering behavior for a monthly series across
+    day-01/day-15/day-28 of the same month, and separately shows what
+    src/macro/fred_provider.py's own get_series() client-side exact-date
+    post-filter (reproduced here read-only, as a 2-line comparison --
+    not imported, not modified) would keep from each raw response.
+  - section_i_vintage_dates_cross_check(): independent cross-check of
+    (output_type=1, realtime_start=realtime_end=as_of) against
+    (output_type=1, vintage_dates=as_of) over the same observation
+    window, compared pair-by-pair on (observation_date, value) -- not
+    just counts.
+  - _redact_text(): new, applied to every `detail` field _request() now
+    populates from external text (HTTP error bodies, exception
+    messages). QA-6's adversarial error-path testing found that FRED's
+    HTTPError response body is not guaranteed to omit the submitted
+    api_key value (the documented "not registered" message does not
+    echo it, but this is not guaranteed for every FRED error variant);
+    _request()'s prior behavior logged that body verbatim via `detail`
+    without ever redacting it. This masks every literal occurrence of
+    the real key value in any such text before it is stored or printed.
 """
 
 from __future__ import annotations
@@ -104,6 +127,27 @@ def _redact(url: str) -> str:
     return re.sub(r"(api_key=)[^&]+", r"\1REDACTED", url)
 
 
+def _redact_text(text: str | None) -> str | None:
+    """Step 10J-QA-7 section 5: mask every literal occurrence of the real
+    FRED_API_KEY value inside arbitrary text (HTTP error response
+    bodies, exception messages) before that text is ever stored in
+    `_request()`'s returned `detail` field or printed. This is distinct
+    from _redact(), which only targets the api_key= query-string
+    parameter of a URL this script itself built -- _redact_text() covers
+    text this script did NOT construct (e.g. FRED's own error response
+    body, or a raw exception message), which can in principle contain
+    the key in any position/format. Never raises -- reads the key
+    directly from the environment (not via _get_api_key(), which exits
+    the whole process on a missing key; a redaction helper used inside
+    exception handlers must never itself be a new failure mode)."""
+    if text is None:
+        return None
+    key = os.environ.get("FRED_API_KEY")
+    if key:
+        text = text.replace(key, "REDACTED")
+    return text
+
+
 def _get_api_key() -> str:
     value = os.environ.get("FRED_API_KEY")
     if not value:
@@ -149,7 +193,7 @@ def _request(params: dict) -> dict:
                 "response_bytes": len(raw_bytes),
                 "body_json": None,
                 "classification": "RESPONSE_PARSE_FAILED",
-                "detail": str(e)[:300],
+                "detail": _redact_text(str(e))[:300],
                 "redacted_url": redacted,
             }
         return {
@@ -183,6 +227,14 @@ def _request(params: dict) -> dict:
             classification = "RATE_LIMITED"
         else:
             classification = "HTTP_FAILURE"
+        # Step 10J-QA-7 section 5: redact the FULL body text (the real
+        # key value, wherever it appears) BEFORE truncating to 300 chars
+        # -- truncating first could cut a key value in half and leave
+        # the surviving fragment unredacted. FRED's own documented
+        # "not registered" error message does not echo the submitted
+        # api_key, but this is not a guarantee covering every FRED error
+        # response variant, so this body is never trusted to be clean.
+        safe_detail = _redact_text(body)[:300]
         return {
             "ok": False,
             "status": status,
@@ -190,7 +242,7 @@ def _request(params: dict) -> dict:
             "response_bytes": len(raw_err_bytes),
             "body_json": None,
             "classification": classification,
-            "detail": body[:300],
+            "detail": safe_detail,
             "redacted_url": redacted,
         }
     except ssl.SSLError as e:
@@ -201,7 +253,7 @@ def _request(params: dict) -> dict:
             "response_bytes": 0,
             "body_json": None,
             "classification": "TLS_FAILURE",
-            "detail": str(e)[:300],
+            "detail": _redact_text(str(e))[:300],
             "redacted_url": redacted,
         }
     except urllib.error.URLError as e:
@@ -214,7 +266,7 @@ def _request(params: dict) -> dict:
             "response_bytes": 0,
             "body_json": None,
             "classification": classification,
-            "detail": str(reason)[:300],
+            "detail": _redact_text(str(reason))[:300],
             "redacted_url": redacted,
         }
     except socket.timeout:
@@ -540,6 +592,173 @@ def section_multiple_as_of(series_id: str, observation_date: str, as_of_dates: l
     }
 
 
+# ============================================================
+# SECTION B-2 (Step 10J-QA-7 section 3): FRED server-side observation_start
+# filtering behavior for a MONTHLY series, isolated across day-01/15/28 of
+# the SAME calendar month, plus a read-only reproduction of
+# src/macro/fred_provider.py's own get_series() client-side exact-date
+# post-filter to show what production would actually keep.
+# ============================================================
+
+
+def section_b2_monthly_precision(series_id: str, as_of: str, test_month: date) -> dict:
+    """Does NOT treat 'FRED represents monthly observation_date as the
+    1st of the month' (QA-6 section B-1) and 'observation_start filtering
+    semantics' (this section) as the same concept -- this section probes
+    filtering behavior only. Three observation_start values (day 01, 15,
+    28 of test_month), all paired with the SAME observation_end
+    (test_month's last day), isolate exactly how far into the month the
+    start date can move before FRED's server-side filter stops returning
+    that month's single observation_date. For each probe, also computes
+    what src/macro/fred_provider.py's get_series() (lines ~865-870: an
+    unconditional client-side `observation_date >= start_date` /
+    `<= end_date` string comparison on the RETURNED records, applied
+    identically regardless of which fetch strategy produced them) would
+    keep -- that exact 2-line comparison is reproduced here, read-only,
+    as this validation script's own local variable; src/macro/fred_provider.py
+    itself is never imported or modified by this section."""
+    month_start = date(test_month.year, test_month.month, 1)
+    next_month = _shift_months(month_start, 1)
+    month_end = next_month - timedelta(days=1)
+    day28 = date(test_month.year, test_month.month, min(28, month_end.day))
+
+    probes = [
+        ("day_01", month_start.isoformat()),
+        ("day_15", date(test_month.year, test_month.month, 15).isoformat()),
+        ("day_28", day28.isoformat()),
+    ]
+
+    results: dict = {}
+    for label, observation_start in probes:
+        observation_end = month_end.isoformat()
+        params = {
+            "series_id": series_id,
+            "output_type": 1,
+            "realtime_start": as_of,
+            "realtime_end": as_of,
+            "observation_start": observation_start,
+            "observation_end": observation_end,
+        }
+        result = _request(params)
+        _log(f"  B-2 ({series_id}, {label}, observation_start={observation_start}, "
+             f"observation_end={observation_end}): redacted_url={result['redacted_url']}")
+        _log(f"    ok={result['ok']} status={result['status']}")
+        if not result["ok"]:
+            _log(f"    FAILED: classification={result['classification']} detail={result['detail']!r}")
+            results[label] = {
+                "observation_start_requested": observation_start,
+                "observation_end_requested": observation_end,
+                "request": result,
+            }
+            continue
+        observations = result["body_json"].get("observations", [])
+        before = _summarize_observations(observations)
+        # Read-only reproduction of get_series()'s own client-side exact-date
+        # post-filter (fred_provider.py lines ~865-870), applied to THIS
+        # response only -- not a call into fred_provider.py.
+        after_rows = [
+            o for o in observations
+            if o.get("date", "") >= observation_start and o.get("date", "") <= observation_end
+        ]
+        after = _summarize_observations(after_rows)
+        _log(f"    BEFORE client-side filter: count={before['observation_count']} "
+             f"first={before['first_observation']} last={before['last_observation']}")
+        _log(f"    AFTER  client-side filter: count={after['observation_count']} "
+             f"first={after['first_observation']} last={after['last_observation']}")
+        results[label] = {
+            "observation_start_requested": observation_start,
+            "observation_end_requested": observation_end,
+            "before_client_side_filter": before,
+            "after_client_side_filter": after,
+        }
+    return results
+
+
+# ============================================================
+# SECTION I (Step 10J-QA-7 section 4): independent vintage_dates
+# cross-check -- (output_type=1, realtime_start=realtime_end=as_of) vs
+# (output_type=1, vintage_dates=as_of), same observation window, compared
+# pair-by-pair on (observation_date, value), not just counts.
+# ============================================================
+
+
+def section_i_vintage_dates_cross_check(
+    series_id: str, as_of: str, observation_start: str, observation_end: str
+) -> dict:
+    path_a_params = {
+        "series_id": series_id,
+        "output_type": 1,
+        "realtime_start": as_of,
+        "realtime_end": as_of,
+        "observation_start": observation_start,
+        "observation_end": observation_end,
+    }
+    path_a = _request(path_a_params)
+    _log(f"  I Path A ({series_id}, realtime_start=realtime_end={as_of}): "
+         f"redacted_url={path_a['redacted_url']}")
+    _log(f"    ok={path_a['ok']} status={path_a['status']}")
+    if not path_a["ok"]:
+        _log(f"    FAILED: classification={path_a['classification']} detail={path_a['detail']!r}")
+
+    path_b_params = {
+        "series_id": series_id,
+        "output_type": 1,
+        "vintage_dates": as_of,
+        "observation_start": observation_start,
+        "observation_end": observation_end,
+    }
+    path_b = _request(path_b_params)
+    _log(f"  I Path B ({series_id}, vintage_dates={as_of}): redacted_url={path_b['redacted_url']}")
+    _log(f"    ok={path_b['ok']} status={path_b['status']}")
+    if not path_b["ok"]:
+        _log(f"    FAILED: classification={path_b['classification']} detail={path_b['detail']!r}")
+
+    if not path_a["ok"] or not path_b["ok"]:
+        return {
+            "path_a_ok": path_a["ok"],
+            "path_a_classification": path_a["classification"],
+            "path_b_ok": path_b["ok"],
+            "path_b_classification": path_b["classification"],
+            "comparison": "INCONCLUSIVE -- at least one path failed; see classification above. "
+                          "Not treated as a PASS or FAIL of the cross-check itself.",
+        }
+
+    obs_a = path_a["body_json"].get("observations", [])
+    obs_b = path_b["body_json"].get("observations", [])
+    pairs_a = {o.get("date"): o.get("value") for o in obs_a}
+    pairs_b = {o.get("date"): o.get("value") for o in obs_b}
+
+    only_in_a = {d: v for d, v in pairs_a.items() if d not in pairs_b}
+    only_in_b = {d: v for d, v in pairs_b.items() if d not in pairs_a}
+    common_dates = sorted(set(pairs_a) & set(pairs_b))
+    value_mismatches = {d: [pairs_a[d], pairs_b[d]] for d in common_dates if pairs_a[d] != pairs_b[d]}
+
+    identical = not only_in_a and not only_in_b and not value_mismatches
+    _log(f"    path_a_count={len(pairs_a)} path_b_count={len(pairs_b)} "
+         f"common={len(common_dates)} only_in_a={len(only_in_a)} only_in_b={len(only_in_b)} "
+         f"value_mismatches={len(value_mismatches)} identical={identical}")
+    if only_in_a:
+        _log(f"    only_in_a_sample={dict(list(only_in_a.items())[:5])}")
+    if only_in_b:
+        _log(f"    only_in_b_sample={dict(list(only_in_b.items())[:5])}")
+    if value_mismatches:
+        _log(f"    value_mismatch_sample={dict(list(value_mismatches.items())[:5])}")
+
+    return {
+        "path_a_count": len(pairs_a),
+        "path_b_count": len(pairs_b),
+        "common_date_count": len(common_dates),
+        "only_in_a_count": len(only_in_a),
+        "only_in_b_count": len(only_in_b),
+        "only_in_a_sample": dict(list(only_in_a.items())[:5]),
+        "only_in_b_sample": dict(list(only_in_b.items())[:5]),
+        "value_mismatch_count": len(value_mismatches),
+        "value_mismatch_sample": dict(list(value_mismatches.items())[:5]),
+        "identical": identical,
+        "comparison": "IDENTICAL" if identical else "DIFFERENCES_FOUND -- see counts/samples above",
+    }
+
+
 def main() -> int:
     today = date.today()
     as_of_today = today.isoformat()
@@ -637,6 +856,32 @@ def main() -> int:
     RESULTS["multiple_as_of_cpiaucsl"] = section_multiple_as_of(
         "CPIAUCSL", revision_probe_observation_date, revision_probe_as_of_dates
     )
+
+    # ---- SECTION B-2 (Step 10J-QA-7 section 3): monthly observation_start
+    # day-01/15/28 probe, isolated to a single safely-in-the-past month so
+    # the data is fully released/stable (not an in-progress release
+    # month). Run for both monthly series. ----
+    _print_header("SECTION B-2 -- monthly observation_start day-01/15/28 probe (FRED server-side behavior)")
+    b2_test_month = _shift_months(today, -6)
+    b2_results = {}
+    for series_id in MONTHLY_SERIES:
+        _log(f"-- {series_id} (test_month={b2_test_month.year:04d}-{b2_test_month.month:02d}) --")
+        b2_results[series_id] = section_b2_monthly_precision(series_id, as_of_today, b2_test_month)
+    RESULTS["b2_monthly_precision"] = b2_results
+
+    # ---- SECTION I (Step 10J-QA-7 section 4): vintage_dates independent
+    # cross-check for PAYEMS and CPIAUCSL, same as_of + observation
+    # window, compared pair-by-pair. ----
+    _print_header("SECTION I -- vintage_dates independent cross-check (PAYEMS, CPIAUCSL)")
+    i_window_start = _shift_months(today, -13).isoformat()
+    i_window_end = as_of_today
+    i_results = {}
+    for series_id in ("PAYEMS", "CPIAUCSL"):
+        _log(f"-- {series_id} (as_of={as_of_today}, window=[{i_window_start}, {i_window_end}]) --")
+        i_results[series_id] = section_i_vintage_dates_cross_check(
+            series_id, as_of_today, i_window_start, i_window_end
+        )
+    RESULTS["i_vintage_dates_cross_check"] = i_results
 
     # ---- SECTION 10: data volume (actual, this run) ----
     _print_header("SECTION DATA-VOLUME -- actual output_type=1 bytes/rows this run (CASE B)")
