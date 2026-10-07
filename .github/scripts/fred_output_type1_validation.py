@@ -148,6 +148,36 @@ def _redact_text(text: str | None) -> str | None:
     return text
 
 
+def _redact_exception_text(exc: BaseException) -> str:
+    """Step 10J-QA-8: build a safe, fully-redacted text summary of an
+    arbitrary exception -- including its own message AND any chained
+    cause/context exception (`raise X from Y`, or an exception raised
+    while handling another one), since a nested exception's own message
+    can independently contain the real secret even when the outer
+    exception's message does not. Every text fragment collected here is
+    redacted individually before being joined, so a secret split across
+    an exception and its __cause__/__context__ cannot survive by being
+    assembled only after redaction. Never raises, never logs/prints
+    anything itself, and never returns the real FRED_API_KEY value."""
+    parts: list[str] = []
+
+    def collect(e: BaseException | None, seen: set[int]) -> None:
+        if e is None or id(e) in seen:
+            return
+        seen.add(id(e))
+        safe = _redact_text(f"{type(e).__name__}: {e}")
+        if safe:
+            parts.append(safe)
+        # Nested/chained exceptions (explicit "raise ... from ..." cause,
+        # or the implicit context captured during exception handling)
+        # are walked too -- a secret can live in either.
+        collect(getattr(e, "__cause__", None), seen)
+        collect(getattr(e, "__context__", None), seen)
+
+    collect(exc, set())
+    return " | ".join(parts) if parts else f"{type(exc).__name__} (no message)"
+
+
 def _get_api_key() -> str:
     value = os.environ.get("FRED_API_KEY")
     if not value:
@@ -278,6 +308,34 @@ def _request(params: dict) -> dict:
             "body_json": None,
             "classification": "NETWORK_FAILURE",
             "detail": "socket timeout",
+            "redacted_url": redacted,
+        }
+    except Exception as e:
+        # Step 10J-QA-8: catch-all for any exception type NOT explicitly
+        # handled above (e.g. RuntimeError, ValueError, or any other
+        # exception the urllib/ssl/json stack does not document but
+        # could in principle raise). Before this round, such an
+        # exception was not caught here at all -- it propagated
+        # uncaught up through main(), and Python's own default
+        # unhandled-exception traceback (printed to stderr, landing in
+        # the public GitHub Actions log) would have printed the
+        # exception's raw __str__ with no redaction whatsoever. This
+        # branch closes that gap: _redact_exception_text() redacts the
+        # exception's own message AND every chained cause/context
+        # exception's message (never the raw exception object, never
+        # its original traceback) before anything is returned. This is
+        # the LAST except clause -- it must never be moved above a more
+        # specific handler, or it would silently swallow and
+        # misclassify failures that already have correct, tested
+        # handling above.
+        return {
+            "ok": False,
+            "status": None,
+            "elapsed": time.monotonic() - t0,
+            "response_bytes": 0,
+            "body_json": None,
+            "classification": "UNEXPECTED_ERROR",
+            "detail": _redact_exception_text(e)[:300],
             "redacted_url": redacted,
         }
 
