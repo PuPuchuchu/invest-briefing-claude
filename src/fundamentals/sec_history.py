@@ -31,6 +31,35 @@ DURATION_RANGES = {
 }
 
 
+# Concepts whose values are NOT an additive cumulative flow -- diluted
+# EPS is net income / weighted-average diluted shares, and subtracting
+# one cumulative EPS figure from another does not yield the correct
+# standalone-quarter EPS whenever the weighted-average diluted share
+# count differs between the two periods (buybacks, issuances,
+# convertible-dilution changes). This is a standard GAAP EPS pitfall,
+# not something specific to this codebase.
+#
+# A concept named here is restricted, in
+# reconstruct_standalone_quarters() below, to DIRECT standalone-quarter
+# observations only -- never Q2 = H1 - Q1 / Q3 = 9M - H1 / Q4 = FY - 9M
+# subtraction. If no direct observation exists for a given quarter,
+# that quarter is simply absent from the result (the same "absent =
+# not available" semantics every other gap in this module already
+# uses) -- never fabricated from YTD data.
+#
+# Added 2026-10-07 to close a confirmed production defect: see
+# claude/2026-10-07-sec-companyfacts-audit.md section E.1 (EPS was
+# being reconstructed via generic cumulative subtraction in this
+# module, unlike the non-production sec_historical.py reference
+# implementation, which already excludes EPS from its equivalent
+# RECONSTRUCTABLE_QUARTERLY_METRICS list).
+NON_ADDITIVE_PER_SHARE_CONCEPTS = frozenset(
+    {
+        "EarningsPerShareDiluted",
+    }
+)
+
+
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -129,9 +158,53 @@ def _filing_sort_key(
     Sort observations by information availability.
 
     Earlier filing date means the information became publicly
-    available earlier.
+    available earlier, so "filed" (ascending) remains the primary
+    key -- this preserves the original, unchanged intent of
+    preferring the earliest public disclosure of a given economic
+    period (e.g. preferring an originally-filed figure over a later
+    10-K/A restatement of that same period).
 
-    Secondary keys make sorting deterministic.
+    Secondary key -- "end" (2026-10-03 Level 2 real-data validation
+    finding, confirmed against real AVGO/AMD/MSFT/ORCL SEC Company
+    Facts data; see module docstring reference below):
+
+    SEC Company Facts' "fy"/"fp" fields describe the FILING's own
+    fiscal focus (dei:DocumentFiscalYearFocus /
+    DocumentFiscalPeriodFocus), not the individual fact's own
+    economic period. A single filing routinely reports both its own
+    current-period value AND one or more prior-year/prior-period
+    comparative values for the same concept, and SEC tags ALL of
+    them with that filing's own identical (fy, fp, filed, accn) --
+    only "start"/"end" (and, when present, "frame") actually
+    distinguish which economic period a given observation covers.
+
+    Concretely (real AMD Revenue, 10-Q filed 2026-08-05, fy=2026,
+    fp=Q2, accn identical on both rows):
+
+        start=2025-03-30 end=2025-06-28 val=7,685,000,000  (comparative)
+        start=2026-03-29 end=2026-06-27 val=11,536,000,000 (current)
+
+    A prior-year/prior-period comparative observation's "end" date
+    is, by construction, always earlier than the filing's own
+    current-period "end" date for the identical (fy, fp, filed)
+    label (a comparative covers an earlier calendar window than the
+    period the filing itself is reporting on). So once the primary
+    "earliest filed wins" key has resolved genuinely distinct
+    filings/restatements, ties on "filed" are broken by preferring
+    the LATEST "end" -- not the earliest -- so a filing's own current
+    period is chosen over an embedded same-tag comparative figure.
+    This is scoped to same-filed ties only; it is not a blanket
+    "always pick the latest end across everything" rule, and it does
+    not assume any calendar-year alignment (it compares two "end"
+    dates that already belong to the same (fy, fp, filed) group, so
+    it works unchanged for non-calendar fiscal-year issuers such as
+    AVGO and ORCL).
+
+    Tertiary keys ("start", "accn") remain for determinism when
+    "filed" and "end" are both tied; "accn" previously read a
+    nonexistent "accession" key (real SEC Company Facts observations
+    use "accn"), which made that tertiary key a silent no-op on real
+    data -- fixed here as part of the same finding.
     """
     filed = _parse_date(
         observation.get("filed")
@@ -145,17 +218,83 @@ def _filing_sort_key(
         observation.get("start")
     )
 
+    end_ordinal = (
+        end.toordinal()
+        if end is not None
+        else None
+    )
+
     return (
         filed or date.max,
-        end or date.max,
+        # Negated so that, within a "filed" tie, sorting ascending
+        # (as sort_by_filing_date() does) prefers the LATEST "end"
+        # instead of the earliest. An observation with no parsable
+        # "end" is deprioritized (sorts after any real end date).
+        -end_ordinal
+        if end_ordinal is not None
+        else float("inf"),
         start or date.max,
         str(
             observation.get(
-                "accession",
+                "accn",
                 "",
             )
         ),
     )
+
+
+def _unambiguous_first(
+    sorted_observations: list[dict],
+) -> dict | None:
+    """
+    Return the preferred observation from an already
+    filing-sorted (see _filing_sort_key / sort_by_filing_date)
+    candidate list, or None if the top choice is genuinely
+    ambiguous.
+
+    "Genuinely ambiguous" means the top two candidates share both
+    the same "filed" date AND the same "end" date (the two keys
+    _filing_sort_key() uses to disambiguate same-tag duplicates)
+    but report different values -- i.e. the data itself does not
+    let this function tell current-period from comparative apart.
+    Per Framework v2.1 Architecture v5 constraint #2 (missing /
+    ambiguous data must resolve to UNVERIFIED, never a default
+    favorable fallback), such a case is reported as "no selection"
+    (None) rather than silently guessing based on array order.
+
+    This situation has not been observed in real AVGO / AMD / MSFT /
+    ORCL Company Facts data (2026-10-03 Level 2 validation) -- it is
+    a defensive guard for data this function has not yet seen, not
+    a response to an observed real-data case.
+    """
+    if not sorted_observations:
+        return None
+
+    if len(sorted_observations) == 1:
+        return sorted_observations[0]
+
+    first = sorted_observations[0]
+    second = sorted_observations[1]
+
+    first_filed = _parse_date(first.get("filed"))
+    second_filed = _parse_date(second.get("filed"))
+
+    first_end = _parse_date(first.get("end"))
+    second_end = _parse_date(second.get("end"))
+
+    same_filed_end = (
+        first_filed == second_filed
+        and first_end == second_end
+    )
+
+    if (
+        same_filed_end
+        and _get_observation_value(first)
+        != _get_observation_value(second)
+    ):
+        return None
+
+    return first
 
 
 # ============================================================
@@ -390,7 +529,12 @@ def extract_annual_history(
     If multiple observations exist for the same FY,
     the earliest filing is preferred because it represents
     the earliest point at which the information became
-    publicly available.
+    publicly available; within the same filing, the observation
+    matching that filing's own current (not comparative) annual
+    period is preferred (see _filing_sort_key()'s docstring). A
+    fiscal year is omitted entirely -- rather than guessed -- if its
+    candidates are genuinely indistinguishable (see
+    _unambiguous_first()).
     """
     valid = filter_valid_duration_observations(
         observations
@@ -425,10 +569,15 @@ def extract_annual_history(
             records
         )
 
-        selected = records[0].copy()
+        selected = _unambiguous_first(
+            records
+        )
+
+        if selected is None:
+            continue
 
         result.append(
-            selected
+            selected.copy()
         )
 
     result.sort(
@@ -546,6 +695,226 @@ def _same_fiscal_year(
         return False
 
     return end_a.year == end_b.year
+
+
+# ============================================================
+# DIRECT-ONLY RECONSTRUCTION (non-additive / per-share concepts)
+# ============================================================
+
+def _is_direct_standalone_quarter_observation(
+    observation: dict,
+) -> bool:
+    """
+    True for an observation that is itself already a non-cumulative,
+    ~3-month economic period -- regardless of "form" (a direct Q4
+    value is often disclosed inside the 10-K itself, not a separate
+    10-Q, e.g. SEC's own "selected quarterly financial data"
+    footnote), mirroring the duration-only test already used by the
+    (non-production) reference implementation's
+    _is_standalone_quarter() in sec_historical.py.
+    """
+    duration = _duration_days(
+        observation
+    )
+
+    if duration is None:
+        return False
+
+    min_days, max_days = DURATION_RANGES[
+        "q1"
+    ]
+
+    return (
+        min_days
+        <= duration
+        <= max_days
+    )
+
+
+def _select_direct_quarter_observation(
+    candidates: list[dict],
+    fy: Any,
+    quarter: str,
+) -> dict | None:
+    """
+    Select one direct standalone-quarter observation for one (fy,
+    quarter) pair.
+
+    Q1 / Q2 / Q3 require an exact "fp" match.
+
+    Q4 accepts fp="Q4" OR fp="FY" -- SEC Company Facts commonly
+    represents a standalone Q4 observation (e.g. inside a 10-K's own
+    "selected quarterly data") tagged with fp="FY" rather than fp="Q4",
+    the same convention already documented and already relied on by
+    the reference implementation (sec_historical.py's
+    _select_direct_quarter()).
+
+    Uses the same filing-date / same-tag-comparative tie-break already
+    used everywhere else in this module (sort_by_filing_date +
+    _unambiguous_first), so a same-filed current-vs-comparative
+    duplicate is resolved identically here to every other extraction
+    path in this file.
+    """
+    matching = []
+
+    for observation in candidates:
+
+        if observation.get("fy") != fy:
+            continue
+
+        fp = observation.get("fp")
+
+        if quarter in ("Q1", "Q2", "Q3"):
+            if fp != quarter:
+                continue
+
+        elif quarter == "Q4":
+            if fp not in ("Q4", "FY"):
+                continue
+
+        else:
+            continue
+
+        matching.append(
+            observation
+        )
+
+    sorted_matching = sort_by_filing_date(
+        matching
+    )
+
+    return _unambiguous_first(
+        sorted_matching
+    )
+
+
+def _build_direct_quarter_record(
+    quarter: str,
+    observation: dict,
+) -> dict:
+    """
+    Build a standalone-quarter record from a genuinely direct
+    (non-cumulative) observation -- same output shape as the Q1 branch
+    of _make_reconstructed_quarter() below (quarter/value/
+    period_start/period_end/filed/form/fy/accession/reconstructed/
+    source), so downstream consumers (growth.py, validate_history())
+    see an identical schema regardless of which path produced the
+    record.
+    """
+    return {
+        "quarter": quarter,
+        "value": _get_observation_value(
+            observation
+        ),
+        "period_start": observation.get(
+            "start"
+        ),
+        "period_end": observation.get(
+            "end"
+        ),
+        "filed": observation.get(
+            "filed"
+        ),
+        "form": observation.get(
+            "form"
+        ),
+        "fy": observation.get(
+            "fy"
+        ),
+        "accession": observation.get(
+            "accession"
+        ),
+        "reconstructed": False,
+        "source": {
+            "current": observation.copy(),
+            "previous": None,
+        },
+    }
+
+
+def _reconstruct_direct_only_quarters(
+    observations: list[dict],
+) -> list[dict]:
+    """
+    Build standalone-quarter history for a non-additive (per-share)
+    concept -- see NON_ADDITIVE_PER_SHARE_CONCEPTS.
+
+    Unlike reconstruct_standalone_quarters()'s generic path below,
+    this NEVER subtracts a cumulative/YTD observation from another to
+    derive a missing quarter. A quarter with no genuinely direct
+    (~3-month, correctly fp-matched) observation is simply absent from
+    the result -- never fabricated.
+    """
+    valid = filter_valid_duration_observations(
+        observations
+    )
+
+    direct_candidates = [
+        observation
+        for observation in valid
+        if _is_direct_standalone_quarter_observation(
+            observation
+        )
+    ]
+
+    fiscal_years = {
+        observation.get("fy")
+        for observation in direct_candidates
+        if observation.get("fy") is not None
+    }
+
+    result = []
+
+    for fy in sorted(
+        fiscal_years
+    ):
+
+        for quarter in (
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4",
+        ):
+
+            selected = _select_direct_quarter_observation(
+                direct_candidates,
+                fy,
+                quarter,
+            )
+
+            if selected is None:
+                continue
+
+            value = _get_observation_value(
+                selected
+            )
+
+            if not _is_numeric(
+                value
+            ):
+                continue
+
+            result.append(
+                _build_direct_quarter_record(
+                    quarter,
+                    selected,
+                )
+            )
+
+    result.sort(
+        key=lambda observation: (
+            observation.get(
+                "period_end",
+                "",
+            ),
+            observation.get(
+                "quarter",
+                "",
+            ),
+        )
+    )
+
+    return result
 
 
 # ============================================================
@@ -698,7 +1067,13 @@ def _select_one_observation(
     """
     Select one observation for a fiscal year.
 
-    Earliest filing is preferred.
+    Earliest filing is preferred; within the same filing, the
+    observation whose "end" date actually matches the current
+    (not comparative) period for that filing is preferred (see
+    _filing_sort_key()'s docstring for the real-data finding this
+    implements). Returns None -- rather than guessing -- if the
+    top two filing-sorted candidates are genuinely indistinguishable
+    (see _unambiguous_first()).
     """
     candidates = [
         observation
@@ -713,11 +1088,14 @@ def _select_one_observation(
         candidates
     )
 
-    return candidates[0]
+    return _unambiguous_first(
+        candidates
+    )
 
 
 def reconstruct_standalone_quarters(
     observations: list[dict],
+    concept_name: str | None = None,
 ) -> list[dict]:
     """
     Reconstruct standalone quarterly values.
@@ -733,7 +1111,28 @@ def reconstruct_standalone_quarters(
         Q4 = FY - 9M
 
     Q4 filing provenance uses the FY / 10-K filing date.
+
+    concept_name (optional, added 2026-10-07): when it names a
+    non-additive per-share concept (NON_ADDITIVE_PER_SHARE_CONCEPTS,
+    currently just diluted EPS), this function instead delegates to
+    _reconstruct_direct_only_quarters() above -- direct observations
+    only, never the Q2=H1-Q1 / Q3=9M-H1 / Q4=FY-9M subtraction this
+    function otherwise performs. Omitting concept_name (the default)
+    preserves this function's prior behavior exactly, which remains
+    correct for every additive flow metric (revenue, net_income,
+    operating_income, cfo, capex). See
+    claude/2026-10-07-sec-companyfacts-audit.md section E.1 for why:
+    a per-share ratio is not an additive cumulative flow, so
+    subtracting cumulative EPS figures does not yield the correct
+    standalone-quarter EPS whenever the weighted-average diluted share
+    count differs between the two periods (buybacks, issuances,
+    convertible-dilution changes).
     """
+    if concept_name in NON_ADDITIVE_PER_SHARE_CONCEPTS:
+        return _reconstruct_direct_only_quarters(
+            observations
+        )
+
     valid = filter_valid_duration_observations(
         observations
     )
@@ -934,6 +1333,7 @@ def reconstruct_standalone_quarters(
 
 def extract_concept_history(
     concept_data: dict,
+    concept_name: str | None = None,
 ) -> dict:
     """
     Extract annual, quarterly and standalone-quarter history
@@ -954,6 +1354,15 @@ def extract_concept_history(
     on each observation as "_unit".
 
     Cross-unit normalization is NOT performed here.
+
+    concept_name (optional, added 2026-10-07): the XBRL concept this
+    data belongs to (e.g. "EarningsPerShareDiluted"), passed straight
+    through to reconstruct_standalone_quarters() below. This function
+    itself does no concept-specific branching -- it only threads the
+    identity through so that function can restrict non-additive
+    per-share concepts to direct-observation-only reconstruction (see
+    NON_ADDITIVE_PER_SHARE_CONCEPTS). Omitting it preserves this
+    function's prior behavior exactly.
     """
     if not isinstance(
         concept_data,
@@ -1012,7 +1421,8 @@ def extract_concept_history(
 
     standalone_quarters = (
         reconstruct_standalone_quarters(
-            observations
+            observations,
+            concept_name=concept_name,
         )
     )
 
@@ -1327,6 +1737,7 @@ def validate_history(
 __all__ = [
     "SCHEMA_VERSION",
     "DURATION_RANGES",
+    "NON_ADDITIVE_PER_SHARE_CONCEPTS",
     "is_duration_observation",
     "is_annual_observation",
     "is_quarterly_form_observation",
@@ -1337,5 +1748,7 @@ __all__ = [
     "extract_quarterly_history",
     "reconstruct_standalone_quarters",
     "extract_concept_history",
+    "validate_history",
+]
     "validate_history",
 ]
