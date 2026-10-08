@@ -283,7 +283,13 @@ def get_point_in_time_history(
 
     gated_concept_data = as_of_concept_data(concept_data, evaluation_date)
 
-    history = extract_concept_history(gated_concept_data)
+    # 2026-10-07: concept_name is threaded through so
+    # extract_concept_history() can restrict non-additive per-share
+    # concepts (e.g. diluted EPS) to direct-observation-only
+    # standalone-quarter reconstruction -- see
+    # sec_history.NON_ADDITIVE_PER_SHARE_CONCEPTS and
+    # claude/2026-10-07-sec-companyfacts-audit.md section E.1.
+    history = extract_concept_history(gated_concept_data, concept_name=concept_name)
     history["evaluation_date"] = evaluation_date.isoformat()
     history["namespace"] = namespace
     history["concept"] = concept_name
