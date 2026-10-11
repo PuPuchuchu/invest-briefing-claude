@@ -1748,7 +1748,5 @@ __all__ = [
     "extract_quarterly_history",
     "reconstruct_standalone_quarters",
     "extract_concept_history",
-    "validate_history"
-    "extract_concept_history",
     "validate_history",
 ]
