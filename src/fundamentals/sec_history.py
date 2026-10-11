@@ -1750,6 +1750,5 @@ __all__ = [
     "extract_concept_history",
     "validate_history"
     "extract_concept_history",
--   "validate_history"
-+   "validate_history",
-+]
+    "validate_history",
+]
