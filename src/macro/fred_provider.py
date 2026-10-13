@@ -168,8 +168,25 @@ SCHEMA_VERSION = "macro_fred_provider_v0.1"
 # frequency then fails schema.validate_raw_observation()'s required-
 # field check, which is the correct fail-closed behavior (never guess
 # a schema value this project has not actually validated it needs).
+#
+# "Daily, Close" (2026-10-13, Step 10 QA follow-up -- live smoke test
+# against VIXCLS): FRED's fred/series metadata endpoint reports
+# VIXCLS's frequency as the literal string "Daily, Close", confirmed
+# both live (this smoke test run) and on FRED's own VIXCLS series page
+# (https://fred.stlouisfed.org/series/VIXCLS). This is explicitly
+# approved (ChatGPT, 2026-10-13, "FRED 'Daily, Close' 메타데이터 정규화
+# 수정 승인") as metadata-normalization scope only, not a PIT or
+# schema-validation semantics change: "Close" describes VIXCLS's
+# end-of-day quotation convention, not a reporting period distinct
+# from daily -- the series still has one observation per calendar day,
+# the same cardinality as every other "Daily" series this table
+# already maps. Mapped to "DAILY", not to any new schema vocabulary
+# member. An unregistered frequency string still falls through to the
+# fail-closed defensive path below -- this one additional literal
+# alias is not a general uppercase-and-accept rule.
 _FRED_FREQUENCY_TO_SCHEMA = {
     "Daily": "DAILY",
+    "Daily, Close": "DAILY",
     "Weekly": "WEEKLY",
     "Monthly": "MONTHLY",
     "Quarterly": "QUARTERLY",
