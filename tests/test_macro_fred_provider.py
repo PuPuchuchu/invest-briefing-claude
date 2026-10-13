@@ -44,6 +44,7 @@ from src.macro.fred_provider import (
     FredProviderError,
     FredResponseShapeError,
     _extract_vintage_cells,
+    _normalize_frequency,
     _parse_crosstab_response,
     _parse_numeric_cell,
     default_raw_response_path,
@@ -138,6 +139,30 @@ def fixture_e_metadata() -> dict:
 
 def fixture_vintagedates(dates: list[str]) -> dict:
     return {"vintage_dates": dates}
+
+
+def fixture_e_metadata_vixcls_daily_close() -> dict:
+    """2026-10-13 Step 10 QA follow-up fixture -- the real
+    fred/series metadata shape FRED returns for VIXCLS (confirmed live,
+    .github/scripts/fred_provider_live_smoke_test.py workflow run
+    2026-10-13T12:23:19Z: 'VIXCLS: frequency=\\'Daily, Close\\''), which
+    is what exposed every VIXCLS row's frequency field as None and
+    failed schema validation 38,428/38,428 times in that live run."""
+    return {
+        "seriess": [
+            {
+                "id": "VIXCLS",
+                "frequency": "Daily, Close",
+                "frequency_short": "D",
+                "units": "Index",
+                "units_short": "Index",
+                "seasonal_adjustment": "Not Seasonally Adjusted",
+                "observation_start": "1990-01-02",
+                "observation_end": "2026-10-09",
+                "last_updated": "2026-10-10T15:17:03-05:00",
+            }
+        ]
+    }
 
 
 # ============================================================
@@ -321,6 +346,111 @@ def test_get_series_explicit_vintage_dates_series_uses_vintagedates_endpoint(mon
     assert len(rows) == 2
     for row in rows:
         assert validate_raw_observation(row) == []
+
+
+# ============================================================
+# 2026-10-13 Step 10 QA follow-up: "Daily, Close" frequency
+# normalization (ChatGPT-approved, metadata-normalization scope only)
+# ============================================================
+
+
+def test_normalize_frequency_daily_close_maps_to_daily():
+    assert _normalize_frequency("Daily, Close") == "DAILY"
+
+
+def test_normalize_frequency_existing_mappings_unchanged():
+    assert _normalize_frequency("Daily") == "DAILY"
+    assert _normalize_frequency("Weekly") == "WEEKLY"
+    assert _normalize_frequency("Monthly") == "MONTHLY"
+    assert _normalize_frequency("Quarterly") == "QUARTERLY"
+    assert _normalize_frequency("Annual") == "ANNUAL"
+
+
+def test_normalize_frequency_none_input_stays_none():
+    assert _normalize_frequency(None) is None
+
+
+def test_normalize_frequency_unregistered_value_remains_fail_closed():
+    # An unrelated, never-approved FRED frequency word must still
+    # resolve to None -- this one additional literal alias for VIXCLS
+    # must not have widened the fallback into "uppercase and accept
+    # anything unrecognized."
+    # "Biweekly".upper() == "BIWEEKLY", which is not in VALID_FREQUENCIES
+    # (DAILY/WEEKLY/MONTHLY/QUARTERLY/ANNUAL) -- must be None, not a guess.
+    assert _normalize_frequency("Biweekly") is None
+    assert _normalize_frequency("Semiannual") is None
+    assert _normalize_frequency("Some Unregistered FRED Frequency") is None
+
+
+def test_normalize_frequency_does_not_blindly_accept_close_suffixed_variants():
+    # Only the exact approved literal "Daily, Close" is aliased. A
+    # similarly-shaped but different string must NOT be silently
+    # accepted by a loosened substring/prefix rule -- this round added
+    # one dict entry, not a pattern match.
+    assert _normalize_frequency("Weekly, Close") is None
+    assert _normalize_frequency("Monthly, Close") is None
+
+
+def test_get_series_vixcls_daily_close_metadata_produces_schema_valid_rows(monkeypatch):
+    """Reproduces the exact live-smoke-test failure shape (2026-10-13
+    workflow run) as an offline fixture: VIXCLS metadata reports
+    frequency='Daily, Close'; after this round's fix, every resulting
+    row must carry frequency='DAILY' and pass
+    schema.validate_raw_observation() -- not just avoid raising."""
+
+    def router(url):
+        if "fred/series/vintagedates" in url:
+            return fixture_vintagedates(["2025-09-08", "2025-09-09"])
+        if "fred/series/observations" in url:
+            assert "vintage_dates=" in url
+            return {
+                "observations": [
+                    {
+                        "date": "2025-09-08",
+                        "VIXCLS_20250908": "15.11",
+                        "VIXCLS_20250909": "15.11",
+                    }
+                ]
+            }
+        return fixture_e_metadata_vixcls_daily_close()
+
+    monkeypatch.setenv("FRED_API_KEY", "test-key-not-real")
+    _install_urlopen_router(monkeypatch, router)
+
+    provider = FredMacroProvider()
+    rows = provider.get_series("VIXCLS")
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row["frequency"] == "DAILY"
+        assert validate_raw_observation(row) == [], (
+            f"row unexpectedly failed schema validation: {row}"
+        )
+
+
+def test_get_series_wide_window_frequency_mapping_unaffected_by_daily_close_entry(monkeypatch):
+    # Regression guard (required-test item 4): confirm the pre-existing
+    # CPIAUCSL/"Monthly" path is byte-for-byte unchanged by this round's
+    # addition -- same assertions as the pre-existing
+    # test_get_series_wide_window_series_produces_schema_valid_rows.
+    def router(url):
+        if "fred/series/observations" in url:
+            return fixture_a_cpi_multi_vintage()
+        if "fred/series?" in url or "fred/series&" in url:
+            return fixture_e_metadata()
+        raise AssertionError(f"unexpected URL in test: {url}")
+
+    monkeypatch.setenv("FRED_API_KEY", "test-key-not-real")
+    _install_urlopen_router(monkeypatch, router)
+
+    provider = FredMacroProvider()
+    rows = provider.get_series("CPIAUCSL")
+
+    assert len(rows) == 3
+    for row in rows:
+        assert validate_raw_observation(row) == []
+        assert row["frequency"] == "MONTHLY"
+        assert row["units"] == "Index 1982-1984=100"
 
 
 def test_get_series_unclassified_series_id_raises_explicitly(monkeypatch):
