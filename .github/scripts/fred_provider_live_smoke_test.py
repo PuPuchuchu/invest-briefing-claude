@@ -77,7 +77,7 @@ import json
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 # Repo-root import fix, same pattern as Step 10I's v3 script: resolved at
@@ -108,6 +108,51 @@ from src.macro.pit import get_point_in_time_series, select_latest_vintage_as_of 
 from src.macro.schema import validate_raw_observation  # noqa: E402
 
 SERIES_TO_CHECK = ["CPIAUCSL", "PAYEMS", "T10Y2Y", "VIXCLS"]
+
+# 2026-10-12 round: validation-infrastructure-only fix for the T10Y2Y/VIXCLS
+# output_type=2 vintage_dates hang (see
+# claude/2026-10-05-step10j-qa3-t10y2y-root-cause-design-review.md, Design
+# Candidate C -- "operational path vs. validation path, kept explicitly
+# separate"). Applies ONLY to the two EXPLICIT_VINTAGE_DATES_SERIES_IDS
+# series (T10Y2Y, VIXCLS): their unbounded get_series() call re-requests the
+# ENTIRE observation history once per vintage_dates batch (confirmed root
+# cause, same QA-3 doc). CPIAUCSL/PAYEMS (WIDE_WINDOW_SERIES_IDS) are
+# deliberately left unbounded/unchanged below -- they already complete in a
+# few seconds against the live API (QA-3 doc's measured throughput), and
+# Section F's revision-distinct-value check specifically needs PAYEMS's
+# full history, so narrowing them here would risk weakening an assertion
+# this round was explicitly told not to touch.
+#
+# This is a SCOPE LIMIT ON THIS SMOKE TEST'S OWN CALL, not a change to
+# fred_provider.py's date-range semantics (those four parameters already
+# existed and were already correctly implemented -- see the QA-3 doc's
+# section F/H) and not a change to PIT production semantics (pit.py is not
+# imported differently and is not touched). It does NOT prove or claim
+# full historical PIT reproducibility for T10Y2Y/VIXCLS -- only that the
+# production provider's real output_type=2 crosstab path, PIT selection,
+# and schema validation hold over a recent, bounded window. Full-history
+# verification of these two series remains a separate, not-yet-built task
+# (see the QA-3 doc's section F/I "Candidate C" split and section I "TEST
+# PLAN" item 1).
+SMOKE_TEST_LOOKBACK_DAYS = 400
+
+
+def _compute_lookback_window(as_of_date: date, lookback_days: int) -> tuple[str, str]:
+    """Pure, offline-testable: returns (window_start_iso, window_end_iso) =
+    (as_of_date - lookback_days, as_of_date), both ISO 'YYYY-MM-DD' strings.
+    The SAME as_of_date is the single source for both the observation-date
+    boundary (start_date/end_date) and the realtime/vintage boundary
+    (realtime_start/realtime_end) wherever this is called -- see
+    section_c_and_d_observations(), which passes the same two returned
+    strings to all four of get_series()'s date-range keyword arguments for
+    T10Y2Y/VIXCLS. No clamping, no calendar-aware business-day logic, and
+    no project-specific "evaluation date" coercion is needed here (unlike
+    src/macro/pit.py's coerce_as_of_date(), which normalizes a caller-
+    supplied as_of_date for PIT selection -- this helper only computes a
+    date arithmetic window for a live smoke test's own HTTP request
+    parameters, not a PIT decision)."""
+    window_start = as_of_date - timedelta(days=lookback_days)
+    return window_start.isoformat(), as_of_date.isoformat()
 
 
 def _log(msg: str) -> None:
@@ -217,7 +262,9 @@ def section_b_metadata(provider: FredMacroProvider) -> dict:
     return out
 
 
-def section_c_and_d_observations(provider: FredMacroProvider) -> dict:
+def section_c_and_d_observations(
+    provider: FredMacroProvider, window_start: str, window_end: str
+) -> dict:
     """C. current observations (incl. '.' handling if any NaN rows turn
     up). D. confirms the real output_type=2 crosstab response was
     actually flattened into normalized rows by the production parser,
@@ -236,15 +283,63 @@ def section_c_and_d_observations(provider: FredMacroProvider) -> dict:
     per-HTTP-request START/END log (enabled via FRED_PROVIDER_HTTP_DEBUG)
     is what actually distinguishes "one slow call" from "many small
     sequential calls" within this stage.
+
+    `window_start`/`window_end` (2026-10-12 round, see
+    SMOKE_TEST_LOOKBACK_DAYS above): passed to get_series()'s
+    start_date/end_date/realtime_start/realtime_end -- all four, the same
+    pair of values -- ONLY for series in EXPLICIT_VINTAGE_DATES_SERIES_IDS
+    (T10Y2Y, VIXCLS), which is where the unbounded-history-per-batch hang
+    was confirmed. WIDE_WINDOW_SERIES_IDS (CPIAUCSL, PAYEMS) are called
+    exactly as before (no date arguments) -- deliberately unchanged, see
+    the module-level comment next to SMOKE_TEST_LOOKBACK_DAYS
+    for why.
     """
     _print_header("SECTION C/D -- observations via get_series() (output_type=2 crosstab)")
     out = {}
     for stage_num, series_id in enumerate(SERIES_TO_CHECK, start=6):
+        windowed = series_id in EXPLICIT_VINTAGE_DATES_SERIES_IDS
+        call_kwargs = (
+            {
+                "start_date": window_start,
+                "end_date": window_end,
+                "realtime_start": window_start,
+                "realtime_end": window_end,
+            }
+            if windowed
+            else {}
+        )
+        # Logged BEFORE the call, flushed immediately (same discipline as
+        # every other diagnostic print in this script -- see the module
+        # docstring's 2026-10-05 DIAGNOSTIC INSTRUMENTATION section on why
+        # this cannot wait until after the call returns).
+        _log(
+            f"  {series_id}: REQUEST START windowed={windowed} "
+            f"observation_start={call_kwargs.get('start_date')!r} "
+            f"observation_end={call_kwargs.get('end_date')!r} "
+            f"realtime_start={call_kwargs.get('realtime_start')!r} "
+            f"realtime_end={call_kwargs.get('realtime_end')!r}"
+        )
+        t0 = time.monotonic()
         with _Stage(stage_num, f"get_series {series_id} (metadata+observations+crosstab)"):
-            rows = provider.get_series(series_id)
+            rows = provider.get_series(series_id, **call_kwargs)
+            elapsed = time.monotonic() - t0
             shape_failures = [f for row in rows for f in validate_raw_observation(row)]
             nan_rows = [r for r in rows if isinstance(r.get("value"), float) and r["value"] != r["value"]]
-            _log(f"  {series_id}:")
+            # Three outcomes of this call must never be confused with one
+            # another: a raised provider exception (handled by _Stage's
+            # own FAILED logging, below this block, and never reaches this
+            # line), a non-empty success (SUCCESS_NONEMPTY), and a normal
+            # HTTP-successful response that nonetheless carried zero rows
+            # for this window (EMPTY_RESULT_NONPASS). The latter is an
+            # ordinary, valid response shape -- not an error -- but it is
+            # NEVER counted or logged as a pass/success: this round's
+            # explicit requirement is that an empty result must not be
+            # silently treated as a success.
+            result_status = "EMPTY_RESULT_NONPASS" if len(rows) == 0 else "SUCCESS_NONEMPTY"
+            _log(
+                f"  {series_id}: REQUEST END status={result_status} "
+                f"elapsed={elapsed:.3f}s row_count={len(rows)}"
+            )
             _print_rows_sample(rows)
             _log(f"    schema_validation_failures={shape_failures[:10]}")
             _log(f"    nan_value_rows={len(nan_rows)} (missing-marker '.' handling, if any occurred live)")
@@ -374,13 +469,29 @@ def section_g_pit(rows_by_series: dict) -> dict:
 def main() -> int:
     results: dict = {}
 
+    # 2026-10-12 round: single as_of_date, used consistently for every one
+    # of the four date-range boundaries passed to get_series() for
+    # T10Y2Y/VIXCLS below (see SMOKE_TEST_LOOKBACK_DAYS and
+    # _compute_lookback_window() above). Logged immediately so a canceled
+    # run's log always shows which window this run actually requested.
+    as_of_date = date.today()
+    window_start, window_end = _compute_lookback_window(
+        as_of_date, SMOKE_TEST_LOOKBACK_DAYS
+    )
+    _log(
+        f"as_of_date={as_of_date.isoformat()} "
+        f"smoke_test_window=[{window_start}, {window_end}] "
+        f"(lookback_days={SMOKE_TEST_LOOKBACK_DAYS}, "
+        f"applies only to EXPLICIT_VINTAGE_DATES_SERIES_IDS={sorted(EXPLICIT_VINTAGE_DATES_SERIES_IDS)})"
+    )
+
     try:
         with _Stage(1, "provider initialization"):
             provider = FredMacroProvider()
 
         results["section_a"] = section_a_connectivity_and_classification(provider)
         results["section_b"] = section_b_metadata(provider)
-        rows_by_series = section_c_and_d_observations(provider)
+        rows_by_series = section_c_and_d_observations(provider, window_start, window_end)
 
         with _Stage(10, "section E -- multiple-vintage check"):
             results["section_e"] = section_e_multiple_vintages(rows_by_series)
