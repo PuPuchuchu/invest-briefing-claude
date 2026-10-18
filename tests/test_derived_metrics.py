@@ -319,6 +319,64 @@ def test_calculate_fcf_missing_capex():
     assert result["status"] == "MISSING"
 
 
+def test_calculate_fcf_positive_capex():
+    """
+    2026-10-18 regression (Round AB/AC/AD): real SEC data for at
+    least one issuer reports PaymentsToAcquirePropertyPlantAndEquipment
+    as a positive expenditure magnitude, not a negative cash-flow
+    value. CapEx must still be subtracted as an outflow regardless of
+    its reported sign. Figures are the real AVGO FY2025 CFO/CapEx
+    values cited in Round Y/AB (CFO=27,537,000,000,
+    CapEx=623,000,000), used here purely as realistic test values --
+    this test does not call out to SEC or re-fetch anything.
+    """
+    result = calculate_fcf(
+        27_537_000_000,
+        623_000_000,
+    )
+
+    assert result["metric"] == "fcf"
+    assert result["status"] == "OK"
+    assert result["value"] == pytest.approx(26_914_000_000)
+
+
+def test_calculate_fcf_zero_capex():
+    result = calculate_fcf(
+        10000,
+        0,
+    )
+
+    assert result["status"] == "OK"
+    assert result["value"] == pytest.approx(10000)
+
+
+def test_calculate_fcf_negative_cfo():
+    result = calculate_fcf(
+        -1000,
+        500,
+    )
+
+    assert result["status"] == "OK"
+    assert result["value"] == pytest.approx(-1500)
+
+
+def test_calculate_fcf_sign_invariant_for_same_expenditure_magnitude():
+    """
+    CapEx reported as a positive expenditure magnitude must produce
+    the same FCF as the same magnitude reported with a negative
+    sign -- the sign of the source concept must not change the
+    economic result.
+    """
+    positive_sign_result = calculate_fcf(25000, 5000)
+    negative_sign_result = calculate_fcf(25000, -5000)
+
+    assert positive_sign_result["status"] == "OK"
+    assert negative_sign_result["status"] == "OK"
+    assert positive_sign_result["value"] == pytest.approx(
+        negative_sign_result["value"]
+    )
+
+
 # ============================================================
 # DEBT / CASH
 # ============================================================
