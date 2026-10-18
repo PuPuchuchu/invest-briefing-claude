@@ -281,19 +281,38 @@ def calculate_fcf(
     """
     Calculate Free Cash Flow.
 
-    SEC CapEx values are commonly represented as negative cash-flow
-    values because they are cash outflows.
+    CapEx is treated as the magnitude of a capital expenditure --
+    i.e. a cash outflow -- regardless of the sign the source concept
+    happens to carry. sec_normalizer.py preserves SEC's raw observed
+    value as-is (no sign normalization is applied upstream, by
+    design -- see the module's own passthrough contract), and in
+    practice different filers/concepts report this magnitude with
+    different signs (e.g. positive for some real-world filings).
+    Taking the absolute value here makes the formula correct under
+    either convention, without requiring any upstream reinterpretation
+    of the raw SEC value.
 
     Therefore:
-        FCF = CFO + CapEx
+        FCF = CFO - abs(CapEx)
 
-    Example:
-        CFO  = 25,000
+    Example (CapEx reported as a negative cash-flow value):
+        CFO   = 25,000
         CapEx = -5,000
-        FCF  = 20,000
+        FCF   = 20,000
 
-    This function assumes the normalized CapEx convention used by
-    sec_normalizer.py.
+    Example (CapEx reported as a positive expenditure magnitude):
+        CFO   = 25,000
+        CapEx = 5,000
+        FCF   = 20,000
+
+    2026-10-18 fix (Round AC/AD): previously this function computed
+    `CFO + CapEx` under the assumption that CapEx always arrived
+    negative. That assumption does not hold for every filer/concept
+    (confirmed against real SEC data for at least one issuer), which
+    made the result CFO-overstated whenever CapEx was reported
+    positive. Using abs() removes the dependency on that assumption
+    entirely. This does not change sec_normalizer.py's own stored
+    CapEx value, which remains the raw SEC observation unchanged.
     """
 
     if not _is_number(cfo_value):
@@ -310,7 +329,7 @@ def calculate_fcf(
             ["cfo", "capex"],
         )
 
-    value = float(cfo_value) + float(capex_value)
+    value = float(cfo_value) - abs(float(capex_value))
 
     return _build_ok_metric(
         "fcf",
