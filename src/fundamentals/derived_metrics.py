@@ -261,6 +261,13 @@ def calculate_margin(
             [metric_name, "revenue"],
         )
 
+    if revenue_float < 0:
+        return _build_invalid_metric(
+            result_name,
+            "Revenue is negative; margin cannot be calculated.",
+            [metric_name, "revenue"],
+        )
+
     value = float(numerator_value) / revenue_float
 
     return _build_ok_metric(
