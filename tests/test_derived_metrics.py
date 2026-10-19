@@ -256,6 +256,36 @@ def test_calculate_margin_zero_revenue():
     assert result["value"] is None
 
 
+def test_calculate_margin_negative_revenue_positive_numerator():
+    # Round AN: positive numerator / negative revenue is a sign
+    # combination that is not economically meaningful as a margin
+    # (Round AN reachability audit). Must be INVALID, not an "OK"
+    # negative margin.
+    result = calculate_margin(
+        "operating_income",
+        30,
+        -100,
+    )
+
+    assert result["status"] == "INVALID"
+    assert result["value"] is None
+
+
+def test_calculate_margin_negative_revenue_negative_numerator():
+    # Round AN: negative numerator / negative revenue would otherwise
+    # divide out to a positive ratio, which could be misread as a
+    # healthy margin despite both inputs representing a loss on
+    # negative revenue. Must be INVALID, not an "OK" positive margin.
+    result = calculate_margin(
+        "operating_income",
+        -30,
+        -100,
+    )
+
+    assert result["status"] == "INVALID"
+    assert result["value"] is None
+
+
 def test_calculate_margin_missing_numerator():
     result = calculate_margin(
         "operating_income",
@@ -575,6 +605,35 @@ def test_calculate_derived_metrics_missing_metric():
 
     assert result["derived_metrics"]["fcf"]["status"] == "MISSING"
     assert result["derived_metrics"]["fcf"]["value"] is None
+
+
+def test_calculate_derived_metrics_negative_revenue_margins_are_invalid():
+    # Round AN/AO: a negative revenue value must not be divided through
+    # into an "OK" margin for any of the three revenue-based margins.
+    # Unrelated metrics (fcf, net_debt, debt_to_cash) must be unaffected.
+    normalized = make_normalized_fixture()
+
+    normalized["metrics"]["revenue"] = make_metric(-120000)
+
+    result = calculate_derived_metrics(normalized)
+
+    derived = result["derived_metrics"]
+
+    assert derived["net_margin"]["status"] == "INVALID"
+    assert derived["net_margin"]["value"] is None
+
+    assert derived["operating_margin"]["status"] == "INVALID"
+    assert derived["operating_margin"]["value"] is None
+
+    assert derived["fcf_margin"]["status"] == "INVALID"
+    assert derived["fcf_margin"]["value"] is None
+
+    # Metrics that do not depend on revenue are unaffected.
+    assert derived["fcf"]["status"] == "OK"
+    assert derived["fcf"]["value"] == pytest.approx(20000)
+
+    assert derived["net_debt"]["status"] == "OK"
+    assert derived["debt_to_cash"]["status"] == "OK"
 
 
 def test_calculate_derived_metrics_requires_metrics():
