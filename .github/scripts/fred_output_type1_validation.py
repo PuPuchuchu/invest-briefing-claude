@@ -67,22 +67,53 @@ src/macro/*.py and all SEC production code remain untouched):
     _request()'s prior behavior logged that body verbatim via `detail`
     without ever redacting it. This masks every literal occurrence of
     the real key value in any such text before it is stored or printed.
+
+Round QA-7-CLOSE-2 addition (this round, validation-infrastructure-only
+-- src/macro/*.py remains untouched, imported read-only exactly as
+fred_provider_live_smoke_test.py's Section G already does):
+  - section_m_production_output_type2_pit_selector_probe(): unlike every
+    section above (which makes this script's OWN raw urllib calls for
+    output_type=1, by design -- see PURPOSE above), this section calls
+    the REAL, unmodified src.macro.fred_provider.FredMacroProvider.
+    get_series() for a WIDE_WINDOW_SERIES_IDS member -- i.e. the actual
+    production output_type=2 fetch + crosstab-parsing path, not a
+    reimplementation of it. The real parsed records are then handed to
+    the real, unmodified src.macro.pit.select_latest_vintage_as_of() /
+    get_point_in_time_series(). This closes the one remaining gap QA-7-
+    CLOSE-1's read-only code audit identified: every prior PIT-selector
+    test exercised that logic only against a synthetic (if
+    real-response-shaped) fixture; this section exercises it against
+    whatever FRED actually returns live, this run, with no success
+    guaranteed -- it fails closed to "INCONCLUSIVE" (never fabricates a
+    PASS) when the live response does not happen to contain a usable
+    multi-vintage observation_date, when FRED_API_KEY is unavailable in
+    the running environment, or on any other error. The network-free
+    evidence-building logic (_build_production_pit_evidence()) is
+    covered by offline regression tests against synthetic,
+    production-shaped fixtures in
+    tests/test_fred_output_type1_validation_production_probe.py -- those
+    tests are fixture-based regression evidence for the evidence-
+    builder's own correctness, never a substitute for, or claim of,
+    live FRED evidence.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 # Repo-root import fix, same pattern as the other .github/scripts/*.py
 # validators. Used ONLY to read-only-import src.macro.pit's public
@@ -98,11 +129,30 @@ from src.macro.pit import (  # noqa: E402
     select_latest_vintage_as_of,
 )
 
+# Round QA-7-CLOSE-2: read-only import of the REAL production provider,
+# to exercise its actual output_type=2 fetch + crosstab-parsing path
+# (see section_m_production_output_type2_pit_selector_probe() below).
+# Mirrors fred_provider_live_smoke_test.py's existing identical import --
+# this is not a new pattern for this project, just new to this script.
+from src.macro.fred_provider import (  # noqa: E402
+    WIDE_WINDOW_SERIES_IDS,
+    FredAPIKeyMissing,
+    FredHTTPError,
+    FredMacroProvider,
+    FredProviderError,
+)
+
 FRED_OBSERVATIONS_BASE = "https://api.stlouisfed.org/fred/series/observations"
 
 SERIES_TO_CHECK = ["CPIAUCSL", "PAYEMS", "T10Y2Y", "VIXCLS"]
 DAILY_SERIES = {"T10Y2Y", "VIXCLS"}
 MONTHLY_SERIES = {"CPIAUCSL", "PAYEMS"}
+
+# Round QA-7-CLOSE-2 Part C: compact evidence artifact filename, written
+# alongside this script's own directory when the live probe runs under
+# the GitHub Actions workflow (see the "Upload QA-7-CLOSE-2 evidence
+# artifact" step in fred-output-type1-validation.yml).
+PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH = "fred_qa7_close2_production_pit_evidence.json"
 
 RESULTS: dict = {}
 
@@ -146,6 +196,23 @@ def _redact_text(text: str | None) -> str | None:
     if key:
         text = text.replace(key, "REDACTED")
     return text
+
+
+def _safe_redact_text(text: str | None) -> str:
+    """Round QA-7-CLOSE-2-R5, Part A. Defensive wrapper around
+    _redact_text() for use in _write_evidence_artifact_atomically()'s
+    error-reporting path: _redact_text() is already documented to
+    "never raise", but this wrapper exists so that even an unforeseen
+    failure INSIDE redaction itself can never propagate out of the
+    artifact writer, and -- critically -- never falls back to
+    returning the raw, unredacted text. On any failure here, the
+    fallback is a fixed, generic placeholder that carries no exception
+    content at all, never the original string."""
+    try:
+        redacted = _redact_text(text)
+    except Exception:  # noqa: BLE001 -- redaction itself must never leak the raw text
+        return "<error detail withheld: redaction failed>"
+    return redacted if redacted is not None else "<error detail unavailable>"
 
 
 def _redact_exception_text(exc: BaseException) -> str:
@@ -817,6 +884,855 @@ def section_i_vintage_dates_cross_check(
     }
 
 
+# ============================================================
+# SECTION M (Round QA-7-CLOSE-2): live production output_type=2 PIT
+# selector validation. See the module docstring's "Round QA-7-CLOSE-2
+# addition" entry for the full rationale.
+# ============================================================
+
+def _parse_iso_date_for_evidence(value: Any) -> date | None:
+    """
+    Round QA-7-CLOSE-2-R1, Part B (tightened in Round QA-7-CLOSE-2-R2,
+    Part C). Validation-infrastructure-only ISO date parser
+    (deliberately NOT imported from any production module --
+    src/macro/*.py remains untouched). Returns None for anything that is
+    not the exact documented "YYYY-MM-DD" canonical representation,
+    including None, non-str types, and malformed strings. Mirrors the
+    same fail-closed principle already established elsewhere in this
+    project (e.g. derived_metrics.py's _parse_period_end()): a non-None,
+    non-parseable value must never be lexically compared against a real
+    date or silently treated as sortable -- it is excluded from grouping
+    and chronological comparison entirely.
+
+    Round QA-7-CLOSE-2-R2, Part C: `date.fromisoformat()` on Python
+    3.11+ also accepts other ISO 8601 representations this project does
+    NOT document as the wire format -- e.g. the no-separator basic
+    format "YYYYMMDD" and ISO week-date form "YYYY-Www-D" -- both of
+    which `date.fromisoformat()` happily parses to a real date. Silently
+    accepting either would mean two different observation_date/
+    vintage_date *strings* could parse to the identical calendar date,
+    which must never be decided implicitly. The round-trip check below
+    (`parsed.isoformat() == value`) rejects both: for "20240101" and
+    "2024-W01-1", `parsed.isoformat()` always re-renders as "2024-01-01"
+    (or whatever canonical date it parsed to), which never equals the
+    original non-canonical input string, so both are excluded exactly
+    like any other malformed value -- never a false acceptance, never an
+    uncaught exception.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.isoformat() != value:
+        return None
+    return parsed
+
+
+def _json_sanitize(obj: Any) -> Any:
+    """
+    Round QA-7-CLOSE-2-R2, Part B. Recursively replace any non-finite
+    float (NaN, +Infinity, -Infinity) with JSON "null" so the written
+    evidence artifact is always standards-compliant JSON. Python's
+    json.dump()/json.dumps() accept NaN/Infinity/-Infinity by default
+    (emitting the literal, non-standard tokens "NaN"/"Infinity"/
+    "-Infinity"), which a strict JSON parser rejects. A "null" produced
+    here means "the production-parsed value was missing/non-finite",
+    exactly FRED's and this project's existing missing-value
+    convention (see _is_nan_value's docstring) -- it is never a
+    fabricated numeric value.
+
+    Preserves ordinary strings, finite numbers, booleans, None, dicts,
+    and lists/tuples (tuples become lists, matching what json.dump()
+    itself would already do) via recursion. Any other object type is
+    returned unchanged and left to json.dumps(..., default=str)'s own
+    fallback -- this function's only job is the NaN/Infinity case.
+    """
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+    return obj
+
+
+def _write_evidence_artifact_atomically(
+    destination_path: str, payload: dict
+) -> tuple[bool, str | None]:
+    """
+    Round QA-7-CLOSE-2-R3, Part A. Standard-library-only, atomic
+    evidence-artifact write helper, factored out of main() so it can be
+    tested directly without invoking main() or touching the network.
+
+    Lifecycle (every step fails closed -- this function never raises):
+
+      1. If `destination_path` already exists (e.g. a stale artifact
+         left over from a PREVIOUS run of this script), it is removed
+         BEFORE this run attempts to produce a new one. This is the
+         key guarantee: if everything below fails, there is no old
+         artifact sitting at `destination_path` for the calling
+         workflow to upload and mistake for THIS run's evidence.
+      2. `payload` is sanitized (_json_sanitize(), Round
+         QA-7-CLOSE-2-R2 Part B) and serialized with
+         `allow_nan=False` as a strict belt-and-suspenders check. A
+         serialization failure here returns False immediately --
+         nothing has touched the filesystem beyond step 1 yet.
+      3. The serialized text is written to a NEW temporary file in the
+         SAME directory as the destination (so the final
+         `os.replace()` is a same-filesystem rename, which is atomic),
+         then flushed and fsync'd, then closed.
+      4. `os.replace(tmp_path, destination_path)` atomically publishes
+         the completed temp file as the destination -- there is no
+         window in which the destination exists in a partially-written
+         state: it is either absent, or it is the complete, valid file.
+      5. On ANY exception in steps 2-4, the temporary file (if it was
+         created) is removed, and the destination is left absent
+         (step 1 already removed whatever was there before this run
+         started) -- never a partial file, never a stale one.
+
+    Round QA-7-CLOSE-2-R4, Part A hardening on top of the above:
+
+      - The write/replace step (3-4) now catches Exception broadly,
+        not just OSError -- a non-OSError failure (e.g. an unexpected
+        error from write()/fsync(), or anything os.fdopen() itself
+        might raise) is still caught and cleaned up here, never left
+        to propagate to the caller. BaseException (KeyboardInterrupt,
+        SystemExit) is deliberately NOT caught.
+      - Raw file-descriptor ownership is now explicit:
+        tempfile.mkstemp() hands back a raw OS-level fd that THIS
+        function owns until os.fdopen() successfully wraps it in a
+        file object -- at which point the file object (and the `with`
+        block around it) owns it instead. If os.fdopen() itself
+        raises, ownership was NEVER transferred, so the raw fd is
+        still open and would otherwise leak; this function closes it
+        directly in that case before re-raising into the outer
+        handler.
+      - A SECONDARY failure while removing the temp file during
+        cleanup is never swallowed silently -- it is appended
+        (separately redacted) to the returned diagnostic, so a
+        cleanup failure is visible rather than hidden behind the
+        original error. The function still never raises, and never
+        claims a file was removed when removal demonstrably failed.
+
+    Round QA-7-CLOSE-2-R5, Part A hardening on top of the above:
+
+      - Step 1 (destination existence check / removal) now catches
+        Exception broadly, not just OSError -- any unexpected failure
+        there is reported, never propagated.
+      - The temp-file cleanup check itself (os.path.exists(), then
+        os.remove()) is now wrapped so that EITHER call raising --
+        not just os.remove() -- is caught and reported rather than
+        propagating or crashing this "never raises" helper. When
+        os.path.exists() itself cannot determine whether the temp
+        file remains, that uncertainty is stated explicitly rather
+        than silently assuming removal succeeded.
+      - os.close(tmp_fd) (invoked when os.fdopen() fails, since
+        ownership of the raw fd was never transferred) is no longer
+        silently swallowed on failure -- a failure there is captured
+        and reported as its OWN, clearly distinguished diagnostic
+        fragment, separate from the original os.fdopen() error.
+      - Every piece of diagnostic text returned by this function goes
+        through _safe_redact_text() (not _redact_text() directly) --
+        a defensive wrapper that itself never raises and never falls
+        back to exposing the unredacted original text, even if
+        redaction itself were to fail unexpectedly.
+
+    Round QA-7-CLOSE-2-R6, Part C hardening on top of the above:
+
+      - The initial `Path(destination_path)` construction (and the
+        `directory` derived from it) is now itself inside a try/except,
+        matching every step after it -- previously this construction
+        sat before step 1 with no exception handling at all, so a
+        `destination_path` value Path() cannot accept would have
+        propagated out of this "never raises" helper uncaught. No
+        other step's behavior changes.
+
+    Returns (True, None) on full success, or (False, redacted_detail)
+    on any failure -- `redacted_detail` has already been passed through
+    _safe_redact_text() and is safe to log directly; the caller never
+    receives or logs a raw, unredacted exception.
+    """
+    # Round QA-7-CLOSE-2-R6, Part C: constructing `Path(destination_path)`
+    # itself sat OUTSIDE any try/except in every prior round -- if
+    # `destination_path` were ever something Path() cannot accept (for
+    # example a non-str/bytes/os.PathLike value, which raises TypeError),
+    # that exception would have propagated straight out of this
+    # function, violating its own documented "never raises" contract
+    # before step 1 even begins. Wrapped here, narrowly, so that this
+    # one extra failure mode is reported via the same (False, detail)
+    # contract as every other step, without changing any of the
+    # already-tested behavior of steps 1-5 below (stale-file removal,
+    # serialization, write/flush/fsync, os.replace(), and temp-file
+    # cleanup are untouched). Still catches Exception only, never
+    # BaseException -- KeyboardInterrupt/SystemExit are not swallowed.
+    try:
+        destination = Path(destination_path)
+        directory = destination.parent if str(destination.parent) else Path(".")
+    except Exception as e:  # noqa: BLE001 -- fail closed: any Exception, never BaseException
+        return False, _safe_redact_text(str(e))
+
+    # Step 1: remove any pre-existing (possibly stale, from a prior
+    # run) destination file before this run attempts anything else.
+    # If this removal itself fails, return immediately -- never claim
+    # the destination was cleared when it demonstrably was not. Catches
+    # Exception broadly (not just OSError): destination.exists()/
+    # .unlink() are not guaranteed to raise only OSError on every
+    # platform/path, and this helper's "never raises" contract must
+    # hold regardless.
+    try:
+        if destination.exists():
+            destination.unlink()
+    except Exception as e:  # noqa: BLE001 -- fail closed: any Exception, never BaseException
+        return False, _safe_redact_text(str(e))
+
+    # Step 2: sanitize + strictly serialize. Nothing on disk changes
+    # here beyond the removal already performed in step 1. Catches
+    # Exception broadly (not just TypeError/ValueError) -- _json_sanitize()
+    # recurses into dicts/lists with no cycle detection, so a
+    # pathological payload (e.g. a circular reference) raises
+    # RecursionError here, not TypeError/ValueError; this function's
+    # "never raises" contract must hold for ANY payload shape, not just
+    # the ones a narrower except clause happens to anticipate.
+    try:
+        serialized = json.dumps(_json_sanitize(payload), indent=2, default=str, allow_nan=False)
+    except Exception as e:  # noqa: BLE001 -- fail closed for any payload pathology
+        return False, _safe_redact_text(str(e))
+
+    # Steps 3-4: write to a sibling temp file, then atomically replace.
+    tmp_path: str | None = None
+    tmp_fd: int | None = None
+    fdopen_close_failure: Exception | None = None
+    primary_error: Exception | None = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(directory), prefix=f".{destination.name}.", suffix=".tmp"
+        )
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding="utf-8")
+        except Exception as fdopen_error:
+            # os.fdopen() never took ownership of tmp_fd -- it is
+            # still a raw, open fd that THIS function owns and must
+            # close itself here, or it leaks. A failure while closing
+            # it is NOT silently dropped -- it is captured as its own
+            # diagnostic, distinct from fdopen_error, and surfaced
+            # below alongside it. Re-raise fdopen_error so the outer
+            # handler still does the usual temp-file cleanup.
+            try:
+                os.close(tmp_fd)
+            except Exception as close_error:  # noqa: BLE001
+                fdopen_close_failure = close_error
+            raise fdopen_error
+        tmp_fd = None  # ownership transferred to `f`; `with f:` below closes it.
+        with f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(destination))
+        return True, None
+    except Exception as e:  # noqa: BLE001 -- fail closed: any Exception, never BaseException
+        primary_error = e
+
+    # Step 5 (reached only on failure above): never leave a partial
+    # temp file around, and never leave a partially-written
+    # destination -- os.replace() is atomic, so if it did not
+    # complete, the destination (already cleared in step 1) is simply
+    # absent, exactly as intended. The existence check AND the removal
+    # are both wrapped -- either can raise -- and any failure here is
+    # appended to the diagnostic (redacted), never hidden behind the
+    # original error, and the temp file's actual fate is never
+    # overstated when its status could not be confirmed.
+    cleanup_detail = ""
+    if tmp_path is not None:
+        try:
+            tmp_still_present = os.path.exists(tmp_path)
+        except Exception as exists_error:  # noqa: BLE001
+            cleanup_detail = (
+                " (could not determine whether the temp file still exists, "
+                f"so its removal is NOT confirmed: {_safe_redact_text(str(exists_error))})"
+            )
+        else:
+            if tmp_still_present:
+                try:
+                    os.remove(tmp_path)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    cleanup_detail = (
+                        f" (temp file cleanup also failed: {_safe_redact_text(str(cleanup_error))})"
+                    )
+
+    detail = _safe_redact_text(str(primary_error))
+    if fdopen_close_failure is not None:
+        detail += (
+            " (additionally, closing the raw file descriptor after an "
+            f"os.fdopen() failure also failed: {_safe_redact_text(str(fdopen_close_failure))})"
+        )
+    detail += cleanup_detail
+    return False, detail
+
+
+def _is_nan_value(value: Any) -> bool:
+    """True only for an actual float NaN (FRED's documented missing-value
+    representation after production parsing). Used so that several rows
+    all carrying the missing-value marker are correctly treated as
+    CONSISTENT duplicates, never as a value conflict -- NaN != NaN under
+    ordinary equality, which would otherwise make every genuine missing-
+    value duplicate look like a disagreement."""
+    return isinstance(value, float) and value != value
+
+
+def _is_malformed_evidence_value(value: Any) -> bool:
+    """
+    Round QA-7-CLOSE-2-R4, Part B. True for any "value" that is NOT a
+    float. Per src/macro/fred_provider.py's documented contract
+    (_parse_numeric_cell(), read-only -- never modified or imported
+    here, this function is a local, independent check): the "value"
+    field FredMacroProvider.get_series() actually returns is ALWAYS a
+    float -- either a real finite number, or float("nan") for FRED's
+    "." missing-value marker. It is NEVER None, an int, a str, a list,
+    or a dict.
+
+    A value of any other type is therefore malformed relative to that
+    contract. The most urgent reason this check exists: {row.get("value")
+    for row in rows ...} (the distinct-value set used for duplicate/
+    conflict detection) raises an uncaught TypeError the moment an
+    unhashable value (a list or dict) reaches it -- this function lets
+    the caller detect and exclude such rows BEFORE they ever reach a
+    set comprehension, so a malformed value can never crash evidence
+    building, never be silently coerced into a number or a string, and
+    never be ignored in a way that lets the REMAINING, well-formed
+    values at that same cell produce a false "PASS" on their own."""
+    return not isinstance(value, float)
+
+
+def _is_infinite_value(value: Any) -> bool:
+    """Round QA-7-CLOSE-2-R3, Part B. True only for an actual float
+    +Infinity or -Infinity. Deliberately DISTINCT from _is_nan_value():
+    FRED's missing-value marker is NaN, never Infinity, so an infinite
+    value is never treated the same way NaN is (it is not a documented
+    "missing" representation to tolerate as a consistent duplicate --
+    see _build_production_pit_evidence()'s status decision, which fails
+    closed to INCONCLUSIVE whenever this is True for the expected or
+    actual selected value, rather than letting
+    _values_reconcile(inf, inf)'s ordinary-equality "True" silently
+    establish evidence integrity)."""
+    return isinstance(value, float) and math.isinf(value)
+
+
+def _values_reconcile(a: Any, b: Any) -> bool:
+    """Value-equality check for reconciling a selected record's value
+    against the independently-known expected value -- handles the NaN
+    case explicitly (see _is_nan_value) rather than relying on `==`.
+    Intentionally does NOT special-case Infinity: `inf == inf` is
+    already True under ordinary equality, which is mathematically
+    correct for THIS equality check alone -- the separate, additional
+    requirement that an infinite value must never by itself support a
+    confident PASS is enforced one layer up, by
+    _build_production_pit_evidence()'s status decision (see
+    _is_infinite_value()), not by weakening this function."""
+    if _is_nan_value(a) and _is_nan_value(b):
+        return True
+    return a == b
+
+
+def _build_production_pit_evidence(observations: list, series_id: str) -> dict:
+    """
+    Network-free, pure evidence builder -- never fetches anything and
+    never parses a crosstab itself (that is exclusively
+    src.macro.fred_provider._parse_crosstab_response()'s job, already
+    exercised by whichever caller produced `observations`). `observations`
+    must already be in the exact shape FredMacroProvider.get_series()
+    returns: a list of dicts with at least series_id, observation_date,
+    value, vintage_date, realtime_start.
+
+    This function:
+      1. (Round QA-7-CLOSE-2-R1, Part B) validates observation_date and
+         vintage_date as actual ISO calendar dates via
+         _parse_iso_date_for_evidence() before anything is grouped or
+         chronologically compared -- a row with either field missing or
+         unparseable is excluded entirely, never lexically compared
+         against a real date;
+      2. (Part C) groups the remaining valid rows by
+         (observation_date, vintage_date). An exact duplicate (same
+         pair, same value -- NaN-aware, see _is_nan_value()) is
+         deduplicated to one representative row. A CONFLICTING
+         duplicate (same pair, genuinely different values) disqualifies
+         that one vintage_date from being counted as a usable candidate
+         at all -- it is never silently resolved by picking whichever
+         row the selector's own internal tie-break happens to prefer;
+      3. keeps only observation_date groups with >=2 DISTINCT, conflict-
+         free vintage_date values;
+      4. (Part D) picks the group with the MOST distinct usable
+         vintages; ties are broken by an explicit, deterministic rule
+         (the most recent observation_date by parsed calendar date),
+         never implicit dict/insertion order;
+      5. chooses as_of from that group's own actually-returned vintage
+         dates (never an invented date) -- specifically the
+         second-newest distinct vintage, which guarantees at least one
+         vintage is "future" relative to as_of (demonstrating exclusion)
+         while also being itself eligible (demonstrating selection);
+      6. independently computes which vintage AND VALUE should be
+         selected, for verification purposes only -- this check-oracle
+         is computed directly from the candidate list's own (already
+         deduplicated/conflict-checked) dates and values, not a
+         reimplementation of pit.py's internals;
+      7. calls the REAL, unmodified pit.select_latest_vintage_as_of()
+         directly on this one observation_date's real candidates, AND
+         separately calls the REAL, unmodified
+         pit.get_point_in_time_series() over the full `observations`
+         list (the actual series-level production entry point),
+         extracting its row for the chosen observation_date -- both are
+         real production calls, neither is reimplemented here. Both
+         calls, and the comparison that follows, are wrapped so that any
+         unexpected exception fails closed to INCONCLUSIVE rather than
+         propagating (Part A; the outer live wrapper also wraps this
+         entire function as defense-in-depth);
+      8. compares both real results' SELECTED VINTAGE *and* VALUE
+         against the independently-computed expectation and reports
+         whether they reconcile.
+
+    Returns a dict with "status": "PASS" only when a usable, conflict-
+    free multi-vintage case was found AND both real selector calls agree
+    with the independently-computed expected vintage AND VALUE AND
+    neither selected a later-than-as_of ("future") vintage. Otherwise
+    "status": "INCONCLUSIVE" with an explicit "reason" and a "stage"
+    field distinguishing why (see callers of this function for the full
+    stage vocabulary). This function never raises -- an ordinary "no
+    suitable case in this data" condition, a date-validation exclusion,
+    a detected value conflict, or an unexpected exception from the real
+    selector calls are all reported as INCONCLUSIVE, never an uncaught
+    exception and never a false PASS.
+    """
+    valid_rows: list[tuple[str, str, dict]] = []
+    excluded_invalid_date_row_count = 0
+    for obs in observations:
+        if not isinstance(obs, dict):
+            continue
+        obs_date_raw = obs.get("observation_date")
+        vintage_date_raw = obs.get("vintage_date")
+        if (
+            _parse_iso_date_for_evidence(obs_date_raw) is None
+            or _parse_iso_date_for_evidence(vintage_date_raw) is None
+        ):
+            excluded_invalid_date_row_count += 1
+            continue
+        valid_rows.append((obs_date_raw, vintage_date_raw, obs))
+
+    by_obs_date: dict[str, dict[str, list]] = {}
+    for obs_date_raw, vintage_date_raw, obs in valid_rows:
+        by_obs_date.setdefault(obs_date_raw, {}).setdefault(vintage_date_raw, []).append(obs)
+
+    candidate_groups: dict[str, list] = {}
+    conflicted_cell_count = 0
+    malformed_value_cell_count = 0
+    for obs_date_raw, by_vintage in by_obs_date.items():
+        usable_rows = []
+        for vintage_date_raw, rows in by_vintage.items():
+            # Round QA-7-CLOSE-2-R4, Part B: check for a malformed
+            # (non-float) "value" BEFORE building any set from these
+            # rows -- {row.get("value") for row in rows ...} below
+            # would raise an uncaught TypeError the instant an
+            # unhashable value (list/dict) reached it. A malformed
+            # value at this cell -- whether alone or alongside an
+            # otherwise-fine finite/NaN value -- disqualifies the
+            # WHOLE cell from the usable candidate set, exactly like a
+            # conflicting duplicate: it is never silently dropped so
+            # that the remaining well-formed rows at this same cell
+            # can produce a PASS on their own.
+            if any(_is_malformed_evidence_value(row.get("value")) for row in rows):
+                malformed_value_cell_count += 1
+                continue
+            distinct_values = {row.get("value") for row in rows if not _is_nan_value(row.get("value"))}
+            nan_present = any(_is_nan_value(row.get("value")) for row in rows)
+            # Round QA-7-CLOSE-2-R2, Part A: a NaN row and a finite-value
+            # row at the SAME (observation_date, vintage_date) pair are
+            # themselves a disagreement -- one row claims "missing",
+            # another claims a real value -- and must be treated as a
+            # conflicting duplicate exactly like two different finite
+            # values would be, never as a consistent duplicate decided
+            # by whichever row happens to be first in `rows`. Only when
+            # EVERY row at this cell is NaN (distinct_values empty, no
+            # finite value ever claimed) is it a genuine consistent
+            # missing-value duplicate, preserved as before.
+            mixed_nan_and_finite = nan_present and bool(distinct_values)
+            if len(distinct_values) > 1 or mixed_nan_and_finite:
+                # Conflicting duplicate: same (observation_date,
+                # vintage_date) pair, genuinely different values (or a
+                # NaN/finite mix). This one vintage_date is excluded
+                # from the usable candidate set entirely -- never
+                # resolved by date equality alone or by input order.
+                conflicted_cell_count += 1
+                continue
+            usable_rows.append(rows[0])  # dedup: one representative row
+        distinct_usable_vintages = {row["vintage_date"] for row in usable_rows}
+        if len(distinct_usable_vintages) >= 2:
+            candidate_groups[obs_date_raw] = usable_rows
+
+    if not candidate_groups:
+        reason = (
+            "No observation_date in the returned window has two or more "
+            "distinct, internally-consistent vintage_date candidates; "
+            "cannot exercise the production PIT selector's tie-break on "
+            "this data."
+        )
+        if conflicted_cell_count:
+            reason += (
+                f" {conflicted_cell_count} observation_date/vintage_date "
+                "pair(s) had conflicting duplicate values and were "
+                "excluded as unusable rather than silently resolved."
+            )
+        if malformed_value_cell_count:
+            reason += (
+                f" {malformed_value_cell_count} observation_date/vintage_date "
+                "pair(s) contained a malformed (non-float) value and were "
+                "excluded as unusable rather than silently ignored."
+            )
+        if excluded_invalid_date_row_count:
+            reason += (
+                f" {excluded_invalid_date_row_count} row(s) were excluded "
+                "for an unparseable observation_date or vintage_date."
+            )
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_succeeded_no_usable_candidates",
+            "reason": reason,
+            "series_id": series_id,
+            "observation_dates_examined": len(by_obs_date),
+            "excluded_invalid_date_row_count": excluded_invalid_date_row_count,
+            "conflicted_cell_count": conflicted_cell_count,
+            "malformed_value_cell_count": malformed_value_cell_count,
+        }
+
+    # Part D: deterministic tie-break -- most distinct usable vintages
+    # wins; ties broken by the MOST RECENT observation_date (max by
+    # parsed calendar date), never implicit dict/insertion order. This
+    # selects only which real example is reported; it does not alter
+    # PIT selector semantics.
+    def _group_sort_key(obs_date_raw: str) -> tuple:
+        vintage_count = len({row["vintage_date"] for row in candidate_groups[obs_date_raw]})
+        return (vintage_count, _parse_iso_date_for_evidence(obs_date_raw))
+
+    chosen_obs_date = max(candidate_groups, key=_group_sort_key)
+    group = candidate_groups[chosen_obs_date]
+    distinct_vintages = sorted(
+        {row["vintage_date"] for row in group},
+        key=_parse_iso_date_for_evidence,
+    )
+
+    if len(distinct_vintages) < 2:
+        # Defensive only -- the candidate_groups filter above already
+        # guarantees this; fail closed rather than index-error if that
+        # invariant is ever violated.
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_succeeded_no_usable_candidates",
+            "reason": "Selected observation_date unexpectedly has fewer than two distinct vintages.",
+            "series_id": series_id,
+            "observation_date": chosen_obs_date,
+        }
+
+    as_of = distinct_vintages[-2]
+    as_of_parsed = _parse_iso_date_for_evidence(as_of)
+    eligible_vintages = [
+        v for v in distinct_vintages if _parse_iso_date_for_evidence(v) <= as_of_parsed
+    ]
+    excluded_future_vintages = [v for v in distinct_vintages if v not in eligible_vintages]
+    expected_selected_vintage = max(eligible_vintages, key=_parse_iso_date_for_evidence)
+    expected_row = next(
+        (row for row in group if row["vintage_date"] == expected_selected_vintage), None
+    )
+    expected_value = expected_row.get("value") if expected_row else None
+
+    # ---- Part A: the real selector calls and their comparison are
+    # wrapped so an unexpected exception here fails closed to
+    # INCONCLUSIVE rather than escaping -- never silently claims parsing
+    # or selection occurred when it did not.
+    try:
+        # select_latest_vintage_as_of() requires an actual date object
+        # (it does not coerce a string itself -- only
+        # get_point_in_time_series() does that, via
+        # pit.coerce_as_of_date()), so "as_of" is parsed here before
+        # this one direct call; the call itself is still the real,
+        # unmodified production function.
+        selected_direct = select_latest_vintage_as_of(group, date.fromisoformat(as_of))
+        pit_series = get_point_in_time_series(observations, series_id, as_of)
+        selected_via_series = next(
+            (row for row in pit_series if row.get("observation_date") == chosen_obs_date),
+            None,
+        )
+
+        selected_direct_vintage = selected_direct.get("vintage_date") if selected_direct else None
+        selected_series_vintage = (
+            selected_via_series.get("vintage_date") if selected_via_series else None
+        )
+        selected_direct_value = selected_direct.get("value") if selected_direct else None
+        selected_series_value = selected_via_series.get("value") if selected_via_series else None
+
+        agrees_with_expected = (
+            selected_direct_vintage == expected_selected_vintage
+            and selected_series_vintage == expected_selected_vintage
+        )
+        values_reconcile = _values_reconcile(
+            selected_direct_value, expected_value
+        ) and _values_reconcile(selected_series_value, expected_value)
+        no_future_vintage_selected = (
+            selected_direct_vintage not in excluded_future_vintages
+            and selected_series_vintage not in excluded_future_vintages
+        )
+        # Round QA-7-CLOSE-2-R3, Part B: positive or negative infinity
+        # must never, by itself, support a confident PASS. inf == inf
+        # is ordinary, correct float equality -- _values_reconcile()
+        # above is not wrong to report True for it -- but that alone
+        # must not be allowed to "silently establish evidence
+        # integrity". If infinity appears in EITHER the independently-
+        # computed expected value OR either real selector's returned
+        # value for this example, the result is forced to INCONCLUSIVE
+        # below, with an explicit reason, regardless of what
+        # agrees_with_expected/values_reconcile/no_future_vintage_selected
+        # otherwise say. Never converts infinity to a missing value
+        # first (that remains purely a serialization-time concern, see
+        # _json_sanitize()) -- this check runs on the real float value.
+        any_infinite_value = (
+            _is_infinite_value(expected_value)
+            or _is_infinite_value(selected_direct_value)
+            or _is_infinite_value(selected_series_value)
+        )
+    except Exception as e:  # noqa: BLE001 -- fail closed, never propagate
+        # Round QA-7-CLOSE-2-R5, Part B: the diagnostic counters below
+        # were ALL already computed earlier in this function (grouping,
+        # date validation, conflict/malformed-value detection all
+        # happen before the real selector calls in the try block
+        # above) -- they are carried over here rather than omitted,
+        # so an exception from the real selector invocation doesn't
+        # also throw away evidence this function had already gathered.
+        # Nothing here is guessed or estimated: every value is the
+        # exact count this function computed, using the same field
+        # names the successful-path result dict already uses.
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_succeeded_evidence_build_error",
+            "reason": "Production selector invocation raised an unexpected exception.",
+            "series_id": series_id,
+            "observation_date": chosen_obs_date,
+            "as_of": as_of,
+            "detail": _redact_exception_text(e)[:300],
+            "excluded_invalid_date_row_count": excluded_invalid_date_row_count,
+            "conflicted_cell_count": conflicted_cell_count,
+            "malformed_value_cell_count": malformed_value_cell_count,
+            "observation_dates_examined": len(by_obs_date),
+            "multi_vintage_observation_dates_found": len(candidate_groups),
+        }
+
+    # Round QA-7-CLOSE-2-R6, Part B: "PASS" here is scoped strictly to
+    # the ONE observation_date/candidate group actually selected above
+    # (`chosen_obs_date` / `group`) -- it is never a statement about
+    # the integrity or data quality of the full response window this
+    # evidence was built from. A malformed-value cell at a different,
+    # unrelated observation_date (counted in `malformed_value_cell_count`
+    # below, which is always present in this result regardless of
+    # status) does not and must not block this PASS; a malformed cell
+    # belonging to THIS SAME group, by contrast, was already excluded
+    # before `group` was ever assembled (see the per-cell filtering
+    # loop above), so it can never be the thing silently "passing"
+    # here either. This status is not changed or widened by this
+    # round -- only this comment, and the tests immediately above, make
+    # that scoping explicit.
+    status = (
+        "PASS"
+        if (
+            agrees_with_expected
+            and values_reconcile
+            and no_future_vintage_selected
+            and selected_direct is not None
+            and selected_via_series is not None
+            and not any_infinite_value
+        )
+        else "INCONCLUSIVE"
+    )
+
+    candidate_sample = [
+        {"vintage_date": g["vintage_date"], "value": g.get("value")}
+        for g in sorted(group, key=lambda g: _parse_iso_date_for_evidence(g["vintage_date"]))
+    ]
+
+    result = {
+        "status": status,
+        "stage": "request_succeeded_evidence_built",
+        "series_id": series_id,
+        "observation_date": chosen_obs_date,
+        "as_of": as_of,
+        "candidate_vintage_dates": distinct_vintages,
+        "candidate_sample": candidate_sample,
+        "eligible_vintage_dates": eligible_vintages,
+        "excluded_future_vintage_dates": excluded_future_vintages,
+        "expected_selected_vintage": expected_selected_vintage,
+        "expected_value": expected_value,
+        "actual_selected_vintage_direct": selected_direct_vintage,
+        "actual_selected_vintage_via_series": selected_series_vintage,
+        "actual_selected_value_direct": selected_direct_value,
+        "actual_selected_value_via_series": selected_series_value,
+        "agrees_with_expected": agrees_with_expected,
+        "values_reconcile": values_reconcile,
+        "no_future_vintage_selected": no_future_vintage_selected,
+        "any_infinite_value": any_infinite_value,
+        "observation_dates_examined": len(by_obs_date),
+        "multi_vintage_observation_dates_found": len(candidate_groups),
+        "excluded_invalid_date_row_count": excluded_invalid_date_row_count,
+        "conflicted_cell_count": conflicted_cell_count,
+        "malformed_value_cell_count": malformed_value_cell_count,
+    }
+    if status == "INCONCLUSIVE":
+        if any_infinite_value:
+            # Round QA-7-CLOSE-2-R3, Part B: a specific, explicit reason
+            # -- never collapsed into the generic reconciliation message
+            # below -- so a reader (or a future test) can distinguish
+            # "an infinite value made this evidence invalid" from an
+            # ordinary reconciliation failure.
+            result["reason"] = (
+                "Positive or negative infinity appeared in the "
+                "independently-computed expected value or in a real "
+                "selector's returned value for this example; an "
+                "infinite value is never treated as a valid numeric "
+                "observation for a confident PASS, even when it "
+                "trivially reconciles against itself under ordinary "
+                "float equality."
+            )
+        else:
+            result["reason"] = (
+                "Real pit.py selector output did not reconcile with the "
+                "independently-computed expected vintage/value, or selected "
+                "a future vintage, or returned None -- see the fields above."
+            )
+    return result
+
+
+def section_m_production_output_type2_pit_selector_probe(
+    series_id: str, start_date: str, end_date: str
+) -> dict:
+    """
+    Round QA-7-CLOSE-2, Part B (hardened in Round QA-7-CLOSE-2-R1,
+    Part A). LIVE-ONLY wrapper around _build_production_pit_evidence():
+    calls the REAL, unmodified
+    src.macro.fred_provider.FredMacroProvider.get_series() (the actual
+    production output_type=2 fetch + crosstab-parsing path) for
+    `series_id`, then hands the real result to the network-free builder
+    above.
+
+    Fails closed to {"status": "INCONCLUSIVE", "reason": ..., "stage":
+    ...} -- never raises -- when FRED_API_KEY is unavailable, on any
+    classified FRED HTTP/response-shape error, on any other exception
+    raised by the fetch itself, OR on any unexpected exception raised by
+    _build_production_pit_evidence() (defense-in-depth: that function
+    already fails closed internally, but this call is wrapped here too,
+    so a failure can never escape this wrapper regardless of where it
+    originates). Every error detail is passed through
+    _redact_text()/_redact_exception_text() before being stored, exactly
+    like every other section in this script; no API key, credential, or
+    unredacted exception text is ever included in the returned dict.
+
+    The "stage" field on every returned dict distinguishes:
+      - "request_not_attempted_unsupported_series" (series_id is not in
+        WIDE_WINDOW_SERIES_IDS, so no request was ever attempted --
+        distinct from the API-key case below, which DOES target a
+        supported series but could not authenticate)
+      - "request_not_attempted_api_key_missing" (FRED_API_KEY absent)
+      - "request_failed" (fetch itself raised)
+      - "request_succeeded_no_usable_candidates" (fetch OK, no usable
+        multi-vintage case in the data)
+      - "request_succeeded_evidence_build_error" (fetch OK, but building
+        or invoking the real selector raised unexpectedly)
+      - "request_succeeded_evidence_built" (fetch OK, real selector
+        path fully exercised -- "status" says whether it reconciled)
+    "production_path_exercised" is True only once the real fetch
+    actually returned data; it is False whenever the fetch itself never
+    completed.
+    """
+    if series_id not in WIDE_WINDOW_SERIES_IDS:
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_not_attempted_unsupported_series",
+            "reason": (
+                f"{series_id!r} is not in WIDE_WINDOW_SERIES_IDS; this probe "
+                "only targets the production output_type=2 wide-window path."
+            ),
+            "series_id": series_id,
+            "production_path_exercised": False,
+        }
+
+    provider = FredMacroProvider()
+    try:
+        observations = provider.get_series(series_id, start_date=start_date, end_date=end_date)
+    except FredAPIKeyMissing as e:
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_not_attempted_api_key_missing",
+            "reason": (
+                "FRED_API_KEY is not set in this execution environment; the "
+                "real production output_type=2 request was never made."
+            ),
+            "series_id": series_id,
+            "detail": _redact_text(str(e)),
+            "production_path_exercised": False,
+        }
+    except FredHTTPError as e:
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_failed",
+            "reason": f"Production fetch failed: classification={e.classification} status={e.status}",
+            "series_id": series_id,
+            "detail": (_redact_text(e.detail) or "")[:300],
+            "production_path_exercised": False,
+        }
+    except FredProviderError as e:
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_failed",
+            "reason": "Production fetch raised a FredProviderError.",
+            "series_id": series_id,
+            "detail": _redact_text(str(e)),
+            "production_path_exercised": False,
+        }
+    except Exception as e:  # noqa: BLE001 -- fail closed, never crash main()
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_failed",
+            "reason": "Production fetch raised an unexpected exception.",
+            "series_id": series_id,
+            "detail": _redact_exception_text(e)[:300],
+            "production_path_exercised": False,
+        }
+
+    # Part A, defense-in-depth: _build_production_pit_evidence() already
+    # fails closed internally (see its own try/except around the real
+    # selector calls), but this call is wrapped too, so nothing it
+    # raises can ever escape this wrapper.
+    try:
+        evidence = _build_production_pit_evidence(observations, series_id)
+    except Exception as e:  # noqa: BLE001 -- fail closed, never crash main()
+        return {
+            "status": "INCONCLUSIVE",
+            "stage": "request_succeeded_evidence_build_error",
+            "reason": "_build_production_pit_evidence() raised an unexpected exception.",
+            "series_id": series_id,
+            "detail": _redact_exception_text(e)[:300],
+            "production_path_exercised": True,
+            "total_raw_records_returned": len(observations) if isinstance(observations, list) else None,
+        }
+
+    evidence["production_path_exercised"] = True
+    evidence["request_params"] = {
+        "series_id": series_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "fetch_strategy": (
+            "output_type=2 (WIDE_WINDOW_SERIES_IDS path, via the real, "
+            "unmodified FredMacroProvider.get_series())"
+        ),
+    }
+    evidence["total_raw_records_returned"] = len(observations)
+    return evidence
+
+
 def main() -> int:
     today = date.today()
     as_of_today = today.isoformat()
@@ -940,6 +1856,92 @@ def main() -> int:
             series_id, as_of_today, i_window_start, i_window_end
         )
     RESULTS["i_vintage_dates_cross_check"] = i_results
+
+    # ---- SECTION M (Round QA-7-CLOSE-2): live production output_type=2
+    # PIT selector probe. Uses the real, unmodified FredMacroProvider.
+    # get_series() + pit.select_latest_vintage_as_of()/
+    # get_point_in_time_series() -- not a reimplementation. Fails closed
+    # to INCONCLUSIVE (never a fabricated PASS) if no usable multi-
+    # vintage case is found, FRED_API_KEY is unavailable, or any other
+    # error occurs. PAYEMS is the primary target (confirmed revised --
+    # see SECTION MULTIPLE-AS_OF above); same ~13-month window as
+    # SECTION I, reused for consistency, not independently re-derived. ----
+    _print_header("SECTION M -- live production output_type=2 PIT selector probe (PAYEMS)")
+    m_window_start = _shift_months(today, -13).isoformat()
+    m_window_end = as_of_today
+    m_result = section_m_production_output_type2_pit_selector_probe(
+        "PAYEMS", m_window_start, m_window_end
+    )
+    _log(json.dumps(m_result, indent=2, default=str))
+    RESULTS["m_production_output_type2_pit_selector_probe"] = m_result
+
+    # Round QA-7-CLOSE-2 Part C: write the compact evidence artifact to
+    # disk (in addition to the RESULTS JSON already logged to stdout
+    # above) so the calling workflow can upload it as a named,
+    # downloadable GitHub Actions artifact -- see the "Upload QA-7-
+    # CLOSE-2 evidence artifact" step in fred-output-type1-validation.yml.
+    # Never includes an API key, a URL containing one, or raw unredacted
+    # exception text -- m_result already went through the same
+    # _redact_text()/_redact_exception_text() discipline as every other
+    # section above before reaching this point.
+    evidence_artifact = {
+        "validation_timestamp": datetime.utcnow().isoformat() + "Z",
+        "round": "QA-7-CLOSE-2",
+        "probe": "m_production_output_type2_pit_selector_probe",
+        "result": m_result,
+    }
+    # Round QA-7-CLOSE-2-R3, Part A: the write itself is delegated to
+    # _write_evidence_artifact_atomically(), which (1) removes any
+    # stale artifact left over from a previous run BEFORE attempting
+    # this run's write, (2) sanitizes + strictly serializes, (3) writes
+    # a same-directory temp file and atomically os.replace()s it into
+    # place, and (4) on any failure, removes the temp file and leaves
+    # the destination absent -- never partial, never stale. The success
+    # log line below is reached only once that helper reports True.
+    artifact_written, artifact_error_detail = _write_evidence_artifact_atomically(
+        PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH, evidence_artifact
+    )
+    if artifact_written:
+        _log(f"  evidence artifact written: {PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH}")
+    else:
+        # Never let a filesystem problem, or an unsanitizable non-finite
+        # value, fail the whole validation run -- the evidence is
+        # already in RESULTS/stdout above regardless. artifact_error_detail
+        # has already been redacted by the helper above.
+        _log(f"  WARNING: could not write evidence artifact file: {artifact_error_detail}")
+        # Round QA-7-CLOSE-2-R5 Test Review Follow-up, Part C: the
+        # calling workflow's "Upload QA-7-CLOSE-2 production PIT
+        # evidence artifact" step uploads whatever file sits at
+        # PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH unconditionally
+        # (if: always(), if-no-files-found: warn) -- it has no way to
+        # know this run's write attempt failed. The one scenario in
+        # which a STALE file left over from a PREVIOUS run can survive
+        # a failed write here is when _write_evidence_artifact_atomically()'s
+        # own step 1 (its destination existence check / removal,
+        # attempted before anything else) itself raised -- every later
+        # failure point inside that helper already guarantees the
+        # destination ends up absent. This is a second, independent,
+        # best-effort attempt (never claimed to be guaranteed -- see
+        # the WARNING below if it too cannot confirm removal) to clear
+        # whatever is left at that path, so a stale artifact from an
+        # earlier run is never uploaded and mistaken for THIS run's
+        # (failed) evidence. Deliberately does not modify
+        # _write_evidence_artifact_atomically() itself or the workflow
+        # file -- this is the smallest change that closes the gap
+        # without touching either.
+        try:
+            if os.path.exists(PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH):
+                os.remove(PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH)
+                _log(
+                    "  additionally removed a leftover/stale file at "
+                    f"{PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH} so it is never "
+                    "uploaded as if it were this (failed) run's evidence"
+                )
+        except Exception as cleanup_error:  # noqa: BLE001 -- best-effort only, never fail the run over this
+            _log(
+                "  WARNING: could not confirm removal of a possibly-stale "
+                f"artifact file: {_safe_redact_text(str(cleanup_error))}"
+            )
 
     # ---- SECTION 10: data volume (actual, this run) ----
     _print_header("SECTION DATA-VOLUME -- actual output_type=1 bytes/rows this run (CASE B)")
