@@ -40,3 +40,18 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: python3 -u .github/scripts/fred_output_type1_validation.py
+
+      # Round QA-7-CLOSE-2, Part C: upload the compact Section M
+      # production-PIT-selector evidence file as a named, downloadable
+      # workflow artifact. if-no-files-found: warn (not error) because
+      # the script writes this file only after its own run completes,
+      # and fails closed to INCONCLUSIVE -- never to a crash that would
+      # skip the write -- but a missing file here must still never fail
+      # the job on its own.
+      - name: Upload QA-7-CLOSE-2 production PIT evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fred-qa7-close2-production-pit-evidence
+          path: fred_qa7_close2_production_pit_evidence.json
+          if-no-files-found: warn
