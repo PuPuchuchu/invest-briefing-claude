@@ -424,6 +424,250 @@ def _shift_months(d: date, months: int) -> date:
     return date(year, month, day)
 
 
+# ============================================================
+# Round QA-7-CLOSE-3: FRED real-time date-boundary diagnosis and
+# recovery. Diagnosed via a real GitHub Actions run on 2026-10-23
+# (job started 2026-10-23T04:49:38Z, i.e. runner-local `date.today()`
+# == 2026-10-23): every CASE A / SECTION B-2 / SECTION I request using
+# realtime_start=realtime_end=as_of_today (or vintage_dates=as_of_today)
+# failed with a 400 INVALID_PARAMETER response whose body was exactly
+#   {"error_code":400,"error_message":"Bad Request.  Variable
+#   realtime_start can not be after today's date (2026-10-22) unless
+#   it's equal to the real-time max date 9999-12-31."}
+# (Section I's vintage_dates=as_of_today path separately failed with a
+# 500 HTTP_FAILURE citing the same 2026-10-22 upper bound: "The vintage
+# date ... cannot be outside the range 1776-07-04 to 2026-10-22.") This
+# was reproducible and stable across the whole ~24-second run (04:49:38
+# to 04:50:02 UTC) -- every "today" request failed with this exact
+# message and date, every "past_1"/"past_2" request (one calendar year
+# and three calendar years back) succeeded with status 200. No
+# AUTH_FAILED, RATE_LIMITED, or other classification was observed. This
+# is consistent with FRED computing its own real-time max date in a
+# timezone behind UTC (the St. Louis Fed is US Central time; at
+# 2026-10-23T04:49 UTC it was still 2026-10-22 in Central time), while
+# this script's `date.today()` (SECTION 10) uses the runner's (UTC)
+# calendar date -- NOT a bug in this script's date arithmetic, and NOT
+# an auth/network/rate-limit problem; a one-calendar-day timezone
+# mismatch between this script's notion of "today" and FRED's real-time
+# max date, observed only close to UTC midnight.
+#
+# The recovery below is validation-infrastructure-only: it does not
+# touch src/macro/fred_provider.py, src/macro/pit.py, or any other
+# production module, and it does not change observation_start/
+# observation_end semantics (a different FRED parameter, never treated
+# as the same variable as the realtime as_of value below). It performs
+# ONE lightweight probe request up front; if FRED accepts the
+# originally requested as_of date, nothing changes (requirement 1). If
+# FRED rejects it with exactly the recognized "today's date (D)"
+# INVALID_PARAMETER pattern, and D passes strict validation, D becomes
+# the single `effective_realtime_as_of` reused by CASE A ("today"),
+# SECTION B-2, and SECTION I for the rest of this run (requirement 5);
+# otherwise this fails closed to the original, unmodified as_of value
+# (requirement 4) and every downstream section behaves exactly as it
+# did before this round -- including still failing, visibly, if the
+# probe's own failure cannot be safely classified as this specific
+# date-boundary condition.
+# ============================================================
+
+_REALTIME_DATE_BOUNDARY_RE = re.compile(
+    r"today.s date \((\d{4}-\d{2}-\d{2})\) unless it.s equal to the real-time max date"
+)
+
+
+def _validate_realtime_boundary_date(candidate_str: str, requested_as_of: str) -> date | None:
+    """Strict validation of a server-reported real-time boundary date,
+    confined to this validation script -- never imported from or fed
+    into any production module. Returns None (fail-closed) unless ALL
+    of the following hold:
+      1. `candidate_str` is the exact canonical "YYYY-MM-DD" form
+         (reuses `_parse_iso_date_for_evidence`'s strict round-trip
+         check -- the same parser already used for observation_date/
+         vintage_date elsewhere in this file, not a new, looser one).
+      2. `requested_as_of` is itself a valid canonical date (defensive;
+         it is always `date.today().isoformat()` or a value derived
+         from it in this script, but this function makes no assumption
+         about its caller).
+      3. The candidate is not AFTER the requested date -- a server-
+         reported "maximum allowed" date that is somehow later than
+         what was actually requested is nonsensical for this specific
+         error pattern and is never accepted.
+      4. The candidate is within 3 calendar days BEFORE the requested
+         date -- this diagnosis identified a ONE-day UTC/Central-time
+         skew as the cause; a larger gap is outside what this specific,
+         diagnosed condition explains, so it is rejected rather than
+         guessed at. This bound is deliberately tight and never
+         widened to "whatever FRED says" without renewed evidence.
+    """
+    candidate = _parse_iso_date_for_evidence(candidate_str)
+    if candidate is None:
+        return None
+    requested = _parse_iso_date_for_evidence(requested_as_of)
+    if requested is None:
+        return None
+    if candidate > requested:
+        return None
+    if (requested - candidate).days > 3:
+        return None
+    return candidate
+
+
+def _determine_effective_realtime_as_of(requested_as_of: str, probe_series_id: str) -> dict:
+    """Round QA-7-CLOSE-3. Issues exactly one real, lightweight FRED
+    request (realtime_start=realtime_end=`requested_as_of`, no
+    observation_start/observation_end -- deliberately NOT the same
+    request CASE A makes for `probe_series_id`, so this function's own
+    probe never silently substitutes for, or is mistaken for, that
+    section's own recorded result) to determine whether FRED currently
+    accepts `requested_as_of` as a real-time as_of value.
+
+    Returns a dict always containing both `requested_realtime_as_of`
+    and `effective_realtime_as_of` as SEPARATE fields (never merged
+    into one), plus `adjusted` (bool) and a human-readable `reason`
+    string recorded unconditionally -- including when no adjustment is
+    made, so the reason nothing changed is as visible as the reason
+    something did. The api_key is never present in any returned field;
+    `probe` only carries the same `classification`/`status` shape
+    `_request()` already returns elsewhere in this file, and any detail
+    text has already passed through `_redact_text()` inside `_request()`
+    itself.
+    """
+    probe = _request({
+        "series_id": probe_series_id,
+        "output_type": 1,
+        "realtime_start": requested_as_of,
+        "realtime_end": requested_as_of,
+    })
+    result = {
+        "requested_realtime_as_of": requested_as_of,
+        "effective_realtime_as_of": requested_as_of,
+        "adjusted": False,
+        "reason": None,
+        "probe_series_id": probe_series_id,
+        "probe_status": probe["status"],
+        "probe_classification": probe["classification"],
+    }
+    if probe["ok"]:
+        result["reason"] = (
+            "FRED accepted the requested realtime_start/realtime_end as-is; "
+            "no adjustment made."
+        )
+        return result
+    if probe["classification"] != "INVALID_PARAMETER":
+        result["reason"] = (
+            "Probe request failed, but not with the recognized date-boundary "
+            f"INVALID_PARAMETER pattern (classification={probe['classification']!r}, "
+            f"status={probe['status']!r}); not treated as a date-boundary issue, "
+            "no adjustment made."
+        )
+        return result
+    detail = probe.get("detail") or ""
+    match = _REALTIME_DATE_BOUNDARY_RE.search(detail)
+    if not match:
+        result["reason"] = (
+            "Request failed with classification=INVALID_PARAMETER, but the "
+            "error text did not match the recognized \"today's date (D)\" "
+            "real-time boundary pattern; no adjustment made."
+        )
+        return result
+    candidate_str = match.group(1)
+    candidate = _validate_realtime_boundary_date(candidate_str, requested_as_of)
+    if candidate is None:
+        result["reason"] = (
+            f"Server-reported boundary date {candidate_str!r} failed strict "
+            "validation (unparseable, not before the requested date, or more "
+            "than 3 days earlier); fail-closed, no adjustment made."
+        )
+        return result
+    result["effective_realtime_as_of"] = candidate.isoformat()
+    result["adjusted"] = True
+    result["reason"] = (
+        f"FRED rejected realtime_start=realtime_end={requested_as_of} with the "
+        f"recognized real-time date-boundary error; server-reported boundary "
+        f"date {candidate.isoformat()} passed validation and is used instead "
+        "for CASE A (today), SECTION B-2, and SECTION I in this run. This is "
+        "reported for this run's adjusted date only -- it is not a claim that "
+        f"PIT correctness was verified for {requested_as_of}."
+    )
+    return result
+
+
+def _run_case_a_with_effective_as_of(
+    series_to_check,
+    effective_realtime_as_of_today: str,
+    as_of_past_1: str,
+    as_of_past_2: str,
+) -> dict:
+    """Round QA-7-CLOSE-4 orchestration seam, extracted from `main()`'s
+    CASE A block with NO behavior change and NO new call site: the exact
+    same section_case_a() calls, same arguments, same order, same _log
+    lines `main()` made inline before this round -- only the "today"
+    entry uses `effective_realtime_as_of_today` (an ALREADY-COMPUTED
+    value this function does not derive and makes no FRED probe request
+    to obtain); "past_1"/"past_2" always use the untouched past as_of
+    values passed in. Exists to give the wiring between
+    `_determine_effective_realtime_as_of()`'s output and this APPROVED
+    call site a stable, directly-testable seam -- addressing the
+    QA-7-CLOSE-3 external-review finding that no test previously
+    exercised this wiring itself."""
+    case_a_results: dict = {}
+    for series_id in series_to_check:
+        case_a_results[series_id] = {}
+        for label, as_of in [
+            ("today", effective_realtime_as_of_today),
+            ("past_1", as_of_past_1),
+            ("past_2", as_of_past_2),
+        ]:
+            _log(f"-- {series_id} / {label} --")
+            case_a_results[series_id][label] = section_case_a(series_id, as_of)
+    return case_a_results
+
+
+def _run_section_b2_with_effective_as_of(
+    monthly_series,
+    effective_realtime_as_of_today: str,
+    b2_test_month: date,
+) -> dict:
+    """Round QA-7-CLOSE-4 orchestration seam, extracted from `main()`'s
+    SECTION B-2 block with NO behavior change and NO new call site --
+    see `_run_case_a_with_effective_as_of()`'s docstring for the shared
+    rationale. `b2_test_month` (and the observation_start/observation_end
+    window it derives inside section_b2_monthly_precision()) is a
+    different, untouched variable, never conflated with the realtime
+    as_of value here."""
+    b2_results: dict = {}
+    for series_id in monthly_series:
+        _log(f"-- {series_id} (test_month={b2_test_month.year:04d}-{b2_test_month.month:02d}) --")
+        b2_results[series_id] = section_b2_monthly_precision(
+            series_id, effective_realtime_as_of_today, b2_test_month
+        )
+    return b2_results
+
+
+def _run_section_i_with_effective_as_of(
+    i_series,
+    effective_realtime_as_of_today: str,
+    i_window_start: str,
+    i_window_end: str,
+) -> dict:
+    """Round QA-7-CLOSE-4 orchestration seam, extracted from `main()`'s
+    SECTION I block with NO behavior change and NO new call site -- see
+    `_run_case_a_with_effective_as_of()`'s docstring for the shared
+    rationale. `i_window_start`/`i_window_end` are the untouched
+    observation window (derived from `as_of_today`, never from the
+    effective realtime as_of value); section_i_vintage_dates_cross_check()
+    itself already applies the SAME `effective_realtime_as_of_today`
+    argument to both its Path A (realtime_start/realtime_end) and Path B
+    (vintage_dates) requests -- unchanged by this refactor."""
+    i_results: dict = {}
+    for series_id in i_series:
+        _log(f"-- {series_id} (as_of={effective_realtime_as_of_today}, "
+             f"window=[{i_window_start}, {i_window_end}]) --")
+        i_results[series_id] = section_i_vintage_dates_cross_check(
+            series_id, effective_realtime_as_of_today, i_window_start, i_window_end
+        )
+    return i_results
+
+
 def _has_missing_marker(observations: list[dict]) -> bool:
     return any(obs.get("value") == "." for obs in observations)
 
@@ -1773,15 +2017,39 @@ def main() -> int:
         "revision_probe_as_of_dates": revision_probe_as_of_dates,
     }
 
+    # ---- Round QA-7-CLOSE-3: determine the single effective real-time
+    # as_of value CASE A ("today"), SECTION B-2, and SECTION I will all
+    # use below -- see the long comment above _determine_effective_
+    # realtime_as_of() for the diagnosed cause. This does NOT change
+    # as_of_today itself (still used, unmodified, for observation_start/
+    # observation_end elsewhere in this function and for SECTION M,
+    # which is unaffected by this diagnosis and is out of this round's
+    # scope) -- only the separate `effective_realtime_as_of_today`
+    # value below is threaded into the three in-scope sections. ----
+    _print_header("REALTIME AS_OF PROBE (Round QA-7-CLOSE-3)")
+    realtime_as_of_probe = _determine_effective_realtime_as_of(as_of_today, SERIES_TO_CHECK[0])
+    effective_realtime_as_of_today = realtime_as_of_probe["effective_realtime_as_of"]
+    _log(f"  requested_realtime_as_of={realtime_as_of_probe['requested_realtime_as_of']}")
+    _log(f"  effective_realtime_as_of={effective_realtime_as_of_today} "
+         f"adjusted={realtime_as_of_probe['adjusted']}")
+    _log(f"  probe_status={realtime_as_of_probe['probe_status']} "
+         f"probe_classification={realtime_as_of_probe['probe_classification']}")
+    _log(f"  reason={realtime_as_of_probe['reason']}")
+    RESULTS["realtime_as_of_probe"] = realtime_as_of_probe
+
     # ---- SECTION 2/9: CASE A for all 4 series at as_of_today, plus 2
-    # past as_of dates (section 3's "at least 2" past-AS_OF requirement) ----
+    # past as_of dates (section 3's "at least 2" past-AS_OF requirement).
+    # "today" uses effective_realtime_as_of_today (Round QA-7-CLOSE-3);
+    # past_1/past_2 are untouched -- they already succeed and are not
+    # part of the diagnosed date-boundary condition. Round QA-7-CLOSE-4:
+    # the actual per-series/per-label calls below are now made by
+    # _run_case_a_with_effective_as_of() (a directly-testable orchestration
+    # seam) instead of an inline loop -- same arguments, same order, same
+    # _log lines as before this round; no behavior change. ----
     _print_header("SECTION CASE-A -- realtime snapshot only (current + 2 past AS_OF)")
-    case_a_results = {}
-    for series_id in SERIES_TO_CHECK:
-        case_a_results[series_id] = {}
-        for label, as_of in [("today", as_of_today), ("past_1", as_of_past_1), ("past_2", as_of_past_2)]:
-            _log(f"-- {series_id} / {label} --")
-            case_a_results[series_id][label] = section_case_a(series_id, as_of)
+    case_a_results = _run_case_a_with_effective_as_of(
+        SERIES_TO_CHECK, effective_realtime_as_of_today, as_of_past_1, as_of_past_2
+    )
     RESULTS["case_a"] = case_a_results
 
     # ---- SECTION 4: CASE B vs CASE C, one comparison per series at
@@ -1835,26 +2103,39 @@ def main() -> int:
     # day-01/15/28 probe, isolated to a single safely-in-the-past month so
     # the data is fully released/stable (not an in-progress release
     # month). Run for both monthly series. ----
+    # "today"'s realtime as_of uses effective_realtime_as_of_today
+    # (Round QA-7-CLOSE-3) -- b2_test_month and the observation window
+    # it derives are untouched (a different, observation-window
+    # variable, never conflated with the realtime as_of value). Round
+    # QA-7-CLOSE-4: the actual call is now made by
+    # _run_section_b2_with_effective_as_of() -- same arguments, same
+    # order, same _log lines as before this round; no behavior change.
     _print_header("SECTION B-2 -- monthly observation_start day-01/15/28 probe (FRED server-side behavior)")
     b2_test_month = _shift_months(today, -6)
-    b2_results = {}
-    for series_id in MONTHLY_SERIES:
-        _log(f"-- {series_id} (test_month={b2_test_month.year:04d}-{b2_test_month.month:02d}) --")
-        b2_results[series_id] = section_b2_monthly_precision(series_id, as_of_today, b2_test_month)
+    b2_results = _run_section_b2_with_effective_as_of(
+        MONTHLY_SERIES, effective_realtime_as_of_today, b2_test_month
+    )
     RESULTS["b2_monthly_precision"] = b2_results
 
     # ---- SECTION I (Step 10J-QA-7 section 4): vintage_dates independent
     # cross-check for PAYEMS and CPIAUCSL, same as_of + observation
-    # window, compared pair-by-pair. ----
+    # window, compared pair-by-pair. Path A (realtime_start=realtime_end)
+    # and Path B (vintage_dates) inside section_i_vintage_dates_cross_check()
+    # both receive the SAME `as_of` argument, so passing
+    # effective_realtime_as_of_today here (Round QA-7-CLOSE-3) covers
+    # both paths without any further change to that function.
+    # i_window_start/i_window_end remain the observation window (as_of_today,
+    # unmodified) -- a different FRED parameter, never treated as the
+    # same variable as the realtime as_of value above. Round QA-7-CLOSE-4:
+    # the actual call is now made by _run_section_i_with_effective_as_of()
+    # -- same arguments, same order, same _log lines as before this
+    # round; no behavior change. ----
     _print_header("SECTION I -- vintage_dates independent cross-check (PAYEMS, CPIAUCSL)")
     i_window_start = _shift_months(today, -13).isoformat()
     i_window_end = as_of_today
-    i_results = {}
-    for series_id in ("PAYEMS", "CPIAUCSL"):
-        _log(f"-- {series_id} (as_of={as_of_today}, window=[{i_window_start}, {i_window_end}]) --")
-        i_results[series_id] = section_i_vintage_dates_cross_check(
-            series_id, as_of_today, i_window_start, i_window_end
-        )
+    i_results = _run_section_i_with_effective_as_of(
+        ("PAYEMS", "CPIAUCSL"), effective_realtime_as_of_today, i_window_start, i_window_end
+    )
     RESULTS["i_vintage_dates_cross_check"] = i_results
 
     # ---- SECTION M (Round QA-7-CLOSE-2): live production output_type=2

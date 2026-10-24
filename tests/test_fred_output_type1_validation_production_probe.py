@@ -22,13 +22,19 @@ src/macro/pit.py, src/macro/schema.py, or src/macro/engine.py (all
 remain frozen) -- it imports pit.py's public functions read-only, via
 the validation script's own existing import, exactly as
 test_fred_output_type1_validation_security.py already imports that
-script for its own tests. No network call is made anywhere in this file.
+script for its own tests. No REAL network call is made anywhere in this
+file -- the Round QA-7-CLOSE-3 tests added at the end of this file
+monkeypatch `urllib.request.urlopen` with synthetic, hand-constructed
+responses (the exact same technique test_fred_output_type1_validation_security.py
+already uses), never a live connection.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import urllib.error
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -1716,6 +1722,675 @@ def test_atomic_write_non_path_like_destination_does_not_propagate(monkeypatch, 
     # Nothing in tmp_path (the test's own isolated directory) should be
     # touched -- the function must fail before any filesystem step.
     assert list(tmp_path.iterdir()) == []
+
+
+# ============================================================
+# Round QA-7-CLOSE-3 additions below: tests for
+# _determine_effective_realtime_as_of() / _validate_realtime_boundary_date()
+# and for the consistent reuse of their result across CASE A ("today"),
+# SECTION B-2, and SECTION I within a single run of main(). Diagnosed
+# against a real GitHub Actions run on 2026-10-23 (see the long comment
+# above _determine_effective_realtime_as_of() in the script itself for
+# the full diagnosis) -- these tests are offline/synthetic: they
+# monkeypatch `urllib.request.urlopen` with hand-constructed responses,
+# the same technique test_fred_output_type1_validation_security.py
+# already uses, never a live connection. No production module
+# (src/macro/fred_provider.py, pit.py, schema.py, engine.py) is touched
+# or imported by any test below.
+# ============================================================
+
+
+class _ProbeFakeResponse:
+    def __init__(self, data: bytes, status: int = 200):
+        self._data = data
+        self.status = status
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _ProbeFakeHTTPError(urllib.error.HTTPError):
+    def __init__(self, code: int, body: bytes):
+        super().__init__("https://api.stlouisfed.org/fred/series/observations", code, "error", {}, None)
+        self._body = body
+
+    def read(self):
+        return self._body
+
+
+def _date_boundary_error(boundary_date: str) -> "_ProbeFakeHTTPError":
+    body = (
+        '{"error_code":400,"error_message":"Bad Request.  Variable '
+        "realtime_start can not be after today's date (" + boundary_date + ") "
+        "unless it's equal to the real-time max date 9999-12-31.\"}"
+    ).encode()
+    return _ProbeFakeHTTPError(400, body)
+
+
+def test_realtime_probe_keeps_requested_date_when_fred_accepts_it(monkeypatch):
+    # Requirement: "FRED가 실행일을 허용하면 기존 날짜가 유지된다."
+    module = _load_module(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: _ProbeFakeResponse(b'{"observations": []}'),
+    )
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+    assert result["requested_realtime_as_of"] == "2026-10-23"
+    assert result["adjusted"] is False
+    assert result["reason"]  # always recorded, even when unchanged
+
+
+def test_realtime_probe_adjusts_on_recognized_date_boundary_error(monkeypatch):
+    # Requirement: "정확한 날짜 경계 오류에서만 명시된 허용 날짜가 후보로
+    # 처리된다." -- this is the exact message/date pair observed in the
+    # real 2026-10-23 GitHub Actions run.
+    module = _load_module(monkeypatch)
+    err = _date_boundary_error("2026-10-22")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["adjusted"] is True
+    assert result["effective_realtime_as_of"] == "2026-10-22"
+    assert result["requested_realtime_as_of"] == "2026-10-23"
+    assert "2026-10-22" in result["reason"]
+
+
+def test_realtime_probe_fails_closed_when_boundary_message_has_no_date(monkeypatch):
+    # Requirement: "오류 메시지에 날짜가 없거나 형식이 잘못된 경우 안전하게
+    # 실패한다." -- an INVALID_PARAMETER message that does not match the
+    # recognized pattern at all must never be guessed at.
+    module = _load_module(monkeypatch)
+    err = _ProbeFakeHTTPError(
+        400, b'{"error_code":400,"error_message":"Bad Request.  Some other problem entirely."}'
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_fails_closed_on_malformed_boundary_date(monkeypatch):
+    # A boundary date in a non-canonical format (e.g. a basic-format
+    # "YYYYMMDD" string) must be rejected by the strict parser inside
+    # _validate_realtime_boundary_date(), not loosely accepted.
+    module = _load_module(monkeypatch)
+    err = _date_boundary_error("20261022")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_rejects_candidate_date_after_requested_date(monkeypatch):
+    # Requirement: "서버가 비정상적인 미래 날짜 또는 유효하지 않은 날짜를
+    # 반환하면 이를 그대로 수용하지 않는다." -- a server-reported boundary
+    # date LATER than the requested date is nonsensical for this error
+    # pattern and must never be accepted.
+    module = _load_module(monkeypatch)
+    err = _date_boundary_error("2026-10-24")  # after the requested 2026-10-23
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_rejects_candidate_date_too_far_in_past(monkeypatch):
+    # The diagnosed cause is a ONE-day UTC/Central-time skew; a boundary
+    # date more than 3 days before the requested date is outside what
+    # was actually diagnosed and must be rejected rather than silently
+    # trusted.
+    module = _load_module(monkeypatch)
+    err = _date_boundary_error("2026-10-01")  # 22 days before requested
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_does_not_misclassify_auth_failure_as_date_boundary(monkeypatch):
+    # Requirement: "인증 오류·기타 HTTP 오류를 날짜 경계 문제로 잘못
+    # 분류하지 않는다." -- an AUTH_FAILED-classified 400 (api_key in the
+    # body) must never be treated as a date-boundary condition, even if
+    # _request()'s classifier saw "api_key" before this function runs.
+    module = _load_module(monkeypatch)
+    err = _ProbeFakeHTTPError(400, b'{"error_message":"Bad Request. api_key is not registered."}')
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["probe_classification"] == "AUTH_FAILED"
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_does_not_misclassify_network_failure_as_date_boundary(monkeypatch):
+    module = _load_module(monkeypatch)
+    err = urllib.error.URLError("connection refused")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    assert result["probe_classification"] == "NETWORK_FAILURE"
+    assert result["adjusted"] is False
+    assert result["effective_realtime_as_of"] == "2026-10-23"
+
+
+def test_realtime_probe_result_never_exposes_the_api_key(monkeypatch):
+    # The synthetic FRED_API_KEY this test file's _load_module() sets
+    # must never appear anywhere in the probe's returned dict, even
+    # indirectly through an unredacted error body.
+    module = _load_module(monkeypatch)
+    secret = "OFFLINE_TEST_ONLY_NOT_A_REAL_KEY"
+    err = _ProbeFakeHTTPError(
+        400, f'{{"error_message":"Bad Request. api_key={secret} invalid"}}'.encode()
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    result = module._determine_effective_realtime_as_of("2026-10-23", "CPIAUCSL")
+
+    import json as _json
+    assert secret not in _json.dumps(result, default=str)
+
+
+def test_validate_realtime_boundary_date_rejects_non_canonical_format(monkeypatch):
+    module = _load_module(monkeypatch)
+    assert module._validate_realtime_boundary_date("2026-W43-4", "2026-10-23") is None
+    assert module._validate_realtime_boundary_date("not-a-date", "2026-10-23") is None
+    assert module._validate_realtime_boundary_date("2026-10-22", "2026-10-23") is not None
+
+
+def test_case_a_section_b2_section_i_honor_whatever_effective_date_they_receive(monkeypatch):
+    # Correction (Round QA-7-CLOSE-4, following an external-review
+    # finding on QA-7-CLOSE-3): this test does NOT call
+    # _determine_effective_realtime_as_of() -- `effective` below is a
+    # plain hardcoded literal, not a probe result. It verifies ONLY that
+    # section_case_a() / section_b2_monthly_precision() /
+    # section_i_vintage_dates_cross_check() each honor whatever realtime
+    # as_of value they are given as an argument (never silently
+    # substituting back the original/rejected date on their own), and
+    # that the three outgoing requests all carry that SAME value. It
+    # does NOT prove that `main()` actually calls the probe helper, or
+    # that it correctly threads the probe's output into these three
+    # call sites -- that separate claim is covered by
+    # test_main_orchestration_wires_probe_output_to_approved_sections_only()
+    # below, which exercises the real orchestration seam
+    # (_run_case_a_with_effective_as_of() /
+    # _run_section_b2_with_effective_as_of() /
+    # _run_section_i_with_effective_as_of()) that `main()` itself calls.
+    module = _load_module(monkeypatch)
+    requested = "2026-10-23"
+    effective = "2026-10-22"
+    seen_urls: list[str] = []
+
+    def _fake_urlopen(req, *a, **k):
+        seen_urls.append(req.full_url)
+        return _ProbeFakeResponse(b'{"observations": []}')
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    # section_case_a / section_b2_monthly_precision / section_i_vintage_dates_cross_check
+    # all take the realtime as_of value as an explicit argument -- exactly
+    # as main() would after computing `effective` once via the probe.
+    from datetime import date as _date
+
+    module.section_case_a("CPIAUCSL", effective)
+    module.section_b2_monthly_precision("CPIAUCSL", effective, _date(2026, 4, 1))
+    module.section_i_vintage_dates_cross_check("PAYEMS", effective, "2025-09-23", "2026-10-23")
+
+    assert seen_urls, "no requests were captured"
+    for url in seen_urls:
+        assert f"realtime_start={effective}" in url or f"vintage_dates={effective}" in url
+        # The rejected, originally-requested date must never appear as a
+        # realtime_start/realtime_end/vintage_dates value in any request.
+        assert f"realtime_start={requested}" not in url
+        assert f"realtime_end={requested}" not in url
+        assert f"vintage_dates={requested}" not in url
+
+
+def test_main_orchestration_wires_probe_output_to_approved_sections_only(monkeypatch):
+    # Round QA-7-CLOSE-4: closes the specific gap the external review
+    # identified on the prior test above -- this one calls the REAL
+    # probe function, _determine_effective_realtime_as_of() (no
+    # hardcoded "effective" literal standing in for its return value),
+    # and then feeds that ACTUAL return value into the exact three
+    # orchestration functions main() itself calls --
+    # _run_case_a_with_effective_as_of(), _run_section_b2_with_effective_as_of(),
+    # _run_section_i_with_effective_as_of() -- in the same order main()
+    # calls them. It does not call main() itself: main() also runs CASE
+    # B/C, PIT compatibility, MULTIPLE-AS-OF, and SECTION M, none of
+    # which this round touches or needs to re-verify, and reaching them
+    # would require monkeypatching far more of the script (disk I/O for
+    # the evidence artifact, FredMacroProvider's own code path) than
+    # this test's actual target -- exactly the "excessive monkeypatching
+    # of most of the script" the round's own instructions warn against.
+    # The three orchestration functions exercised here ARE the complete
+    # set main() calls for CASE A / SECTION B-2 / SECTION I; nothing
+    # broader is claimed.
+    #
+    # Correction (Round QA-7-CLOSE-5, following a further external-
+    # review finding): calling these three functions directly, with a
+    # manually-selected argument, verifies the FUNCTIONS' own behavior
+    # -- it does NOT verify that main() itself passes the probe's
+    # return value to them (as opposed to, say, accidentally passing
+    # as_of_today due to a future typo/regression inside main()'s own
+    # body). That stronger claim -- that main()'s ACTUAL runtime wiring
+    # does this correctly -- is covered separately by
+    # test_main_actually_wires_probe_output_to_approved_sections_and_leaves_others_unaffected()
+    # below, which calls main() itself. This test remains valid,
+    # narrower evidence: it is a regression guard on the three
+    # orchestration functions' own argument-handling, not on main()'s
+    # wiring to them.
+    module = _load_module(monkeypatch)
+
+    # Hard network guard: if anything in this test's path reaches past
+    # the monkeypatched urlopen below and attempts a real socket
+    # connection, fail loudly and immediately rather than silently
+    # making (or hanging on) a live network call.
+    def _guard_create_connection(*_a, **_k):
+        raise AssertionError(
+            "test_main_orchestration_wires_probe_output_to_approved_sections_only "
+            "attempted a real network connection -- urlopen was not fully intercepted"
+        )
+
+    monkeypatch.setattr("socket.create_connection", _guard_create_connection)
+
+    requested_as_of = "2026-10-23"
+    effective_as_of = "2026-10-22"
+    probe_series_id = module.SERIES_TO_CHECK[0]
+
+    seen_urls: list[str] = []
+
+    def _fake_urlopen(req, *_a, **_k):
+        url = req.full_url
+        seen_urls.append(url)
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        rt_end = qs.get("realtime_end", [None])[0]
+        has_observation_window = "observation_start" in qs
+        if (
+            rt_start == requested_as_of
+            and rt_end == requested_as_of
+            and not has_observation_window
+        ):
+            # This exact shape (bare realtime_start=realtime_end=
+            # requested_as_of, no observation window) matches ONLY the
+            # one-time probe request _determine_effective_realtime_as_of()
+            # makes. After the probe returns the adjusted date below,
+            # every subsequent call in this test carries the EFFECTIVE
+            # date instead, so this branch is never hit a second time.
+            body = (
+                '{"error_code":400,"error_message":"Bad Request.  Variable '
+                "realtime_start can not be after today's date (" + effective_as_of + ") "
+                "unless it's equal to the real-time max date 9999-12-31.\"}"
+            ).encode()
+            raise _ProbeFakeHTTPError(400, body)
+        return _ProbeFakeResponse(b'{"observations": []}')
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    # ---- Step 1-2: establish the requested/as-of date, then invoke the
+    # effective-date probe through the ACTUAL orchestration path (no
+    # literal substitution anywhere above this line). ----
+    probe_call_count_before = len(seen_urls)
+    realtime_as_of_probe = module._determine_effective_realtime_as_of(requested_as_of, probe_series_id)
+    assert len(seen_urls) == probe_call_count_before + 1, "probe must make exactly one request"
+    probe_url = seen_urls[-1]
+    probe_qs = parse_qs(urlparse(probe_url).query)
+    assert probe_qs.get("realtime_start", [None])[0] == requested_as_of
+    assert probe_qs.get("realtime_end", [None])[0] == requested_as_of
+    assert "observation_start" not in probe_qs
+
+    assert realtime_as_of_probe["adjusted"] is True
+    effective_realtime_as_of_today = realtime_as_of_probe["effective_realtime_as_of"]
+    assert effective_realtime_as_of_today == effective_as_of
+    assert effective_realtime_as_of_today != requested_as_of
+
+    as_of_past_1 = "2025-10-23"
+    as_of_past_2 = "2023-10-23"
+    import datetime as _dt
+    b2_test_month = _dt.date(2026, 4, 1)
+    i_window_start = "2025-09-23"
+    i_window_end = requested_as_of  # the UNTOUCHED observation window boundary
+
+    # ---- Step 3: feed the probe's ACTUAL return value into main()'s
+    # real orchestration functions -- the exact calls main() makes. ----
+    idx = len(seen_urls)
+    case_a_results = module._run_case_a_with_effective_as_of(
+        module.SERIES_TO_CHECK, effective_realtime_as_of_today, as_of_past_1, as_of_past_2
+    )
+    case_a_urls = seen_urls[idx:]
+
+    idx = len(seen_urls)
+    b2_results = module._run_section_b2_with_effective_as_of(
+        module.MONTHLY_SERIES, effective_realtime_as_of_today, b2_test_month
+    )
+    b2_urls = seen_urls[idx:]
+
+    idx = len(seen_urls)
+    i_results = module._run_section_i_with_effective_as_of(
+        ("PAYEMS", "CPIAUCSL"), effective_realtime_as_of_today, i_window_start, i_window_end
+    )
+    i_urls = seen_urls[idx:]
+
+    assert case_a_results and b2_results and i_results, "orchestration functions produced no results"
+
+    # ---- Step 4 (approved sites): CASE A's "today" entry, SECTION B-2,
+    # and SECTION I must all carry the probe's effective date -- never
+    # the original requested_as_of it replaced. ----
+    today_hits = 0
+    for url in case_a_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        rt_end = qs.get("realtime_end", [None])[0]
+        assert rt_start == rt_end, f"CASE A request had mismatched realtime_start/end: {url}"
+        assert rt_start in (effective_realtime_as_of_today, as_of_past_1, as_of_past_2), (
+            f"CASE A request used an unexpected realtime as_of value: {url}"
+        )
+        assert rt_start != requested_as_of, f"CASE A leaked the original requested date: {url}"
+        if rt_start == effective_realtime_as_of_today:
+            today_hits += 1
+    assert today_hits == len(module.SERIES_TO_CHECK), (
+        "expected exactly one CASE A 'today' request per series to use the effective date"
+    )
+
+    assert b2_urls, "SECTION B-2 made no requests"
+    for url in b2_urls:
+        qs = parse_qs(urlparse(url).query)
+        assert qs.get("realtime_start", [None])[0] == effective_realtime_as_of_today
+        assert qs.get("realtime_end", [None])[0] == effective_realtime_as_of_today
+        # Step 4 (unaffected path): the observation window comes from
+        # b2_test_month (2026-04), never from the effective or requested
+        # realtime as_of value -- must NOT be switched to either.
+        obs_start = qs.get("observation_start", [None])[0]
+        obs_end = qs.get("observation_end", [None])[0]
+        assert obs_start is not None and obs_start.startswith("2026-04")
+        assert obs_end is not None and obs_end.startswith("2026-04")
+        assert obs_start not in (effective_realtime_as_of_today, requested_as_of)
+        assert obs_end not in (effective_realtime_as_of_today, requested_as_of)
+
+    assert i_urls, "SECTION I made no requests"
+    for url in i_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        vintage = qs.get("vintage_dates", [None])[0]
+        # Path A (realtime_start/realtime_end) and Path B (vintage_dates)
+        # are mutually exclusive on a single request; whichever is
+        # present must carry the effective date.
+        assert (rt_start == effective_realtime_as_of_today) or (vintage == effective_realtime_as_of_today), (
+            f"SECTION I request used an unexpected realtime/vintage as_of value: {url}"
+        )
+        assert rt_start != requested_as_of and vintage != requested_as_of, (
+            f"SECTION I leaked the original requested date: {url}"
+        )
+        # Step 4 (unaffected path): the observation window is
+        # i_window_start/i_window_end, untouched by the probe -- here
+        # i_window_end intentionally equals requested_as_of (mirroring
+        # main()'s own as_of_today-derived window), which must NOT be
+        # confused with, or overwritten by, the effective realtime date.
+        assert qs.get("observation_start", [None])[0] == i_window_start
+        assert qs.get("observation_end", [None])[0] == i_window_end
+
+
+def test_main_actually_wires_probe_output_to_approved_sections_and_leaves_others_unaffected(
+    monkeypatch, tmp_path
+):
+    # Round QA-7-CLOSE-5. Closes the gap identified in the external
+    # review of QA-7-CLOSE-4: calling _run_case_a_with_effective_as_of()
+    # / _run_section_b2_with_effective_as_of() /
+    # _run_section_i_with_effective_as_of() directly (as the test above
+    # does) proves those FUNCTIONS honor whatever date they're given --
+    # it does not prove `main()` itself calls the probe and passes its
+    # result to them, rather than (for example) a future edit
+    # accidentally leaving `as_of_today` in place at one call site. This
+    # test calls `main()` ITSELF -- the actual runtime path -- and
+    # verifies its real wiring end to end, including that every
+    # UNAFFECTED date path (CASE B/C, MULTIPLE-AS-OF, SECTION M,
+    # SECTION B-2/I's observation windows) still uses the original date,
+    # never the effective one.
+    #
+    # Scope: this traverses main() completely -- every section it runs
+    # is exercised, not a subset. Two things inside main() are replaced
+    # with narrowly-scoped monkeypatches, both independent of the
+    # date-boundary logic this round owns, so the test stays robust and
+    # maintainable rather than reproducing unrelated response formats:
+    #   1. PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH is redirected to a
+    #      tmp_path file so this test never writes into the real
+    #      repository working tree.
+    #   2. section_m_production_output_type2_pit_selector_probe() is
+    #      replaced with a spy that records its arguments and returns a
+    #      fixed INCONCLUSIVE-shaped dict -- SECTION M goes through
+    #      src.macro.fred_provider.FredMacroProvider's own output_type=2
+    #      "crosstab" response parsing, a completely different response
+    #      shape than every other section's output_type=1 requests; this
+    #      round does not touch Section M's logic at all (confirmed
+    #      unaffected via the spy's captured arguments below, exactly as
+    #      a real call would show), so faithfully reproducing its crosstab
+    #      wire format here would add test complexity with no bearing on
+    #      what this round actually changed. Every other section (CASE
+    #      A/B/C, PIT compatibility, MULTIPLE-AS-OF, SECTION B-2,
+    #      SECTION I) runs its REAL code, through the REAL `_request()`,
+    #      against a monkeypatched `urllib.request.urlopen` -- the same
+    #      technique already used throughout this file.
+    #
+    # Distinct sentinel dates (both deliberately far from any real
+    # calendar date this project would use) stand in for the "requested"
+    # and server-reported "effective" dates, so an accidental
+    # substitution in either direction cannot pass unnoticed by
+    # coincidentally matching a real date elsewhere in the run.
+    module = _load_module(monkeypatch)
+
+    requested_as_of = "2099-06-15"  # sentinel "today" -- never a real calendar date
+    effective_as_of = "2099-06-14"  # sentinel server-reported boundary date (1 day earlier)
+
+    import datetime as _datetime_module
+
+    class _FixedDate(_datetime_module.date):
+        @classmethod
+        def today(cls):
+            return _datetime_module.date(2099, 6, 15)
+
+    monkeypatch.setattr(module, "date", _FixedDate)
+    monkeypatch.setattr(module, "PRODUCTION_PIT_EVIDENCE_ARTIFACT_PATH", str(tmp_path / "evidence.json"))
+
+    section_m_calls: list[tuple] = []
+
+    def _section_m_spy(series_id, start_date, end_date):
+        section_m_calls.append((series_id, start_date, end_date))
+        return {"status": "INCONCLUSIVE", "reason": "test stub (Round QA-7-CLOSE-5)", "stage": "test_stub"}
+
+    monkeypatch.setattr(module, "section_m_production_output_type2_pit_selector_probe", _section_m_spy)
+
+    # Hard network guard: a real socket connection anywhere in this run
+    # fails the test immediately and loudly instead of silently
+    # succeeding or hanging.
+    def _guard_create_connection(*_a, **_k):
+        raise AssertionError(
+            "test_main_actually_wires_probe_output_to_approved_sections_and_leaves_others_unaffected "
+            "attempted a real network connection -- urlopen was not fully intercepted"
+        )
+
+    monkeypatch.setattr("socket.create_connection", _guard_create_connection)
+
+    seen_urls: list[str] = []
+
+    def _fake_urlopen(req, *_a, **_k):
+        url = req.full_url
+        seen_urls.append(url)
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        rt_end = qs.get("realtime_end", [None])[0]
+        has_observation_window = "observation_start" in qs
+        if (
+            rt_start == requested_as_of
+            and rt_end == requested_as_of
+            and not has_observation_window
+        ):
+            # Matches ONLY the one-time probe request
+            # _determine_effective_realtime_as_of() makes inside
+            # main(). After it returns the adjusted date, every
+            # subsequent CASE-A-"today"/SECTION-B-2/SECTION-I request in
+            # this run carries the EFFECTIVE date instead -- this exact
+            # bare shape is never repeated.
+            body = (
+                '{"error_code":400,"error_message":"Bad Request.  Variable '
+                "realtime_start can not be after today's date (" + effective_as_of + ") "
+                "unless it's equal to the real-time max date 9999-12-31.\"}"
+            ).encode()
+            raise _ProbeFakeHTTPError(400, body)
+        return _ProbeFakeResponse(b'{"observations": []}')
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    # ---- Call main() itself -- the actual runtime orchestration path,
+    # not a manually-assembled stand-in for it. ----
+    exit_code = module.main()
+    assert exit_code == 0
+
+    # ---- Assertion 1: the probe actually ran exactly once and produced
+    # the effective sentinel date. ----
+    probe_result = module.RESULTS["realtime_as_of_probe"]
+    assert probe_result["adjusted"] is True
+    assert probe_result["requested_realtime_as_of"] == requested_as_of
+    assert probe_result["effective_realtime_as_of"] == effective_as_of
+
+    today = _datetime_module.date(2099, 6, 15)
+    as_of_past_1 = module._shift_months(today, -12).isoformat()
+    as_of_past_2 = module._shift_months(today, -36).isoformat()
+    b2_test_month = module._shift_months(today, -6)
+    i_window_start = module._shift_months(today, -13).isoformat()
+    i_window_end = requested_as_of  # as_of_today, unmodified
+
+    case_a_urls, b2_urls, i_urls, case_bc_urls, multiple_as_of_urls = [], [], [], [], []
+    for url in seen_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        obs_start = qs.get("observation_start", [None])[0]
+        obs_end = qs.get("observation_end", [None])[0]
+        vintage = qs.get("vintage_dates", [None])[0]
+        if rt_start == requested_as_of and obs_start is None and vintage is None:
+            continue  # the probe's own request, already checked above
+        if vintage is not None:
+            i_urls.append(url)  # vintage_dates only ever appears in SECTION I's Path B
+        elif obs_start is None:
+            case_a_urls.append(url)  # CASE A: "today" (effective) / past_1 / past_2
+        elif obs_start == obs_end:
+            # MULTIPLE-AS-OF: a single-day window on
+            # revision_probe_observation_date, at one of THREE distinct
+            # as_of values (only the last of which equals requested_as_of
+            # -- the other two are derived from revision_probe_month,
+            # unrelated to either sentinel) -- identified by its window
+            # shape, not by which as_of value happens to appear.
+            multiple_as_of_urls.append(url)
+        elif rt_start == effective_as_of:
+            # SECTION B-2 and SECTION I's Path A both carry a multi-day
+            # observation window AND the effective date; SECTION I's
+            # window ends at i_window_end (== requested_as_of) while
+            # SECTION B-2's window is entirely inside b2_test_month --
+            # split on that distinguishing fact.
+            if obs_end == i_window_end:
+                i_urls.append(url)
+            else:
+                b2_urls.append(url)
+        elif rt_start == requested_as_of:
+            # CASE B/C: a multi-day observation window AND the original
+            # (unaffected) requested date.
+            case_bc_urls.append(url)
+        else:
+            raise AssertionError(f"unrecognized request shape in this run: {url}")
+
+    # ---- Assertion 2: CASE A's approved "today" request uses the
+    # effective date; past_1/past_2 (unaffected) use their own values;
+    # the original requested date never appears in any CASE A request. ----
+    today_hits = 0
+    for url in case_a_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        assert rt_start == qs.get("realtime_end", [None])[0]
+        assert rt_start in (effective_as_of, as_of_past_1, as_of_past_2)
+        assert rt_start != requested_as_of
+        if rt_start == effective_as_of:
+            today_hits += 1
+    assert today_hits == len(module.SERIES_TO_CHECK)
+
+    # ---- Assertion 3: SECTION B-2 receives the effective date ONLY for
+    # realtime_start/realtime_end; its observation window stays on
+    # b2_test_month, never switched to the effective or requested date. ----
+    assert b2_urls
+    for url in b2_urls:
+        qs = parse_qs(urlparse(url).query)
+        assert qs.get("realtime_start", [None])[0] == effective_as_of
+        assert qs.get("realtime_end", [None])[0] == effective_as_of
+        obs_start = qs.get("observation_start", [None])[0]
+        obs_end = qs.get("observation_end", [None])[0]
+        assert obs_start.startswith(f"{b2_test_month.year:04d}-{b2_test_month.month:02d}")
+        assert obs_end.startswith(f"{b2_test_month.year:04d}-{b2_test_month.month:02d}")
+        assert obs_start not in (effective_as_of, requested_as_of)
+
+    # ---- Assertion 4: SECTION I receives the effective date for the
+    # approved real-time parameters in BOTH Path A (realtime_start/
+    # realtime_end) and Path B (vintage_dates); its observation window
+    # (i_window_start/i_window_end) stays unaffected. ----
+    assert i_urls and len(i_urls) >= 4  # 2 series x (Path A + Path B)
+    for url in i_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt_start = qs.get("realtime_start", [None])[0]
+        vintage = qs.get("vintage_dates", [None])[0]
+        assert (rt_start == effective_as_of) or (vintage == effective_as_of)
+        assert rt_start != requested_as_of and vintage != requested_as_of
+        assert qs.get("observation_start", [None])[0] == i_window_start
+        assert qs.get("observation_end", [None])[0] == i_window_end
+
+    # ---- Assertion 5: unaffected paths continue to use the ORIGINAL
+    # requested date, never the effective one -- CASE B/C, MULTIPLE-AS-OF
+    # (via real requests), and SECTION M (via the spy's captured args). ----
+    assert case_bc_urls
+    for url in case_bc_urls:
+        qs = parse_qs(urlparse(url).query)
+        assert qs.get("realtime_start", [None])[0] == requested_as_of
+        assert qs.get("realtime_end", [None])[0] == requested_as_of
+
+    assert multiple_as_of_urls
+    multiple_as_of_rt_values = set()
+    for url in multiple_as_of_urls:
+        qs = parse_qs(urlparse(url).query)
+        rt = qs.get("realtime_start", [None])[0]
+        multiple_as_of_rt_values.add(rt)
+        assert rt != effective_as_of, f"MULTIPLE-AS-OF request was wrongly switched to the effective date: {url}"
+    # revision_probe_as_of_dates's third entry is as_of_today itself,
+    # unmodified -- it must appear among the as_of values actually used.
+    assert requested_as_of in multiple_as_of_rt_values
+
+    assert section_m_calls, "SECTION M (spied) was never invoked by main()"
+    for series_id, start_date, end_date in section_m_calls:
+        assert end_date == requested_as_of, "SECTION M's window end must stay on the unmodified as_of_today"
+        assert end_date != effective_as_of
+
+    # ---- Assertion 6 (regression guard): if a future edit to main()
+    # ever stops using the probe's effective date at an approved call
+    # site (or starts using it at an unaffected one), one of the
+    # assertions above fails -- this is the explicit purpose of this
+    # test. ----
+    # ---- Assertion 7: no real network access occurred -- enforced
+    # throughout by the hard network guard on socket.create_connection,
+    # never triggered if this test reaches this point. ----
 
 
 if __name__ == "__main__":
