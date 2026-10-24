@@ -1,0 +1,81 @@
+name: FRED PIT PROD M2 -- Explicit-Vintage Live Probe (T10Y2Y/VIXCLS)
+
+# FRED-PIT-PROD-M2 -- isolated, additive LIVE validation of the
+# production output_type=2 EXPLICIT_VINTAGE_DATES_SERIES_IDS fetch
+# strategy (T10Y2Y, VIXCLS), via the real, unmodified
+# src.macro.fred_provider.FredMacroProvider.get_series().
+#
+# This workflow is a wholly SEPARATE file from
+# fred-output-type1-validation.yml -- that file is left with ZERO
+# bytes changed by this round. See:
+#   claude/2026-10-24-fred-pit-prod-m2-explicit-vintage-live-probe.md
+#     (BLOCKED finding: the existing Section M probe/workflow cannot
+#      reach T10Y2Y/VIXCLS as they stand)
+#   claude/2026-10-24-fred-pit-prod-m2-enablement-design.md
+#     (Option A vs. Option B design comparison; Option B recommended)
+#   claude/2026-10-24-fred-pit-prod-m2-implementation.md
+#     (this round: Option B implemented as a dedicated script +
+#      dedicated workflow, rather than a mode flag on the existing one,
+#      to guarantee the already-audited Section A-M file/workflow are
+#      unaffected)
+#
+# This workflow does NOT implement any new production fetch logic. It
+# does NOT modify src/macro/fred_provider.py, src/macro/pit.py,
+# src/macro/schema.py, src/macro/engine.py,
+# .github/scripts/fred_output_type1_validation.py, or
+# fred-output-type1-validation.yml. It writes no CSV, no macro-state,
+# no regime, no briefing output, and does not run on a schedule or on
+# push/pull_request -- workflow_dispatch only, with an explicit,
+# required series choice (never a silently-guessed default series).
+#
+# Running this workflow (a live GitHub Actions execution that makes a
+# real FRED API call) requires separate, explicit approval beyond this
+# implementation round -- see
+# claude/2026-10-24-fred-pit-prod-m2-implementation.md for the planned
+# execution mode/inputs for that future, separately-approved step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      series_id:
+        description: "Explicit-vintage-dates series to probe (production output_type=2 path)"
+        required: true
+        type: choice
+        options:
+          - T10Y2Y
+          - VIXCLS
+
+jobs:
+  fred-pit-prod-m2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run FRED-PIT-PROD-M2 explicit-vintage-dates live probe
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          FRED_PIT_M2_SERIES_ID: ${{ inputs.series_id }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 -u .github/scripts/fred_pit_prod_m2_explicit_vintage_probe.py
+
+      # Mirrors fred-output-type1-validation.yml's own Round
+      # QA-7-CLOSE-2 artifact-upload step: if-no-files-found: warn, not
+      # error, since the script writes this file only after its own
+      # run completes and fails closed to INCONCLUSIVE (never a crash
+      # that would skip the write), but a missing file here must still
+      # never fail the job on its own.
+      - name: Upload FRED-PIT-PROD-M2 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fred-pit-prod-m2-explicit-vintage-evidence
+          path: fred_pit_prod_m2_explicit_vintage_evidence.json
+          if-no-files-found: warn
