@@ -505,6 +505,75 @@ def test_negative_net_debt_is_not_treated_as_bad():
 
 
 # ============================================================
+# NEGATIVE-REVENUE MARGIN PROPAGATION (Round AN/AO)
+# ============================================================
+
+def test_invalid_margin_component_is_not_rated_ok():
+    # Round AN/AO: when a revenue-based margin comes back INVALID
+    # upstream (e.g. derived_metrics.calculate_margin() rejecting a
+    # negative revenue denominator), quality.py's existing (unmodified)
+    # _get_derived_value() only passes through status == "OK" values,
+    # so a non-OK upstream status reaches rate_operating_margin() as
+    # None and is reported as MISSING here -- the exact status label
+    # quality.py already uses for "no usable value", not "INVALID".
+    # The actual requirement under test is that the component is never
+    # upgraded to "OK" / a positive value / a 5-star rating.
+    derived = _build_derived()
+
+    derived["derived_metrics"]["operating_margin"] = {
+        "status": "INVALID",
+        "value": None,
+        "reason": "Revenue is negative; margin cannot be calculated.",
+    }
+
+    result = calculate_quality(
+        _build_normalized(),
+        derived,
+    )
+
+    operating_margin_component = result["components"]["operating_margin"]
+
+    assert operating_margin_component["status"] != "OK"
+    assert operating_margin_component["status"] == "MISSING"
+    assert operating_margin_component["value"] is None
+    assert operating_margin_component.get("stars") is None
+
+    # Enough other valid components remain for an overall score --
+    # one INVALID component does not force the whole Quality result
+    # to MISSING under the existing >=4-valid-components design.
+    assert result["quality"]["status"] in {"OK", "MISSING"}
+
+    if result["quality"]["status"] == "OK":
+        assert result["quality"]["stars"] in {1, 2, 3, 4, 5}
+
+
+def test_invalid_fcf_margin_component_is_not_rated_ok():
+    # Same propagation check for fcf_margin, which also flows through
+    # calculate_margin() and the same revenue-sign guard. See the note
+    # in test_invalid_margin_component_is_not_rated_ok() above on why
+    # the resulting component status is "MISSING", not "INVALID".
+    derived = _build_derived()
+
+    derived["derived_metrics"]["fcf_margin"] = {
+        "status": "INVALID",
+        "value": None,
+        "reason": "Revenue is negative; margin cannot be calculated.",
+    }
+
+    result = calculate_quality(
+        _build_normalized(),
+        derived,
+    )
+
+    fcf_margin_component = result["components"]["fcf_margin"]
+
+    assert fcf_margin_component["status"] != "OK"
+    assert fcf_margin_component["status"] == "MISSING"
+    assert fcf_margin_component["value"] is None
+    assert fcf_margin_component.get("stars") is None
+
+
+# ============================================================
 # FINANCIAL COMPANY HANDLING
 # ============================================================
 
