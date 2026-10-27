@@ -168,6 +168,37 @@ and only then calls normalize_company() on the gated snapshot --
 normalize_company()'s own already-approved selection logic then runs
 correctly and safely, unmodified, because every observation it can
 possibly see was already filtered to filed <= evaluation_date.
+
+STEP 14 update (2026-10-26) -- Company Type is now a validated,
+registry-backed lookup, not a bare caller-supplied value
+--------------------------------------------------------------------
+Per the user's explicit Production Implementation Authorization
+("STEP 14 -- Company Type Source of Truth & Fail-Closed Validation"),
+this function now runs a new COMPANY_TYPE_VALIDATION stage FIRST
+(before SEC_FETCH, so an unapproved/unresolved cik never triggers a
+live SEC request) that resolves this cik's approved Company Type as
+of evaluation_date via company_type_registry.get_company_type_as_of()
+against the new company_type_rows parameter (required, no default),
+and raises ValueError on any non-OK lookup_status or on a caller-
+value/registry-value mismatch. See company_type_registry.py's own
+module docstring for the full rationale, and the function docstring
+below for the exact contract.
+
+STEP 14 Finalization Review update (2026-10-26) -- normalized_data_
+validation is now wired, as an INFORMATIONAL stage
+--------------------------------------------------------------------
+sec_normalizer.validate_normalized_data() is now connected as a new
+stage immediately after NORMALIZATION. It is deliberately NOT a
+pipeline-blocking gate: it reports whatever failures list the
+function returns, but does not raise merely because that list is
+non-empty (the function's own existing hard-raise behavior for
+genuine structural defects -- a missing top-level key, or an
+unrecognized company_type -- is unaffected and still propagates).
+See that stage's own inline comment for the full contract analysis;
+in short, a non-empty failures list from this function represents a
+legitimate, already-meaningful "concept not found/not OK" data state
+(the same state GROWTH/DATA_SUFFICIENCY below classify on purpose),
+not a structural error, so this orchestrator does not block on it.
 """
 
 from __future__ import annotations
@@ -175,6 +206,10 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from src.fundamentals.company_type_registry import (
+    LOOKUP_OK as COMPANY_TYPE_LOOKUP_OK,
+    get_company_type_as_of,
+)
 from src.fundamentals.data_sufficiency import classify_growth_data_sufficiency
 from src.fundamentals.derived_metrics import calculate_derived_metrics
 from src.fundamentals.growth import calculate_growth
@@ -184,7 +219,11 @@ from src.fundamentals.point_in_time import (
     gate_companyfacts_as_of,
     get_point_in_time_history,
 )
-from src.fundamentals.sec_normalizer import normalize_company, validate_companyfacts
+from src.fundamentals.sec_normalizer import (
+    normalize_company,
+    validate_companyfacts,
+    validate_normalized_data,
+)
 from src.fundamentals.universe_membership import get_universe_membership_as_of
 from src.sec.fetcher import fetch_companyfacts, get_user_agent
 from src.sec.identity import normalize_issuer_identity
@@ -451,6 +490,7 @@ def run_fundamentals_pipeline(
     cik: str,
     evaluation_date: Any,
     company_type: str,
+    company_type_rows: list[dict],
     raw_companyfacts: dict | None = None,
     raw_submissions: dict | None = None,
     peer_rows: list[dict] | None = None,
@@ -477,7 +517,29 @@ def run_fundamentals_pipeline(
         an unparseable value, matching every other point-in-time entry
         point in this codebase (fail closed, never silently unbounded).
     company_type : "NON_FINANCIAL" or "FINANCIAL", passed straight
-        through to sec_normalizer.normalize_company().
+        through to sec_normalizer.normalize_company(). As of the STEP 14
+        Company Type Source of Truth round (2026-10-26), this
+        caller-supplied value is no longer trusted on its own -- it is
+        checked against the approved company_type_rows registry for
+        this cik as of evaluation_date (see the new COMPANY_TYPE_
+        VALIDATION stage below) and must agree with the registry's
+        value, or this function raises ValueError. The parameter itself
+        is kept (not replaced by a company_type_rows-only lookup) so
+        every existing caller's explicit company_type stays a visible,
+        checked assertion rather than a silent implicit default.
+    company_type_rows : already-loaded data/reference/company_type.csv
+        rows (see company_type_registry_io.read_company_type_csv),
+        REQUIRED (no default) as of the STEP 14 round. Used by the new
+        COMPANY_TYPE_VALIDATION stage to resolve this cik's approved
+        Company Type as of evaluation_date via
+        company_type_registry.get_company_type_as_of(); any non-OK
+        lookup_status (unregistered cik, not-yet-available, structurally
+        invalid, or overlapping reference data) fails closed with
+        ValueError -- never a guessed/defaulted Company Type. This is
+        intentionally required rather than optional-with-SKIPPED (unlike
+        peer_rows/membership_rows below), because validating
+        company_type is no longer optional per STEP 14's authorization:
+        every caller must now go through the approved registry.
     raw_companyfacts : an already-fetched SEC Company Facts dict for
         this CIK. If omitted, this function fetches it live via
         src.sec.fetcher.fetch_companyfacts() -- this is a genuine SEC
@@ -518,11 +580,13 @@ def run_fundamentals_pipeline(
             "company_type": company_type,
             "evaluation_date": "<ISO date>",
             "stages": {
+                "company_type_validation": {"status": ..., "lookup": {...}},
                 "sec_fetch": {"status": ..., ...},
                 "raw_validation": {"status": ...},
                 "identity": {"status": ...},
                 "pit_gating": {"status": ...},
                 "normalization": {"status": ..., "normalized": {...} },
+                "normalized_data_validation": {"status": ..., "failures": [...]},
                 "annual_history": {"status": ..., "history": {metric: [...]}},
                 "derived_metrics": {"status": ..., "derived": {...}},
                 "growth": {"status": ..., "growth": {...}},
@@ -544,6 +608,51 @@ def run_fundamentals_pipeline(
     """
     eval_date = coerce_evaluation_date(evaluation_date)
     stages: dict[str, Any] = {}
+
+    # --------------------------------------------------------
+    # STAGE: COMPANY_TYPE_VALIDATION (STEP 14, 2026-10-26)
+    #
+    # Runs FIRST, before any SEC request, per STEP 14 Section 4's
+    # instruction that Company Type validation should happen before
+    # pipeline side effects where possible. company_type is no longer
+    # trusted as a bare caller-supplied value -- it must agree with the
+    # approved data/reference/company_type.csv registry's value for
+    # this cik as of evaluation_date (company_type_registry.
+    # get_company_type_as_of()). Any non-OK lookup_status (unregistered
+    # cik -- e.g. BLK/UNH/JPM remain unregistered by design -- not-yet-
+    # available, structurally invalid, or overlapping reference data)
+    # fails closed with ValueError, matching this function's existing
+    # fail-loud convention for shape/input defects (see RAW_VALIDATION
+    # above). A caller-value/registry-value mismatch also raises
+    # ValueError -- the caller-supplied company_type may only be used to
+    # VERIFY agreement with the approved source, never to override it.
+    # --------------------------------------------------------
+
+    company_type_lookup = get_company_type_as_of(cik, eval_date, company_type_rows)
+
+    if company_type_lookup["lookup_status"] != COMPANY_TYPE_LOOKUP_OK:
+        raise ValueError(
+            f"Company Type validation failed for cik={cik!r} as of "
+            f"{eval_date.isoformat()}: lookup_status="
+            f"{company_type_lookup['lookup_status']!r}. "
+            f"{company_type_lookup['reason']}"
+        )
+
+    approved_company_type = company_type_lookup["mapping"]["company_type"]
+    if company_type != approved_company_type:
+        raise ValueError(
+            f"company_type mismatch for cik={cik!r}: caller supplied "
+            f"{company_type!r}, but the approved Company Type registry "
+            f"(data/reference/company_type.csv) says {approved_company_type!r} "
+            f"as of {eval_date.isoformat()}. The caller-supplied value may "
+            f"only be used to verify agreement with the approved source, "
+            f"never to override it."
+        )
+
+    stages["company_type_validation"] = {
+        "status": STAGE_OK,
+        "lookup": company_type_lookup,
+    }
 
     # --------------------------------------------------------
     # STAGE: SEC_FETCH
@@ -614,6 +723,56 @@ def run_fundamentals_pipeline(
     stages["normalization"] = {
         "status": STAGE_OK,
         "normalized": normalized,
+    }
+
+    # --------------------------------------------------------
+    # STAGE: NORMALIZED_DATA_VALIDATION (STEP 14 Finalization Review,
+    # 2026-10-26)
+    #
+    # Connects sec_normalizer.validate_normalized_data() WITHOUT
+    # redefining its rules and WITHOUT adding a new raise this stage
+    # didn't already have a basis for. validate_normalized_data() itself
+    # already draws its own two-tier distinction: it RAISES ValueError
+    # directly (unchanged, still happens here, propagates exactly as
+    # before) for a structural/schema defect (a missing top-level key, or
+    # an unrecognized company_type) -- that is unaffected by this stage
+    # and was already true before this round. Separately, it RETURNS a
+    # list of per-metric completeness gaps (e.g. "net_income", "cfo") for
+    # metrics that are structurally fine but weren't found/weren't OK --
+    # this is NOT the same as a structural defect: normalize_company()'s
+    # own convention (see sec_normalizer.py, build_missing_metric /
+    # build_not_applicable_metric) already treats an unfound concept as a
+    # legitimate, informative MISSING status, not an error -- and this
+    # orchestrator's own GROWTH/DATA_SUFFICIENCY stages (below) exist
+    # specifically to classify exactly this situation (CONCEPT_NOT_FOUND
+    # vs INSUFFICIENT_HISTORY) as meaningful output, not something to
+    # hide behind a raised exception.
+    #
+    # So this stage reports validate_normalized_data()'s returned
+    # failures list transparently -- exactly like the metric_
+    # applicability / relative_evaluation / factor "NOT_WIRED" stages
+    # below report their own status without blocking the pipeline -- and
+    # deliberately does NOT raise merely because that list is non-empty.
+    # Doing so would silently reclassify an existing, already-meaningful
+    # "legitimate data gap" outcome as a hard pipeline failure, which
+    # would also make it structurally impossible to ever reach the
+    # GROWTH/DATA_SUFFICIENCY Case A-E tests (added 2026-09-29) for any
+    # fixture that doesn't happen to populate all 9 of
+    # validate_normalized_data()'s required concepts -- including the
+    # existing ORCL_FIXTURE those tests are built on, which deliberately
+    # only ever defines 2 of the 9 (Revenue, LongTermNotesPayable) to
+    # prove CONCEPT_NOT_FOUND handling works at the real orchestrator
+    # level. Raising here would not "connect" that test design, it would
+    # erase its ability to run at all -- a material, un-approved change
+    # to already-documented test behavior, not a narrow integration.
+    # See the STEP 14 Finalization Review report, section D, for the
+    # full contract analysis this decision is based on.
+    # --------------------------------------------------------
+
+    normalized_data_failures = validate_normalized_data(normalized)
+    stages["normalized_data_validation"] = {
+        "status": STAGE_OK,
+        "failures": normalized_data_failures,
     }
 
     # --------------------------------------------------------
