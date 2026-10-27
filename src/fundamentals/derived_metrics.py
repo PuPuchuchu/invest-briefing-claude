@@ -791,6 +791,25 @@ def calculate_ttm_from_ytd(
 # COMBINED DERIVED METRICS
 # ============================================================
 
+def _capex_scope_metadata(capex) -> dict:
+    """Scope/source metadata to carry from a broader-scope CapEx input onto
+    FCF-based derived metrics (STEP 15). Empty when CapEx has no
+    concept_scope label, so PP&E-based results are unchanged."""
+    if not isinstance(capex, dict) or not capex.get("concept_scope"):
+        return {}
+    return {
+        "input_scope": {
+            "capex": {
+                "concept": capex.get("concept"),
+                "concept_scope": capex.get("concept_scope"),
+                "accession": capex.get("accession"),
+                "period_end": capex.get("period_end"),
+            }
+        },
+        "peer_comparison_eligibility": "RESTRICTED_INPUT_SCOPE",
+    }
+
+
 def calculate_derived_metrics(
     normalized: dict,
     *,
@@ -881,6 +900,14 @@ def calculate_derived_metrics(
         capex_unit=capex_unit,
     )
 
+    # STEP 15 (2026-10-27): metadata only. When CapEx was taken from a
+    # broader-scope concept (e.g. PaymentsToAcquireProductiveAssets), carry
+    # its scope and source onto FCF so a consumer cannot treat it as
+    # PP&E-based FCF. The FCF formula, value and status are unchanged.
+    capex_scope_meta = _capex_scope_metadata(capex)
+    if capex_scope_meta:
+        result["derived_metrics"]["fcf"].update(capex_scope_meta)
+
     # --------------------------------------------------------
     # Current-period margins
     # --------------------------------------------------------
@@ -948,6 +975,8 @@ def calculate_derived_metrics(
         numerator_unit=fcf_unit,
         revenue_unit=revenue_unit,
     )
+    if capex_scope_meta:
+        result["derived_metrics"]["fcf_margin"].update(capex_scope_meta)
 
     # --------------------------------------------------------
     # Debt / Cash

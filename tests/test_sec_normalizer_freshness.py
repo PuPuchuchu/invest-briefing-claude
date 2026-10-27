@@ -108,6 +108,7 @@ def test_clean_issuer_all_current_and_values_unchanged():
     assert n["freshness_anchors"] == {
         "annual": "2025-12-31",
         "instant": "2026-06-30",
+        "instant_source": "US_GAAP_ASSETS",
         "tolerance_days": FRESHNESS_TOLERANCE_DAYS,
     }
 
@@ -215,7 +216,14 @@ def test_current_debtcurrent_tag_replaces_stale_current_portion():
     m = _norm(g)["metrics"]
     assert m["current_debt"]["concept"] == "DebtCurrent"
     assert m["current_debt"]["value"] == 2.0e9
-    assert m["total_debt"]["value"] == 42e9
+    # DebtCurrent includes lease obligations; LongTermDebtNoncurrent
+    # excludes them, and no same-date evidence shows the current amount
+    # is lease-free -> the sum is not reported as complete total debt.
+    assert m["current_debt"]["lease_scope"] == "CAPITAL_FINANCE_LEASE_INCLUDED"
+    assert m["total_debt"]["status"] == "INCOMPLETE"
+    assert m["total_debt"]["reason_code"] == "LEASE_SCOPE_MISMATCH"
+    assert m["total_debt"]["value"] is None
+    assert m["total_debt"]["unqualified_sum"] == 42e9
 
 
 def test_debt_and_lease_obligations_used_only_when_current():
@@ -240,12 +248,82 @@ def test_tolerance_boundary():
     assert _norm(g)["metrics"]["cash"]["freshness"] == "STALE"
 
 
-def test_missing_assets_anchor_leaves_instant_values_unverified_not_stale():
+def test_missing_assets_uses_selected_balance_sheet_dates_as_anchor():
     g = _current_base()
     del g["Assets"]
+    n = _norm(g)
+    assert n["freshness_anchors"]["instant"] == "2026-06-30"
+    assert n["freshness_anchors"]["instant_source"] == "SELECTED_BALANCE_SHEET_METRICS"
+    assert n["metrics"]["cash"]["freshness"] == "CURRENT"
+
+
+def test_missing_assets_fallback_still_catches_stale_outlier():
+    g = _current_base()
+    del g["Assets"]
+    g["LongTermDebtNoncurrent"] = _concept([_instant(3e9, "2013-05-30", form="10-K")])
+    m = _norm(g)["metrics"]
+    assert m["noncurrent_debt"]["freshness"] == "STALE"
+    assert m["total_debt"]["status"] == "INCOMPLETE"
+
+
+def _no_balance_sheet_anchor():
+    g = _current_base()
+    for name in ("Assets", "CashAndCashEquivalentsAtCarryingValue",
+                 "LongTermDebtCurrent", "LongTermDebtNoncurrent",
+                 "StockholdersEquity"):
+        del g[name]
+    return g
+
+
+def test_no_anchor_at_all_fails_closed_as_unverified():
+    m = _norm(_no_balance_sheet_anchor())["metrics"]
+    shares = m["shares_outstanding"]
+    assert shares["status"] == "INCOMPLETE"
+    assert shares["freshness"] == "UNVERIFIED_NO_ANCHOR"
+    assert shares["value"] is None
+    assert shares["unverified_observation"]["value"] == 4e9
+    assert m["revenue"]["status"] == "OK"
+    assert m["revenue"]["freshness"] == "CURRENT"
+
+
+def test_unverified_or_stale_inputs_do_not_make_derived_metrics_ok_or_zero():
+    g = _current_base()
+    g["LongTermDebtNoncurrent"] = _concept([_instant(3e9, "2013-05-30", form="10-K")])
+    g["CashAndCashEquivalentsAtCarryingValue"] = _concept([_instant(1e9, "2014-06-30")])
+    n = _norm(g)
+    assert n["metrics"]["total_debt"]["value"] is None
+    derived = calculate_derived_metrics(n)["derived_metrics"]
+    for name in ("net_debt", "debt_to_cash"):
+        assert derived[name]["status"] != "OK", name
+        assert derived[name]["value"] is None, name
+    # Annual-only derived metrics are still computed from current inputs.
+    assert derived["fcf"]["status"] == "OK"
+    assert derived["fcf"]["value"] == 15e9
+
+
+def test_missing_period_end_fails_closed():
+    g = _current_base()
+    obs = _instant(30e9, "2026-06-30")
+    obs["end"] = "not-a-date"
+    g["CashAndCashEquivalentsAtCarryingValue"] = _concept([obs])
     m = _norm(g)["metrics"]["cash"]
-    assert m["status"] == "OK"
-    assert m["freshness"] == "UNVERIFIED_NO_ANCHOR"
+    assert m["status"] != "OK"
+    assert m["value"] is None
+
+
+def test_only_ok_results_are_current():
+    """Every OK metric in normalize_company() output carries
+    freshness=CURRENT; nothing OK is left without a freshness verdict."""
+    g = _current_base()
+    g["OperatingIncomeLoss"] = _concept([_annual(22e9, "2012-12-31")])
+    m = _norm(g)["metrics"]
+    m.update({k: v for k, v in _norm(_no_balance_sheet_anchor())["metrics"].items()
+              if k == "shares_outstanding"})
+    for name, metric in m.items():
+        if name == "total_debt":
+            continue
+        if metric.get("status") == "OK":
+            assert metric.get("freshness") == "CURRENT", name
 
 
 def test_missing_value_stays_missing_not_stale():

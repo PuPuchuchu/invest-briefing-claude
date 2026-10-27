@@ -1037,6 +1037,16 @@ def get_metric_semantics(
             ),
         }
 
+    if metric_name == "current_debt" and concept == "NotesPayableCurrent":
+        return {
+            "concept_scope": "CURRENT_PORTION_OF_LONG_TERM_NOTES",
+            "scope_coverage": "PARTIAL",
+            "semantic_note": (
+                "Current portion of long-term notes payable only; not a "
+                "complete measure of current debt."
+            ),
+        }
+
     if metric_name != "stockholders_equity":
         return {}
 
@@ -1338,9 +1348,55 @@ def calculate_total_debt(
                 "units without an approved FX conversion policy."
             )
         else:
-            result["value"] = current_value + noncurrent_value
-            result["status"] = "OK"
-            result["unit"] = current_unit
+            # STEP 15: scope checks. Only applied when the components
+            # carry scope labels (normalize_company() adds them), so
+            # callers passing unlabelled components are unaffected.
+            current_lease = current_debt.get("lease_scope")
+            noncurrent_lease = noncurrent_debt.get("lease_scope")
+            partial = [
+                name
+                for name, component in (
+                    ("current_debt", current_debt),
+                    ("noncurrent_debt", noncurrent_debt),
+                )
+                if component.get("scope_coverage") == "PARTIAL"
+            ]
+            if current_lease and noncurrent_lease and current_lease != noncurrent_lease:
+                result["reason_code"] = "LEASE_SCOPE_MISMATCH"
+                result["reason"] = (
+                    f"current_debt ({current_debt.get('concept')}) is "
+                    f"{current_lease} but noncurrent_debt "
+                    f"({noncurrent_debt.get('concept')}) is "
+                    f"{noncurrent_lease}; refusing to report their sum as a "
+                    "complete total debt."
+                )
+                result["unqualified_sum"] = current_value + noncurrent_value
+            elif current_debt.get("uncovered_components"):
+                result["reason_code"] = "CURRENT_COMPONENT_NOT_COVERED"
+                result["reason"] = (
+                    f"current_debt ({current_debt.get('concept')}) does not "
+                    "cover same-date facts "
+                    + ", ".join(
+                        c.get("concept", "?")
+                        for c in current_debt.get("uncovered_components")
+                    )
+                    + "; total debt completeness is not verified."
+                )
+                result["unqualified_sum"] = current_value + noncurrent_value
+            elif partial:
+                result["reason_code"] = "PARTIAL_COMPONENT_SCOPE"
+                result["reason"] = (
+                    "Component(s) " + ", ".join(partial) + " cover only part "
+                    "of the debt they stand in for; refusing to report the "
+                    "sum as a complete total debt."
+                )
+                result["unqualified_sum"] = current_value + noncurrent_value
+            else:
+                result["value"] = current_value + noncurrent_value
+                result["status"] = "OK"
+                result["unit"] = current_unit
+                if current_lease and current_lease == noncurrent_lease:
+                    result["lease_scope"] = current_lease
 
     return result
 
@@ -1413,6 +1469,39 @@ def instant_freshness_anchor(data: dict):
     return best
 
 
+_DIAGNOSTIC_KEYS = (
+    "namespace",
+    "concept",
+    "value",
+    "unit",
+    "period_start",
+    "period_end",
+    "filing_date",
+    "form",
+    "accession",
+)
+
+
+def _unverified_freshness(result: dict, freshness: str, why: str, anchor) -> dict:
+    metric_name = result.get("metric")
+    out = build_incomplete_metric(
+        metric_name,
+        (
+            f"Freshness of the selected {metric_name} observation "
+            f"({result.get('concept')}) cannot be verified: {why}. "
+            "Refusing to return an unverified value as current."
+        ),
+    )
+    out["freshness"] = freshness
+    out["reason_code"] = "FRESHNESS_UNVERIFIABLE"
+    if anchor is not None:
+        out["freshness_anchor"] = anchor.isoformat()
+    out["unverified_observation"] = {
+        key: result.get(key) for key in _DIAGNOSTIC_KEYS if key in result
+    }
+    return out
+
+
 def apply_freshness_check(result: dict, anchor, kind: str) -> dict:
     """Return `result` annotated with freshness, or an INCOMPLETE/STALE
     replacement when its period_end predates `anchor` by more than
@@ -1420,17 +1509,26 @@ def apply_freshness_check(result: dict, anchor, kind: str) -> dict:
     if not isinstance(result, dict) or result.get("status") != "OK":
         return result
 
+    # Freshness that cannot be verified fails closed: the value is not
+    # returned as OK, so consumers that only check status/value (e.g.
+    # derived_metrics) never treat it as usable.
     if anchor is None:
-        annotated = dict(result)
-        annotated["freshness"] = "UNVERIFIED_NO_ANCHOR"
-        return annotated
+        return _unverified_freshness(
+            result,
+            "UNVERIFIED_NO_ANCHOR",
+            "the issuer's reference date could not be determined "
+            "(no 10-K FY observation / no us-gaap:Assets instant)",
+            None,
+        )
 
     period_end = _parse_iso_date(result.get("period_end"))
     if period_end is None:
-        annotated = dict(result)
-        annotated["freshness"] = "UNVERIFIED_NO_PERIOD_END"
-        annotated["freshness_anchor"] = anchor.isoformat()
-        return annotated
+        return _unverified_freshness(
+            result,
+            "UNVERIFIED_NO_PERIOD_END",
+            "the selected observation has no parseable period end",
+            anchor,
+        )
 
     lag_days = (anchor - period_end).days
     if lag_days <= FRESHNESS_TOLERANCE_DAYS:
@@ -1457,23 +1555,353 @@ def apply_freshness_check(result: dict, anchor, kind: str) -> dict:
         ),
     )
     stale["freshness"] = "STALE"
+    stale["reason_code"] = "STALE_PERIOD"
     stale["freshness_anchor"] = anchor.isoformat()
     stale["stale_observation"] = {
-        key: result.get(key)
-        for key in (
-            "namespace",
-            "concept",
-            "value",
-            "unit",
-            "period_start",
-            "period_end",
-            "filing_date",
-            "form",
-            "accession",
-        )
-        if key in result
+        key: result.get(key) for key in _DIAGNOSTIC_KEYS if key in result
     }
     return stale
+
+
+# ============================================================
+# ANNUAL DURATION CHECK (STEP 15, 2026-10-27)
+#
+# is_annual_observation() accepts any 10-K / fp=FY duration fact, so a
+# 3-month Q4 value tagged in a 10-K is also "annual", and the shared
+# selection prefers it over the full-year value that ends on the same
+# date. For normalize_company()'s annual metrics only, 10-K/FY duration
+# facts are therefore filtered by length before selection.
+#
+# Day-count rule: duration_days = (end - start) in calendar days, using
+# the SEC fact's inclusive start and end dates as given. A calendar
+# year (Jan 1 - Dec 31) is 364 (365 in a leap year); a 52-week fiscal
+# year is 363 and a 53-week year 370. Accepted range: 350..380
+# inclusive. Shared selection helpers are not changed.
+# ============================================================
+
+ANNUAL_MIN_DAYS = 350
+ANNUAL_MAX_DAYS = 380
+
+
+def annual_duration_days(obs: dict):
+    """(end - start) in days, or None when either date is unparseable."""
+    start = _parse_iso_date(obs.get("start"))
+    end = _parse_iso_date(obs.get("end"))
+    if start is None or end is None:
+        return None
+    return (end - start).days
+
+
+def _is_full_year(obs: dict) -> bool:
+    days = annual_duration_days(obs)
+    return days is not None and ANNUAL_MIN_DAYS <= days <= ANNUAL_MAX_DAYS
+
+
+def annual_duration_view(data: dict) -> dict:
+    """Copy of `data` in which 10-K / fp=FY duration facts whose length
+    is outside ANNUAL_MIN_DAYS..ANNUAL_MAX_DAYS (or unparseable) are
+    removed. All other facts (instants, 10-Q facts) are kept as-is."""
+    facts = data.get("facts") or {}
+    view_facts = {}
+    for namespace, concepts in facts.items():
+        if not isinstance(concepts, dict):
+            view_facts[namespace] = concepts
+            continue
+        view_concepts = {}
+        for concept_name, concept_data in concepts.items():
+            units = concept_data.get("units") if isinstance(concept_data, dict) else None
+            if not isinstance(units, dict):
+                view_concepts[concept_name] = concept_data
+                continue
+            view_units = {
+                unit: [
+                    obs
+                    for obs in (observations or [])
+                    if not (isinstance(obs, dict) and is_annual_observation(obs))
+                    or _is_full_year(obs)
+                ]
+                for unit, observations in units.items()
+            }
+            view_concept = dict(concept_data)
+            view_concept["units"] = view_units
+            view_concepts[concept_name] = view_concept
+        view_facts[namespace] = view_concepts
+    view = dict(data)
+    view["facts"] = view_facts
+    return view
+
+
+def extract_full_year_metric(
+    data: dict,
+    annual_view: dict,
+    metric_name: str,
+    concept_candidates: list,
+):
+    """extract_metric() on the full-year view. If nothing qualifies but
+    the unfiltered data would have produced a value, return INCOMPLETE
+    with the out-of-range observation kept for diagnostics, so a
+    non-annual value is never reported as annual and the absence is not
+    mistaken for MISSING."""
+    result = extract_metric(annual_view, metric_name, concept_candidates)
+    if result.get("status") != "MISSING":
+        return result
+
+    unfiltered = extract_metric(data, metric_name, concept_candidates)
+    if unfiltered.get("status") != "OK":
+        return result
+
+    probe = {"start": unfiltered.get("period_start"), "end": unfiltered.get("period_end")}
+    days = annual_duration_days(probe)
+    if days is None:
+        code = "ANNUAL_DURATION_UNVERIFIABLE"
+        why = "its start/end dates cannot be parsed"
+    else:
+        code = "ANNUAL_DURATION_OUT_OF_RANGE"
+        why = (
+            f"it spans {days} days, outside the accepted "
+            f"{ANNUAL_MIN_DAYS}-{ANNUAL_MAX_DAYS} day annual range"
+        )
+    out = build_incomplete_metric(
+        metric_name,
+        (
+            f"The only 10-K/FY {metric_name} observation found "
+            f"({unfiltered.get('concept')}, {unfiltered.get('period_start')} "
+            f"to {unfiltered.get('period_end')}) is not a full-year value: "
+            f"{why}."
+        ),
+    )
+    out["reason_code"] = code
+    out["duration_days"] = days
+    out["rejected_observation"] = {
+        key: unfiltered.get(key) for key in _DIAGNOSTIC_KEYS if key in unfiltered
+    }
+    return out
+
+
+# ============================================================
+# DEBT SCOPE (STEP 15, 2026-10-27)
+#
+# Capital/finance lease scope per concept, from the US-GAAP element
+# definitions carried in companyfacts (operating lease liabilities are a
+# different concept and are never part of these debt components):
+#   DebtCurrent: "short-term debt and current maturity of long-term debt
+#     and capital lease obligations" -> CAPITAL_FINANCE_LEASE_INCLUDED
+#   LongTermDebtCurrent / LongTermDebtNoncurrent: "Excludes capital lease
+#     obligations" -> CAPITAL_FINANCE_LEASE_EXCLUDED
+#   LongTermDebtAndCapitalLeaseObligations: "long-term debt and lease
+#     obligation, classified as noncurrent" -> CAPITAL_FINANCE_LEASE_INCLUDED
+#   ShortTermBorrowings / ShortTermDebt / notes payable: borrowing concepts
+#     whose definitions do not include lease obligations
+#     -> CAPITAL_FINANCE_LEASE_EXCLUDED (basis: BORROWING_CONCEPT)
+#
+# Rules (no tolerance, no inference from equal values):
+#   1. If the default selection pairs components of different lease scope,
+#      look for a pair of the SAME scope reported at the same date and unit
+#      (CAPITAL_FINANCE_LEASE_INCLUDED first, then EXCLUDED). If found, use
+#      it and record the replacement; otherwise calculate_total_debt()
+#      reports LEASE_SCOPE_MISMATCH.
+#   2. A component that covers only part of the debt it stands in for
+#      (NotesPayableCurrent) blocks a complete total (PARTIAL).
+#   3. If a same-date fact shows a current-debt component that the selected
+#      concept does not cover (e.g. CommercialPaper alongside
+#      LongTermDebtCurrent), total debt is not reported as complete.
+# ============================================================
+
+FINANCE_LEASE_INCLUDED = "CAPITAL_FINANCE_LEASE_INCLUDED"
+FINANCE_LEASE_EXCLUDED = "CAPITAL_FINANCE_LEASE_EXCLUDED"
+
+_DEBT_LEASE_SCOPE = {
+    "DebtCurrent": (FINANCE_LEASE_INCLUDED, "ELEMENT_DEFINITION"),
+    "LongTermDebtCurrent": (FINANCE_LEASE_EXCLUDED, "ELEMENT_DEFINITION"),
+    "ShortTermBorrowings": (FINANCE_LEASE_EXCLUDED, "BORROWING_CONCEPT"),
+    "ShortTermDebt": (FINANCE_LEASE_EXCLUDED, "BORROWING_CONCEPT"),
+    "NotesPayableCurrent": (FINANCE_LEASE_EXCLUDED, "BORROWING_CONCEPT"),
+    "LongTermDebtNoncurrent": (FINANCE_LEASE_EXCLUDED, "ELEMENT_DEFINITION"),
+    "LongTermNotesPayable": (FINANCE_LEASE_EXCLUDED, "BORROWING_CONCEPT"),
+    "LongTermDebtAndCapitalLeaseObligations": (FINANCE_LEASE_INCLUDED, "ELEMENT_DEFINITION"),
+}
+
+# Same-date facts that the selected current-debt concept does not cover.
+_NOT_COVERED_BY = {
+    "LongTermDebtCurrent": ("CommercialPaper", "ShortTermBorrowings", "ShortTermDebt"),
+    "ShortTermBorrowings": ("LongTermDebtCurrent",),
+    "ShortTermDebt": ("LongTermDebtCurrent",),
+}
+
+CURRENT_DEBT_CANDIDATES = [
+    # STEP 15 (2026-10-27, B partially approved): DebtCurrent is the
+    # aggregate current-debt concept and takes priority over its
+    # components. In the 18-issuer comparison over five past PIT dates it
+    # changed 5 of 90 values (GE x3, AVGO x2), each matching the issuer's
+    # reported totals or component sums. Only one concept is selected, so
+    # ShortTermBorrowings is never added on top.
+    "DebtCurrent",
+    "LongTermDebtCurrent",
+    "ShortTermBorrowings",
+    "ShortTermDebt",
+    "CurrentDebt",
+    # Lowest priority; partial scope (labelled), never treated as
+    # complete current debt (ORCL).
+    "NotesPayableCurrent",
+]
+
+NONCURRENT_DEBT_CANDIDATES = [
+    "LongTermDebtNoncurrent",
+    # Fallback migrated from src/fundamentals/sec_historical.py's
+    # CONCEPT_MAP (2026-09-28, Framework v2.1 Architecture v5,
+    # implementation step 1 -- "ORCL fallback migration").
+    # Confirmed against real SEC data (2026-09-18 investigation):
+    # Oracle (CIK 0001341439) has zero observations under
+    # LongTermDebtNoncurrent (404 from data.sec.gov) and instead
+    # tags its noncurrent debt under LongTermNotesPayable (86 real
+    # observations spanning 2009-2026, e.g. $122.3B as of
+    # FY2026-05-31, filed 2026-06-22, form 10-K). Before this
+    # migration, this candidate list -- the one actually used by
+    # the production path (point_in_time.py -> sec_normalizer.
+    # find_concept / normalize_company) -- did not have this
+    # fallback; only the non-production sec_historical.py did.
+    "LongTermNotesPayable",
+    # STEP 15 (2026-10-27): noncurrent debt tag at the latest
+    # balance-sheet date for GE and MU. Cross-checked: with
+    # DebtCurrent it sums to each issuer's reported combined
+    # total (GE DebtLongtermAndShorttermCombinedAmount, MU
+    # DebtAndCapitalLeaseObligations). Includes capital/finance
+    # lease obligations, labelled by get_metric_semantics().
+    "LongTermDebtAndCapitalLeaseObligations",
+]
+
+
+def _instant_observation_at(data: dict, concept: str, end, unit):
+    """Latest-filed instant observation of `concept` at `end` in `unit`."""
+    concept_data = (data.get("facts", {}).get("us-gaap") or {}).get(concept)
+    if not isinstance(concept_data, dict):
+        return None
+    matches = [
+        obs
+        for obs in get_observations(concept_data)
+        if is_instant_observation(obs)
+        and obs.get("end") == end
+        and obs.get("unit") == unit
+        and _is_number(obs.get("val"))
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda o: (_date_string(o.get("filed")) or "", o.get("accn") or ""))
+
+
+def annotate_debt_scope(metric: dict, data: dict = None) -> dict:
+    """Add lease_scope (and its basis) to an OK debt component."""
+    if not isinstance(metric, dict) or metric.get("status") != "OK":
+        return metric
+    entry = _DEBT_LEASE_SCOPE.get(metric.get("concept"))
+    if entry is None:
+        return metric
+    annotated = dict(metric)
+    annotated["lease_scope"], annotated["lease_scope_basis"] = entry
+    return annotated
+
+
+def _scope_of(metric):
+    return metric.get("lease_scope") if isinstance(metric, dict) else None
+
+
+def align_debt_scope(current_debt: dict, noncurrent_debt: dict, data: dict):
+    """Rule 1: replace a mixed-scope pair with a same-date, same-unit pair
+    of matching lease scope, if the filing reports one. Returns the
+    (possibly replaced) pair."""
+    if not (
+        isinstance(current_debt, dict)
+        and isinstance(noncurrent_debt, dict)
+        and current_debt.get("status") == "OK"
+        and noncurrent_debt.get("status") == "OK"
+    ):
+        return current_debt, noncurrent_debt
+    cur_scope, non_scope = _scope_of(current_debt), _scope_of(noncurrent_debt)
+    if not cur_scope or not non_scope or cur_scope == non_scope:
+        return current_debt, noncurrent_debt
+    end = current_debt.get("period_end")
+    unit = current_debt.get("unit")
+    if end != noncurrent_debt.get("period_end") or unit != noncurrent_debt.get("unit"):
+        return current_debt, noncurrent_debt
+
+    for scope in (FINANCE_LEASE_INCLUDED, FINANCE_LEASE_EXCLUDED):
+        picked = {}
+        for role, candidates in (
+            ("current_debt", CURRENT_DEBT_CANDIDATES),
+            ("noncurrent_debt", NONCURRENT_DEBT_CANDIDATES),
+        ):
+            for concept in candidates:
+                entry = _DEBT_LEASE_SCOPE.get(concept)
+                if not entry or entry[0] != scope:
+                    continue
+                if get_metric_semantics(role, concept).get("scope_coverage") == "PARTIAL":
+                    continue
+                obs = _instant_observation_at(data, concept, end, unit)
+                if obs is not None:
+                    picked[role] = (concept, obs)
+                    break
+        if len(picked) == 2:
+            replaced = []
+            out = {}
+            for role, original in (("current_debt", current_debt), ("noncurrent_debt", noncurrent_debt)):
+                concept, obs = picked[role]
+                result = build_instant_result(role, "us-gaap", concept, obs)
+                for key in ("freshness", "freshness_anchor"):
+                    if key in original:
+                        result[key] = original[key]
+                result = annotate_debt_scope(result)
+                if concept != original.get("concept"):
+                    result["scope_alignment"] = {
+                        "replaced_concept": original.get("concept"),
+                        "replaced_value": original.get("value"),
+                        "reason": (
+                            "Default selection mixed lease scopes; a same-date "
+                            f"pair reported as {scope} was used instead."
+                        ),
+                    }
+                    replaced.append(role)
+                    # Replacing the aggregate DebtCurrent with a narrower
+                    # concept must not silently drop what the aggregate
+                    # held beyond it.
+                    if (
+                        original.get("concept") == "DebtCurrent"
+                        and original.get("value") != result.get("value")
+                    ):
+                        result["uncovered_components"] = [{
+                            "concept": "DebtCurrent",
+                            "value": original.get("value"),
+                            "accession": original.get("accession"),
+                            "note": (
+                                "Aggregate current debt differs from the "
+                                "scope-aligned component; the difference is "
+                                "not covered."
+                            ),
+                        }]
+                out[role] = result
+            return out["current_debt"], out["noncurrent_debt"]
+    return current_debt, noncurrent_debt
+
+
+def detect_uncovered_current_components(current_debt: dict, data: dict) -> dict:
+    """Rule 3: record same-date current-debt facts the selected concept
+    does not cover (no summing, no estimate)."""
+    if not isinstance(current_debt, dict) or current_debt.get("status") != "OK":
+        return current_debt
+    others = _NOT_COVERED_BY.get(current_debt.get("concept"))
+    if not others:
+        return current_debt
+    found = []
+    for concept in others:
+        obs = _instant_observation_at(
+            data, concept, current_debt.get("period_end"), current_debt.get("unit")
+        )
+        if obs is not None and obs.get("val") not in (0, 0.0):
+            found.append({"concept": concept, "value": obs.get("val"), "accession": obs.get("accn")})
+    if not found:
+        return current_debt
+    annotated = dict(current_debt)
+    annotated["uncovered_components"] = list(current_debt.get("uncovered_components") or []) + found
+    return annotated
 
 
 # ============================================================
@@ -1487,8 +1915,12 @@ def normalize_company(
 ):
     validate_companyfacts(data)
 
-    revenue = extract_metric(
+    # STEP 15: annual metrics are selected from full-year facts only.
+    annual_view = annual_duration_view(data)
+
+    revenue = extract_full_year_metric(
         data,
+        annual_view,
         "revenue",
         [
             "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -1497,8 +1929,9 @@ def normalize_company(
         ],
     )
 
-    net_income = extract_metric(
+    net_income = extract_full_year_metric(
         data,
+        annual_view,
         "net_income",
         [
             "NetIncomeLoss",
@@ -1506,8 +1939,9 @@ def normalize_company(
         ],
     )
 
-    diluted_eps = extract_metric(
+    diluted_eps = extract_full_year_metric(
         data,
+        annual_view,
         "diluted_eps",
         [
             "EarningsPerShareDiluted",
@@ -1523,8 +1957,9 @@ def normalize_company(
             ),
         )
     else:
-        operating_income = extract_metric(
+        operating_income = extract_full_year_metric(
             data,
+            annual_view,
             "operating_income",
             [
                 "OperatingIncomeLoss",
@@ -1540,8 +1975,9 @@ def normalize_company(
             ),
         )
     else:
-        cfo = extract_metric(
+        cfo = extract_full_year_metric(
             data,
+            annual_view,
             "cfo",
             [
                 "NetCashProvidedByUsedInOperatingActivities",
@@ -1557,8 +1993,9 @@ def normalize_company(
             ),
         )
     else:
-        capex = extract_metric(
+        capex = extract_full_year_metric(
             data,
+            annual_view,
             "capex",
             [
                 "PaymentsToAcquirePropertyPlantAndEquipment",
@@ -1591,20 +2028,7 @@ def normalize_company(
         current_debt = extract_instant_metric(
             data,
             "current_debt",
-            [
-                "LongTermDebtCurrent",
-                "ShortTermBorrowings",
-                "ShortTermDebt",
-                "CurrentDebt",
-                # STEP 15 (2026-10-27): DebtCurrent is the current-debt
-                # tag at the latest balance-sheet date for GE, MU, LLY
-                # and INTC; NotesPayableCurrent for ORCL (raw
-                # companyfacts, CI run on step15-batch-runner). Lowest
-                # priority, so issuers already served by the tags above
-                # are unaffected.
-                "DebtCurrent",
-                "NotesPayableCurrent",
-            ],
+            CURRENT_DEBT_CANDIDATES,
         )
 
     if company_type == "FINANCIAL":
@@ -1619,30 +2043,7 @@ def normalize_company(
         noncurrent_debt = extract_instant_metric(
             data,
             "noncurrent_debt",
-            [
-                "LongTermDebtNoncurrent",
-                # Fallback migrated from src/fundamentals/sec_historical.py's
-                # CONCEPT_MAP (2026-09-28, Framework v2.1 Architecture v5,
-                # implementation step 1 -- "ORCL fallback migration").
-                # Confirmed against real SEC data (2026-09-18 investigation):
-                # Oracle (CIK 0001341439) has zero observations under
-                # LongTermDebtNoncurrent (404 from data.sec.gov) and instead
-                # tags its noncurrent debt under LongTermNotesPayable (86 real
-                # observations spanning 2009-2026, e.g. $122.3B as of
-                # FY2026-05-31, filed 2026-06-22, form 10-K). Before this
-                # migration, this candidate list -- the one actually used by
-                # the production path (point_in_time.py -> sec_normalizer.
-                # find_concept / normalize_company) -- did not have this
-                # fallback; only the non-production sec_historical.py did.
-                "LongTermNotesPayable",
-                # STEP 15 (2026-10-27): noncurrent debt tag at the latest
-                # balance-sheet date for GE and MU. Cross-checked: with
-                # DebtCurrent it sums to each issuer's reported combined
-                # total (GE DebtLongtermAndShorttermCombinedAmount, MU
-                # DebtAndCapitalLeaseObligations). Includes lease
-                # obligations, labelled by get_metric_semantics().
-                "LongTermDebtAndCapitalLeaseObligations",
-            ],
+            NONCURRENT_DEBT_CANDIDATES,
         )
 
     shares = extract_instant_metric(
@@ -1676,8 +2077,27 @@ def normalize_company(
 
     # Freshness check (STEP 15): downgrade stale selections before any
     # derived value (total_debt) is computed from them.
-    annual_anchor = annual_freshness_anchor(data)
+    annual_anchor = annual_freshness_anchor(annual_view)
     instant_anchor = instant_freshness_anchor(data)
+    instant_anchor_source = "US_GAAP_ASSETS" if instant_anchor else None
+    if instant_anchor is None:
+        # Fallback when us-gaap:Assets is not reported: the latest
+        # period end among the selected us-gaap balance-sheet metrics
+        # themselves (cover-page share counts excluded, since their
+        # date follows the balance sheet). An outlier older than the
+        # others is still caught; with no selected balance-sheet value
+        # at all, freshness stays unverifiable and fails closed.
+        candidate_ends = [
+            _parse_iso_date(m.get("period_end"))
+            for m in (cash, current_debt, noncurrent_debt, stockholders_equity)
+            if isinstance(m, dict)
+            and m.get("status") == "OK"
+            and m.get("namespace") == "us-gaap"
+        ]
+        candidate_ends = [e for e in candidate_ends if e is not None]
+        if candidate_ends:
+            instant_anchor = max(candidate_ends)
+            instant_anchor_source = "SELECTED_BALANCE_SHEET_METRICS"
 
     revenue = apply_freshness_check(revenue, annual_anchor, _FRESHNESS_ANNUAL)
     net_income = apply_freshness_check(net_income, annual_anchor, _FRESHNESS_ANNUAL)
@@ -1697,17 +2117,79 @@ def normalize_company(
         stockholders_equity, instant_anchor, _FRESHNESS_INSTANT
     )
 
+    # STEP 15: debt lease-scope labels (used by calculate_total_debt()).
+    current_debt = annotate_debt_scope(current_debt)
+    noncurrent_debt = annotate_debt_scope(noncurrent_debt)
+    current_debt, noncurrent_debt = align_debt_scope(current_debt, noncurrent_debt, data)
+    current_debt = detect_uncovered_current_components(current_debt, data)
+
+    # STEP 15: period labels. period_kind is DURATION or INSTANT;
+    # period_class distinguishes the annual (10-K FY) duration metrics.
+    # Named to avoid the existing "period_type" field used by history
+    # records in growth.py.
+    def _label(metric, kind, period_class=None):
+        if not isinstance(metric, dict) or metric.get("status") == "NOT_APPLICABLE":
+            return metric
+        labelled = dict(metric)
+        labelled["period_kind"] = kind
+        if period_class:
+            labelled["period_class"] = period_class
+        return labelled
+
+    revenue = _label(revenue, "DURATION", "ANNUAL_FY")
+    net_income = _label(net_income, "DURATION", "ANNUAL_FY")
+    diluted_eps = _label(diluted_eps, "DURATION", "ANNUAL_FY")
+    operating_income = _label(operating_income, "DURATION", "ANNUAL_FY")
+    cfo = _label(cfo, "DURATION", "ANNUAL_FY")
+    capex = _label(capex, "DURATION", "ANNUAL_FY")
+    cash = _label(cash, "INSTANT")
+    current_debt = _label(current_debt, "INSTANT")
+    noncurrent_debt = _label(noncurrent_debt, "INSTANT")
+    shares = _label(shares, "INSTANT")
+    stockholders_equity = _label(stockholders_equity, "INSTANT")
+
     total_debt = calculate_total_debt(
         current_debt,
         noncurrent_debt,
         company_type,
     )
+    total_debt = _label(total_debt, "INSTANT")
+
+    # STEP 15: scope restrictions that downstream derived metrics do not
+    # carry themselves. A consumer must treat the listed derived metrics
+    # as not eligible for general peer comparison / scoring.
+    scope_flags = []
+    if isinstance(capex, dict) and capex.get("status") == "OK" and capex.get("concept_scope"):
+        scope_flags.append({
+            "metric": "capex",
+            "concept": capex.get("concept"),
+            "concept_scope": capex.get("concept_scope"),
+            "affected_derived_metrics": ["fcf", "fcf_margin"],
+            "scoring_eligibility": "RESTRICTED",
+            "reason": (
+                "CapEx is broader than PP&E-only CapEx; FCF built on it is "
+                "not directly comparable with PP&E-based FCF."
+            ),
+        })
+    for name, component in (("current_debt", current_debt), ("noncurrent_debt", noncurrent_debt)):
+        if isinstance(component, dict) and component.get("status") == "OK" and component.get("scope_coverage") == "PARTIAL":
+            scope_flags.append({
+                "metric": name,
+                "concept": component.get("concept"),
+                "concept_scope": component.get("concept_scope"),
+                "affected_derived_metrics": ["total_debt", "net_debt", "debt_to_cash"],
+                "scoring_eligibility": "RESTRICTED",
+                "reason": "Component covers only part of the debt it stands in for.",
+            })
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "scope_flags": scope_flags,
+        "annual_duration_range_days": [ANNUAL_MIN_DAYS, ANNUAL_MAX_DAYS],
         "freshness_anchors": {
             "annual": annual_anchor.isoformat() if annual_anchor else None,
             "instant": instant_anchor.isoformat() if instant_anchor else None,
+            "instant_source": instant_anchor_source,
             "tolerance_days": FRESHNESS_TOLERANCE_DAYS,
         },
         "ticker": ticker,
