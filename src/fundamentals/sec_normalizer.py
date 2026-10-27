@@ -1012,6 +1012,31 @@ def get_metric_semantics(
     meaning can be distinguished from the selected SEC concept.
     """
 
+    # STEP 15 (2026-10-27): concepts added as lower-priority candidates
+    # whose scope is broader than the metric's primary concept. They are
+    # labelled so consumers can tell them apart; the scope difference is
+    # recorded, not corrected.
+    if metric_name == "capex" and concept == "PaymentsToAcquireProductiveAssets":
+        return {
+            "concept_scope": "PRODUCTIVE_ASSETS",
+            "semantic_note": (
+                "Payments to acquire productive assets; may include "
+                "intangible assets or software in addition to PP&E."
+            ),
+        }
+
+    if (
+        metric_name == "noncurrent_debt"
+        and concept == "LongTermDebtAndCapitalLeaseObligations"
+    ):
+        return {
+            "concept_scope": "DEBT_AND_LEASE_OBLIGATIONS",
+            "semantic_note": (
+                "Noncurrent long-term debt including lease "
+                "obligations."
+            ),
+        }
+
     if metric_name != "stockholders_equity":
         return {}
 
@@ -1321,6 +1346,137 @@ def calculate_total_debt(
 
 
 # ============================================================
+# FRESHNESS CHECK (STEP 15, 2026-10-27)
+#
+# Candidate selection picks the latest observation of each candidate
+# concept. When an issuer stopped using a concept years ago, that
+# concept's last value (e.g. FY2012) was returned as "OK" even though
+# it is not the issuer's current period. This check compares the
+# selected period_end with the issuer's own latest reporting date in
+# the same (already PIT-gated) companyfacts document:
+#
+#   - annual (duration) metrics: latest 10-K FY period end across all
+#     us-gaap concepts;
+#   - instant (balance-sheet) metrics: latest instant period end of
+#     us-gaap:Assets.
+#
+# A selected value older than its anchor by more than
+# FRESHNESS_TOLERANCE_DAYS is downgraded to the existing INCOMPLETE
+# status with freshness="STALE" and value=None; the stale observation
+# is kept under "stale_observation" for diagnostics. The check is
+# one-sided (later dates, e.g. dei cover-page share counts, pass).
+# Freshness says nothing about a concept's accounting meaning; that is
+# a separate question.
+# ============================================================
+
+FRESHNESS_TOLERANCE_DAYS = 45
+
+_FRESHNESS_ANNUAL = "annual"
+_FRESHNESS_INSTANT = "instant"
+
+
+def _parse_iso_date(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def annual_freshness_anchor(data: dict):
+    """Latest 10-K FY period end across all us-gaap concepts."""
+    best = None
+    for concept_data in (data.get("facts", {}).get("us-gaap") or {}).values():
+        for obs in get_observations(concept_data):
+            if not is_annual_observation(obs):
+                continue
+            end = _parse_iso_date(obs.get("end"))
+            if end is not None and (best is None or end > best):
+                best = end
+    return best
+
+
+def instant_freshness_anchor(data: dict):
+    """Latest instant period end of us-gaap:Assets (the balance-sheet
+    date), or None when Assets is not reported."""
+    concept_data = (data.get("facts", {}).get("us-gaap") or {}).get("Assets")
+    if concept_data is None:
+        return None
+    best = None
+    for obs in get_observations(concept_data):
+        if not is_instant_observation(obs):
+            continue
+        end = _parse_iso_date(obs.get("end"))
+        if end is not None and (best is None or end > best):
+            best = end
+    return best
+
+
+def apply_freshness_check(result: dict, anchor, kind: str) -> dict:
+    """Return `result` annotated with freshness, or an INCOMPLETE/STALE
+    replacement when its period_end predates `anchor` by more than
+    FRESHNESS_TOLERANCE_DAYS. Non-OK results are returned unchanged."""
+    if not isinstance(result, dict) or result.get("status") != "OK":
+        return result
+
+    if anchor is None:
+        annotated = dict(result)
+        annotated["freshness"] = "UNVERIFIED_NO_ANCHOR"
+        return annotated
+
+    period_end = _parse_iso_date(result.get("period_end"))
+    if period_end is None:
+        annotated = dict(result)
+        annotated["freshness"] = "UNVERIFIED_NO_PERIOD_END"
+        annotated["freshness_anchor"] = anchor.isoformat()
+        return annotated
+
+    lag_days = (anchor - period_end).days
+    if lag_days <= FRESHNESS_TOLERANCE_DAYS:
+        annotated = dict(result)
+        annotated["freshness"] = "CURRENT"
+        annotated["freshness_anchor"] = anchor.isoformat()
+        return annotated
+
+    metric_name = result.get("metric")
+    anchor_label = (
+        "latest 10-K fiscal-year end"
+        if kind == _FRESHNESS_ANNUAL
+        else "latest balance-sheet date (us-gaap:Assets)"
+    )
+    stale = build_incomplete_metric(
+        metric_name,
+        (
+            f"Selected {metric_name} observation "
+            f"({result.get('concept')}, period ending "
+            f"{period_end.isoformat()}) is {lag_days} days older than "
+            f"the issuer's {anchor_label} {anchor.isoformat()}; no "
+            "candidate concept reports a current-period value. "
+            "Refusing to return a stale value as current."
+        ),
+    )
+    stale["freshness"] = "STALE"
+    stale["freshness_anchor"] = anchor.isoformat()
+    stale["stale_observation"] = {
+        key: result.get(key)
+        for key in (
+            "namespace",
+            "concept",
+            "value",
+            "unit",
+            "period_start",
+            "period_end",
+            "filing_date",
+            "form",
+            "accession",
+        )
+        if key in result
+    }
+    return stale
+
+
+# ============================================================
 # COMPANY NORMALIZATION
 # ============================================================
 
@@ -1407,6 +1563,11 @@ def normalize_company(
             [
                 "PaymentsToAcquirePropertyPlantAndEquipment",
                 "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+                # STEP 15 (2026-10-27): current capex tag for GE, LMT and
+                # NVDA in their latest 10-Ks (raw companyfacts, CI run on
+                # step15-batch-runner); broader scope, labelled by
+                # get_metric_semantics(). Lowest priority.
+                "PaymentsToAcquireProductiveAssets",
             ],
         )
 
@@ -1435,6 +1596,14 @@ def normalize_company(
                 "ShortTermBorrowings",
                 "ShortTermDebt",
                 "CurrentDebt",
+                # STEP 15 (2026-10-27): DebtCurrent is the current-debt
+                # tag at the latest balance-sheet date for GE, MU, LLY
+                # and INTC; NotesPayableCurrent for ORCL (raw
+                # companyfacts, CI run on step15-batch-runner). Lowest
+                # priority, so issuers already served by the tags above
+                # are unaffected.
+                "DebtCurrent",
+                "NotesPayableCurrent",
             ],
         )
 
@@ -1466,6 +1635,13 @@ def normalize_company(
                 # find_concept / normalize_company) -- did not have this
                 # fallback; only the non-production sec_historical.py did.
                 "LongTermNotesPayable",
+                # STEP 15 (2026-10-27): noncurrent debt tag at the latest
+                # balance-sheet date for GE and MU. Cross-checked: with
+                # DebtCurrent it sums to each issuer's reported combined
+                # total (GE DebtLongtermAndShorttermCombinedAmount, MU
+                # DebtAndCapitalLeaseObligations). Includes lease
+                # obligations, labelled by get_metric_semantics().
+                "LongTermDebtAndCapitalLeaseObligations",
             ],
         )
 
@@ -1498,6 +1674,29 @@ def normalize_company(
         ),
     )
 
+    # Freshness check (STEP 15): downgrade stale selections before any
+    # derived value (total_debt) is computed from them.
+    annual_anchor = annual_freshness_anchor(data)
+    instant_anchor = instant_freshness_anchor(data)
+
+    revenue = apply_freshness_check(revenue, annual_anchor, _FRESHNESS_ANNUAL)
+    net_income = apply_freshness_check(net_income, annual_anchor, _FRESHNESS_ANNUAL)
+    diluted_eps = apply_freshness_check(diluted_eps, annual_anchor, _FRESHNESS_ANNUAL)
+    operating_income = apply_freshness_check(
+        operating_income, annual_anchor, _FRESHNESS_ANNUAL
+    )
+    cfo = apply_freshness_check(cfo, annual_anchor, _FRESHNESS_ANNUAL)
+    capex = apply_freshness_check(capex, annual_anchor, _FRESHNESS_ANNUAL)
+    cash = apply_freshness_check(cash, instant_anchor, _FRESHNESS_INSTANT)
+    current_debt = apply_freshness_check(current_debt, instant_anchor, _FRESHNESS_INSTANT)
+    noncurrent_debt = apply_freshness_check(
+        noncurrent_debt, instant_anchor, _FRESHNESS_INSTANT
+    )
+    shares = apply_freshness_check(shares, instant_anchor, _FRESHNESS_INSTANT)
+    stockholders_equity = apply_freshness_check(
+        stockholders_equity, instant_anchor, _FRESHNESS_INSTANT
+    )
+
     total_debt = calculate_total_debt(
         current_debt,
         noncurrent_debt,
@@ -1506,6 +1705,11 @@ def normalize_company(
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "freshness_anchors": {
+            "annual": annual_anchor.isoformat() if annual_anchor else None,
+            "instant": instant_anchor.isoformat() if instant_anchor else None,
+            "tolerance_days": FRESHNESS_TOLERANCE_DAYS,
+        },
         "ticker": ticker,
         "entity_name": data.get("entityName"),
         "cik": data.get("cik"),
