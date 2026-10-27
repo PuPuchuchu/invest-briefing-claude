@@ -1851,13 +1851,10 @@ def align_debt_scope(current_debt: dict, noncurrent_debt: dict, data: dict):
                         result[key] = original[key]
                 result = annotate_debt_scope(result)
                 if concept != original.get("concept"):
-                    result["scope_alignment"] = {
-                        "replaced_concept": original.get("concept"),
-                        "replaced_value": original.get("value"),
-                        "reason": (
-                            "Default selection mixed lease scopes; a same-date "
-                            f"pair reported as {scope} was used instead."
-                        ),
+                    result["replaces_default"] = {
+                        "concept": original.get("concept"),
+                        "value": original.get("value"),
+                        "lease_scope": original.get("lease_scope"),
                     }
                     replaced.append(role)
                     # Replacing the aggregate DebtCurrent with a narrower
@@ -1880,6 +1877,39 @@ def align_debt_scope(current_debt: dict, noncurrent_debt: dict, data: dict):
                 out[role] = result
             return out["current_debt"], out["noncurrent_debt"]
     return current_debt, noncurrent_debt
+
+
+# Independent aggregates the issuer may report at the same date. Recorded
+# as evidence only; they never change a status or a value. Facts in
+# companyfacts are entity-level (no segment/axis dimensions), i.e. the
+# consolidated registrant.
+_DEBT_RECONCILIATION_CONCEPTS = (
+    "LongTermDebt",
+    "DebtLongtermAndShorttermCombinedAmount",
+    "DebtAndCapitalLeaseObligations",
+)
+
+
+def reconcile_total_debt(total_debt: dict, current_component: dict, data: dict) -> list:
+    """Same-date, same-unit independent aggregates and whether each equals
+    the computed total exactly (no tolerance)."""
+    end = current_component.get("period_end") if isinstance(current_component, dict) else None
+    unit = total_debt.get("unit")
+    if not end or not unit:
+        return []
+    out = []
+    for concept in _DEBT_RECONCILIATION_CONCEPTS:
+        obs = _instant_observation_at(data, concept, end, unit)
+        if obs is None:
+            continue
+        out.append({
+            "concept": concept,
+            "value": obs.get("val"),
+            "period_end": end,
+            "accession": obs.get("accn"),
+            "equals_total": obs.get("val") == total_debt.get("value"),
+        })
+    return out
 
 
 def detect_uncovered_current_components(current_debt: dict, data: dict) -> dict:
@@ -2120,8 +2150,47 @@ def normalize_company(
     # STEP 15: debt lease-scope labels (used by calculate_total_debt()).
     current_debt = annotate_debt_scope(current_debt)
     noncurrent_debt = annotate_debt_scope(noncurrent_debt)
-    current_debt, noncurrent_debt = align_debt_scope(current_debt, noncurrent_debt, data)
     current_debt = detect_uncovered_current_components(current_debt, data)
+
+    # Total-debt components: the individual current_debt / noncurrent_debt
+    # fields above keep their default selection (DebtCurrent first). Only
+    # the total-debt calculation may use a same-date, same-scope pair.
+    total_current, total_noncurrent = align_debt_scope(
+        current_debt, noncurrent_debt, data
+    )
+    debt_alignment = None
+    if total_current is not current_debt or total_noncurrent is not noncurrent_debt:
+        if total_current is not current_debt:
+            total_current = detect_uncovered_current_components(total_current, data)
+        debt_alignment = {
+            "reason": (
+                "Default current/noncurrent selections have different "
+                "capital/finance lease scopes; a same-date, same-unit pair "
+                "of matching scope was used for total debt only."
+            ),
+            "period_end": total_current.get("period_end"),
+            "unit": total_current.get("unit"),
+            "original": {
+                "current_debt": {
+                    "concept": current_debt.get("concept"),
+                    "lease_scope": current_debt.get("lease_scope"),
+                },
+                "noncurrent_debt": {
+                    "concept": noncurrent_debt.get("concept"),
+                    "lease_scope": noncurrent_debt.get("lease_scope"),
+                },
+            },
+            "selected": {
+                "current_debt": {
+                    "concept": total_current.get("concept"),
+                    "lease_scope": total_current.get("lease_scope"),
+                },
+                "noncurrent_debt": {
+                    "concept": total_noncurrent.get("concept"),
+                    "lease_scope": total_noncurrent.get("lease_scope"),
+                },
+            },
+        }
 
     # STEP 15: period labels. period_kind is DURATION or INSTANT;
     # period_class distinguishes the annual (10-K FY) duration metrics.
@@ -2149,10 +2218,16 @@ def normalize_company(
     stockholders_equity = _label(stockholders_equity, "INSTANT")
 
     total_debt = calculate_total_debt(
-        current_debt,
-        noncurrent_debt,
+        total_current,
+        total_noncurrent,
         company_type,
     )
+    if debt_alignment is not None:
+        total_debt["scope_alignment"] = debt_alignment
+    if total_debt.get("status") == "OK":
+        reconciliation = reconcile_total_debt(total_debt, total_current, data)
+        if reconciliation:
+            total_debt["reconciliation"] = reconciliation
     total_debt = _label(total_debt, "INSTANT")
 
     # STEP 15: scope restrictions that downstream derived metrics do not

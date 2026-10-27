@@ -216,18 +216,31 @@ def test_mixed_scope_without_any_aligned_pair_is_incomplete():
 
 
 def test_equal_values_do_not_prove_absence_of_leases():
-    # NVDA latest shape: DebtCurrent == LongTermDebtCurrent. No inference
-    # from equality; instead the same-date lease-excluded pair is used and
-    # the total is labelled as excluding finance leases.
+    # NVDA latest shape: DebtCurrent == LongTermDebtCurrent, noncurrent only
+    # LongTermDebtNoncurrent. No inference from equality. The individual
+    # current_debt field keeps DebtCurrent; total debt alone uses the
+    # same-date lease-excluded pair and is labelled as excluding leases.
     g = _base()
     g["DebtCurrent"] = _c([_inst(2.0, BS)])
+    g["LongTermDebt"] = _c([_inst(42.0, BS)])
     m = _norm(g)["metrics"]
     assert "lease_scope_evidence" not in m["current_debt"]
-    assert m["current_debt"]["concept"] == "LongTermDebtCurrent"
-    assert m["current_debt"]["scope_alignment"]["replaced_concept"] == "DebtCurrent"
-    assert m["total_debt"]["status"] == "OK"
-    assert m["total_debt"]["value"] == 42.0
-    assert m["total_debt"]["lease_scope"] == "CAPITAL_FINANCE_LEASE_EXCLUDED"
+    assert m["current_debt"]["concept"] == "DebtCurrent"
+    assert m["noncurrent_debt"]["concept"] == "LongTermDebtNoncurrent"
+    td = m["total_debt"]
+    assert td["status"] == "OK"
+    assert td["value"] == 42.0
+    assert td["lease_scope"] == "CAPITAL_FINANCE_LEASE_EXCLUDED"
+    assert td["components"]["current_debt"]["concept"] == "LongTermDebtCurrent"
+    align = td["scope_alignment"]
+    assert align["original"]["current_debt"] == {
+        "concept": "DebtCurrent", "lease_scope": "CAPITAL_FINANCE_LEASE_INCLUDED"}
+    assert align["selected"]["current_debt"] == {
+        "concept": "LongTermDebtCurrent", "lease_scope": "CAPITAL_FINANCE_LEASE_EXCLUDED"}
+    assert align["period_end"] == BS
+    assert align["unit"] == "USD"
+    rec = {r["concept"]: r for r in td["reconciliation"]}
+    assert rec["LongTermDebt"]["equals_total"] is True
 
 
 def test_aligning_away_from_larger_aggregate_flags_uncovered_difference():
@@ -236,10 +249,13 @@ def test_aligning_away_from_larger_aggregate_flags_uncovered_difference():
     g = _base()
     g["DebtCurrent"] = _c([_inst(5.6, BS)])
     m = _norm(g)["metrics"]
-    assert m["current_debt"]["concept"] == "LongTermDebtCurrent"
-    assert m["total_debt"]["status"] == "INCOMPLETE"
-    assert m["total_debt"]["reason_code"] == "CURRENT_COMPONENT_NOT_COVERED"
-    assert m["total_debt"]["value"] is None
+    assert m["current_debt"]["concept"] == "DebtCurrent"
+    assert m["current_debt"]["value"] == 5.6
+    td = m["total_debt"]
+    assert td["components"]["current_debt"]["concept"] == "LongTermDebtCurrent"
+    assert td["status"] == "INCOMPLETE"
+    assert td["reason_code"] == "CURRENT_COMPONENT_NOT_COVERED"
+    assert td["value"] is None
 
 
 def test_same_date_lease_including_pair_is_preferred():
@@ -248,12 +264,28 @@ def test_same_date_lease_including_pair_is_preferred():
     g = _base()
     g["DebtCurrent"] = _c([_inst(2.0, BS)])
     g["LongTermDebtAndCapitalLeaseObligations"] = _c([_inst(40.0, BS)])
+    g["LongTermDebt"] = _c([_inst(42.0, BS)])
+    g["DebtLongtermAndShorttermCombinedAmount"] = _c([_inst(43.5, BS)])
     m = _norm(g)["metrics"]
+    # individual fields keep the default selection
     assert m["current_debt"]["concept"] == "DebtCurrent"
-    assert m["noncurrent_debt"]["concept"] == "LongTermDebtAndCapitalLeaseObligations"
-    assert m["noncurrent_debt"]["scope_alignment"]["replaced_concept"] == "LongTermDebtNoncurrent"
-    assert m["total_debt"]["status"] == "OK"
-    assert m["total_debt"]["lease_scope"] == "CAPITAL_FINANCE_LEASE_INCLUDED"
+    assert m["noncurrent_debt"]["concept"] == "LongTermDebtNoncurrent"
+    td = m["total_debt"]
+    assert td["status"] == "OK"
+    assert td["value"] == 42.0
+    assert td["lease_scope"] == "CAPITAL_FINANCE_LEASE_INCLUDED"
+    assert td["components"]["noncurrent_debt"]["concept"] == "LongTermDebtAndCapitalLeaseObligations"
+    assert td["components"]["noncurrent_debt"]["replaces_default"]["concept"] == "LongTermDebtNoncurrent"
+    assert td["scope_alignment"]["selected"]["noncurrent_debt"]["concept"] == "LongTermDebtAndCapitalLeaseObligations"
+    rec = {r["concept"]: r["equals_total"] for r in td["reconciliation"]}
+    # recorded as evidence only, no tolerance; a non-matching aggregate
+    # does not change the status
+    assert rec == {"LongTermDebt": True, "DebtLongtermAndShorttermCombinedAmount": False}
+
+
+def test_no_alignment_when_default_pair_is_consistent():
+    m = _norm(_base())["metrics"]
+    assert "scope_alignment" not in m["total_debt"]
 
 
 def test_avgo_reconciled_aggregate_with_lease_including_noncurrent_is_ok():
