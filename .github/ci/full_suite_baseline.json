@@ -1,22 +1,70 @@
 {
- "schema_version": 1,
- "description": "Full Test Suite baseline for the regression gate (DEC-025/DEC-027). Known failures may keep failing; anything else that fails, disappears, or goes from passed to skipped is a regression. Changing this file is a reviewed decision.",
+ "schema_version": 2,
+ "description": "Full Test Suite baseline for the regression gate (DEC-025/DEC-027/DEC-029). Each known failure carries its failure signature (status, exception type, normalized message); a known failure that fails with a different signature is a regression. Anything else that fails, disappears, or goes from run to skipped is a regression. Changing this file is a reviewed decision.",
  "baseline_commit": "8c1cf41ab3e1eabb40cd31c077ee4e655f35428e",
  "baseline_source": "Full Test Suite run 40515387963 on de34af31cbaf1818309e9872adb32d4a70572211 (tree 5eeef627..., identical to 8c1cf41); report timestamp 2026-10-27T13:49:03Z",
- "known_failures": [
-  "tests.test_stockholders_equity_coverage::test_print_stockholders_equity_coverage",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AAPL]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AMD]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AVGO]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[CRWV]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[INTC]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MSFT]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MU]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[NVDA]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[ORCL]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[PLTR]",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[SMCI]"
- ],
+ "known_failures": {
+  "tests.test_stockholders_equity_coverage::test_print_stockholders_equity_coverage": {
+   "status": "failure",
+   "exception": "FileNotFoundError",
+   "message": "FileNotFoundError: SEC raw file not found: data/raw/sec/MSFT_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AAPL]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/AAPL_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AMD]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/AMD_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AVGO]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/AVGO_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[CRWV]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/CRWV_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[INTC]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/INTC_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MSFT]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/MSFT_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MU]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/MU_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[NVDA]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/NVDA_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[ORCL]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/ORCL_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[PLTR]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/PLTR_companyfacts.json"
+  },
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[SMCI]": {
+   "status": "failure",
+   "exception": "Failed",
+   "message": "Failed: SEC raw file not found: data/raw/sec/SMCI_companyfacts.json"
+  }
+ },
  "protected": {
   "classname_markers": [
    "test_sec_history_eps_direct_only"

@@ -17,15 +17,16 @@ _spec.loader.exec_module(gate)
 MARKER = "protected_marker_module"
 
 
-def _xml(cases):
+def _xml(cases, exc="Failed", line=10):
     """cases: list of (classname, name, status, message)."""
     body = []
     for cls, name, status, msg in cases:
         inner = ""
+        tb = f"tests/{cls.split('.')[-1]}.py:{line}: {exc}"
         if status == "failure":
-            inner = f'<failure message="{msg}">x</failure>'
+            inner = f'<failure message="{msg}">frame\n{tb}</failure>'
         elif status == "error":
-            inner = f'<error message="{msg}">x</error>'
+            inner = f'<error message="{msg}">frame\n{tb}</error>'
         elif status == "skipped":
             inner = '<skipped message="skip"/>'
         body.append(f'<testcase classname="{cls}" name="{name}">{inner}</testcase>')
@@ -43,10 +44,14 @@ BASE_CASES = [
 ]
 
 
+KNOWN_SIG = {"status": "failure", "exception": "Failed", "message": "SEC raw file not found"}
+
+
 def _baseline():
     return {
+        "schema_version": 2,
         "baseline_commit": "base",
-        "known_failures": ["tests.test_env::test_known[AAPL]"],
+        "known_failures": {"tests.test_env::test_known[AAPL]": dict(KNOWN_SIG)},
         "protected": {"classname_markers": [MARKER], "tests": 3, "failed": 1},
         "tests": {
             "tests.test_a::test_ok1": "passed",
@@ -57,9 +62,9 @@ def _baseline():
     }
 
 
-def _run(tmp_path, cases, exit_code=1, baseline=None):
+def _run(tmp_path, cases, exit_code=1, baseline=None, exc="Failed", line=10):
     report = tmp_path / "r.xml"
-    report.write_text(_xml(cases), encoding="utf-8")
+    report.write_text(_xml(cases, exc=exc, line=line), encoding="utf-8")
     base = tmp_path / "b.json"
     base.write_text(json.dumps(baseline or _baseline()), encoding="utf-8")
     out = tmp_path / "out.json"
@@ -191,13 +196,92 @@ def test_summary_states_known_failures_are_not_passing(tmp_path):
     assert "tests.test_env::test_known[AAPL]" in text
 
 
+def test_known_failure_with_different_message_is_regression(tmp_path):
+    cases = _replace(BASE_CASES, "tests.test_env", "test_known[AAPL]", "failure",
+                     "AssertionError: equity 0 != 1")
+    rc, res = _run(tmp_path, cases)
+    assert rc == gate.EXIT_REGRESSION and res["verdict"] == "REGRESSION"
+    [changed] = res["known_failures_cause_changed"]
+    assert changed["id"] == "tests.test_env::test_known[AAPL]"
+    assert changed["baseline"] == KNOWN_SIG
+    assert changed["current"]["message"] == "AssertionError: equity 0 != 1"
+
+
+def test_known_failure_with_different_exception_type_is_regression(tmp_path):
+    rc, res = _run(tmp_path, BASE_CASES, exc="KeyError")
+    assert rc == gate.EXIT_REGRESSION
+    assert res["known_failures_cause_changed"][0]["current"]["exception"] == "KeyError"
+
+
+def test_known_failure_turning_into_error_is_regression(tmp_path):
+    cases = _replace(BASE_CASES, "tests.test_env", "test_known[AAPL]", "error",
+                     "SEC raw file not found")
+    rc, res = _run(tmp_path, cases)
+    assert rc == gate.EXIT_REGRESSION
+    assert res["known_failures_cause_changed"][0]["current"]["status"] == "error"
+
+
+def test_shifted_line_number_is_not_a_cause_change(tmp_path):
+    rc, res = _run(tmp_path, BASE_CASES, line=999)
+    assert rc == gate.EXIT_PASS
+    assert res["known_failures_cause_changed"] == []
+
+
+def test_workspace_path_prefix_is_normalized(tmp_path):
+    base = _baseline()
+    base["known_failures"]["tests.test_env::test_known[AAPL]"]["message"] = (
+        "Failed: SEC raw file not found: data/raw/sec/AAPL_companyfacts.json")
+    cases = _replace(BASE_CASES, "tests.test_env", "test_known[AAPL]", "failure",
+                     "Failed: SEC raw file not found: "
+                     "/home/runner/work/repo/repo/data/raw/sec/AAPL_companyfacts.json")
+    rc, res = _run(tmp_path, cases, baseline=base)
+    assert rc == gate.EXIT_PASS, res["known_failures_cause_changed"]
+
+
+def test_different_file_in_message_is_a_cause_change(tmp_path):
+    base = _baseline()
+    base["known_failures"]["tests.test_env::test_known[AAPL]"]["message"] = (
+        "Failed: SEC raw file not found: data/raw/sec/AAPL_companyfacts.json")
+    cases = _replace(BASE_CASES, "tests.test_env", "test_known[AAPL]", "failure",
+                     "Failed: SEC raw file not found: data/raw/sec/MSFT_companyfacts.json")
+    rc, res = _run(tmp_path, cases, baseline=base)
+    assert rc == gate.EXIT_REGRESSION
+
+
+def test_known_failure_now_skipped_is_regression(tmp_path):
+    cases = _replace(BASE_CASES, "tests.test_env", "test_known[AAPL]", "skipped")
+    rc, res = _run(tmp_path, cases)
+    assert rc == gate.EXIT_REGRESSION
+    assert res["newly_skipped"] == ["tests.test_env::test_known[AAPL]"]
+
+
+def test_baseline_without_signatures_is_unverifiable(tmp_path):
+    base = _baseline()
+    base["schema_version"] = 1
+    base["known_failures"] = ["tests.test_env::test_known[AAPL]"]
+    rc, res = _run(tmp_path, BASE_CASES, baseline=base)
+    assert rc == gate.EXIT_UNVERIFIABLE
+    assert "signatures" in res["unverifiable_reasons"][0]
+
+
+def test_summary_mentions_cause_comparison(tmp_path):
+    _, res = _run(tmp_path, BASE_CASES)
+    text = gate.render_summary(res)
+    assert "Known failures with changed cause | 0" in text
+    assert "Protected tests are compared by counts only" in text
+
+
 def test_committed_baseline_is_consistent():
     b = json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
-    known = set(b["known_failures"])
+    assert b["schema_version"] >= 2
+    known = b["known_failures"]
     assert known, "baseline must list its known failures explicitly"
     assert all(b["tests"].get(t) in ("failure", "error") for t in known)
+    for t, sig in known.items():
+        assert set(sig) == {"status", "exception", "message"}, t
+        assert sig["status"] == b["tests"][t] and sig["exception"] and sig["message"], t
     failing = {t for t, s in b["tests"].items() if s in ("failure", "error")}
-    assert failing == known
+    assert failing == set(known)
     assert b["protected"]["tests"] >= b["protected"]["failed"] >= 0
     markers = b["protected"]["classname_markers"]
     assert not any(any(m in t for m in markers) for t in b["tests"])
