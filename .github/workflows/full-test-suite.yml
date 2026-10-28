@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - step14-company-type
+      - step15-batch-runner
 
 jobs:
   full-test-suite:

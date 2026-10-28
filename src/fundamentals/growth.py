@@ -563,18 +563,24 @@ def _build_fcf_history(
             + capex["value"]
         )
 
-        result.append(
-            {
-                "status": "OK",
-                "period_end": _record_period_end(cfo),
-                "quarter": _quarter_value(cfo),
-                "fy": _year_value(cfo),
-                "period_type": cfo.get(
-                    "period_type"
-                ),
-                "value": fcf,
-            }
-        )
+        fcf_record = {
+            "status": "OK",
+            "period_end": _record_period_end(cfo),
+            "quarter": _quarter_value(cfo),
+            "fy": _year_value(cfo),
+            "period_type": cfo.get(
+                "period_type"
+            ),
+            "value": fcf,
+        }
+
+        # STEP 15 (2026-10-27): metadata only. Carry a CapEx record's own
+        # scope label, when it has one, so fcf_yoy can report it per period.
+        if capex.get("concept_scope"):
+            fcf_record["capex_concept_scope"] = capex.get("concept_scope")
+            fcf_record["capex_concept"] = capex.get("concept")
+
+        result.append(fcf_record)
 
     return result
 
@@ -974,6 +980,66 @@ def _calculate_weighted_score(
 # MAIN CALCULATION
 # ============================================================
 
+def _fcf_yoy_scope_metadata(
+    fcf_history: list[dict[str, Any]],
+    normalized: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    STEP 15 (2026-10-27): scope restriction for fcf_yoy, per compared
+    period. A period is restricted when its CapEx came from a broader-scope
+    concept (e.g. PaymentsToAcquireProductiveAssets):
+
+    - the FCF history record carries capex_concept_scope (taken from the
+      CapEx history record itself), or, failing that,
+    - the normalized CapEx metric has concept_scope. The orchestrator
+      builds CapEx history from that same selected concept, so its scope
+      applies to every history period that has no label of its own.
+
+    Returns {} when neither compared period is restricted, so unrestricted
+    output is unchanged.
+    """
+    latest, previous = _select_latest_quarter_pair(fcf_history)
+
+    capex = (normalized.get("metrics") or {}).get("capex") if isinstance(normalized, dict) else None
+    selected = None
+    if isinstance(capex, dict) and capex.get("status") == "OK" and capex.get("concept_scope"):
+        selected = {
+            "concept": capex.get("concept"),
+            "concept_scope": capex.get("concept_scope"),
+            "basis": "SELECTED_CAPEX_CONCEPT",
+        }
+
+    def _period_scope(record):
+        if not isinstance(record, dict):
+            return None
+        if record.get("capex_concept_scope"):
+            return {
+                "concept": record.get("capex_concept"),
+                "concept_scope": record.get("capex_concept_scope"),
+                "basis": "HISTORY_RECORD",
+                "period_end": _record_period_end(record),
+            }
+        if selected:
+            return dict(selected, period_end=_record_period_end(record))
+        return None
+
+    current_scope = _period_scope(latest)
+    previous_scope = _period_scope(previous)
+
+    if current_scope is None and previous_scope is None:
+        return {}
+
+    return {
+        "input_scope": {
+            "capex": {
+                "current_period": current_scope,
+                "previous_period": previous_scope,
+            }
+        },
+        "peer_comparison_eligibility": "RESTRICTED_INPUT_SCOPE",
+    }
+
+
 def calculate_growth(
     normalized: dict[str, Any],
     derived: dict[str, Any],
@@ -1092,6 +1158,12 @@ def calculate_growth(
             positive_only=True,
         )
     )
+
+    # STEP 15 (2026-10-27): metadata only; value and status unchanged.
+    if components["fcf_yoy"].get("status") == "OK":
+        components["fcf_yoy"].update(
+            _fcf_yoy_scope_metadata(fcf_history, normalized)
+        )
 
     # --------------------------------------------------------
     # Revenue 3Y CAGR
