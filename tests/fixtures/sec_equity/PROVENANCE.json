@@ -1,0 +1,149 @@
+{
+ "description": "Slices of real SEC companyfacts used by tests/test_stockholders_equity_coverage.py. Built by scripts/build_sec_equity_fixtures.py; do not edit by hand.",
+ "equivalence_check": "normalize_company(...)['metrics']['stockholders_equity'] is identical on the full file and on the slice, for every ticker (checked at build time)",
+ "kept_concepts": [
+  "StockholdersEquity",
+  "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+  "Assets"
+ ],
+ "kept_top_level_keys": [
+  "cik",
+  "entityName"
+ ],
+ "source": {
+  "artifact_created_utc": "2026-10-28T12:57Z",
+  "artifact_name": "sec-companyfacts-raw",
+  "artifact_zip_sha256": "238013fa5743b352b474c84c0a512e536aed2aa13a1570e3119aa586e8d088ed",
+  "github_actions_run_id": null,
+  "origin": "SEC EDGAR XBRL companyfacts API, fetched by the Fundamentals Batch workflow"
+ },
+ "tickers": {
+  "AAPL": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "Assets"
+   ],
+   "full_file": "AAPL_companyfacts.json",
+   "full_file_bytes": 4195471,
+   "full_file_sha256": "6b4380f07cf6045408be419cf7d78a5d90d08c28cb86fef6c78c7105622fd784",
+   "slice_file": "AAPL_companyfacts_equity_slice.json",
+   "slice_sha256": "89be70d1c9104e27bbf6f224e996daf49fe49bc581403daa339e3954ccb3e276"
+  },
+  "AMD": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "Assets"
+   ],
+   "full_file": "AMD_companyfacts.json",
+   "full_file_bytes": 4061179,
+   "full_file_sha256": "a4b6a0e20800dd647bc1d08a7eb9cd407b4bf27b4bc8cfedbeabde7a12d235f5",
+   "slice_file": "AMD_companyfacts_equity_slice.json",
+   "slice_sha256": "4a7a554624caf5fb6c095a6965c1504e0975b84900cd3c760b873c422946a864"
+  },
+  "AVGO": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "AVGO_companyfacts.json",
+   "full_file_bytes": 2603068,
+   "full_file_sha256": "77f77f0d0031d327547c613fe98a531d5ba165681e23fe62ebb08d1271905a2d",
+   "slice_file": "AVGO_companyfacts_equity_slice.json",
+   "slice_sha256": "57fb1199d3fb2ba49e88bbb79326d0297c4ade8d2f8341528b5b7307d6157671"
+  },
+  "CRWV": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "Assets"
+   ],
+   "full_file": "CRWV_companyfacts.json",
+   "full_file_bytes": 547431,
+   "full_file_sha256": "37cb10dd2f47980d67a64c77d2f68f25c1cab181e920c22b27d4fd22aca4de26",
+   "slice_file": "CRWV_companyfacts_equity_slice.json",
+   "slice_sha256": "28d4fa611484901bf3e34dce66b74b23966da55c9a6d19301f5a2c741103910e"
+  },
+  "INTC": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "INTC_companyfacts.json",
+   "full_file_bytes": 4772010,
+   "full_file_sha256": "078579f2594c173e5ac539854a7080107846b2405fb2c9137de9b8087c3cbb83",
+   "slice_file": "INTC_companyfacts_equity_slice.json",
+   "slice_sha256": "72b9f36045e3249cb79e3565175ec4adc480eb1c8d94e988650c9a6ab414e5d1"
+  },
+  "MSFT": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "Assets"
+   ],
+   "full_file": "MSFT_companyfacts.json",
+   "full_file_bytes": 5416727,
+   "full_file_sha256": "bf634f485edffb616b1ce47236a9ef9773e03b1ac7173126f7827c7d0368a34a",
+   "slice_file": "MSFT_companyfacts_equity_slice.json",
+   "slice_sha256": "ac7dcc803b7a636158690ca2e2a63a6593a5518be5e7076e632e77777d8f5bfd"
+  },
+  "MU": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "MU_companyfacts.json",
+   "full_file_bytes": 4597245,
+   "full_file_sha256": "45ab53424f7ac50d954f3915979f9df88e89ee77ddababfdb200cb8a7c42d0cb",
+   "slice_file": "MU_companyfacts_equity_slice.json",
+   "slice_sha256": "ab268996285bdac6bf13a116dcd427ac482105518c3b7f3e3b06ca918e250adb"
+  },
+  "NVDA": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "Assets"
+   ],
+   "full_file": "NVDA_companyfacts.json",
+   "full_file_bytes": 4534615,
+   "full_file_sha256": "a7cf2857c67726f1627299e0e7533670272e37349da086efaebeb5b8a6c7970d",
+   "slice_file": "NVDA_companyfacts_equity_slice.json",
+   "slice_sha256": "4f9ec05feeb02d537bbb4cf026fa4879a7035e5d8cf75dd2f09111ad0fab24b1"
+  },
+  "ORCL": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "ORCL_companyfacts.json",
+   "full_file_bytes": 4389698,
+   "full_file_sha256": "3dd1eead54fd6eb78737a3f683f20a8caedfcdba42b38ab31a3e87623398286c",
+   "slice_file": "ORCL_companyfacts_equity_slice.json",
+   "slice_sha256": "1f4919e601cdf2a8c2fa2ca615c6178b2ef1036ce8cb9e831d5fa342ae75d8c9"
+  },
+  "PLTR": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "PLTR_companyfacts.json",
+   "full_file_bytes": 1376712,
+   "full_file_sha256": "1a97bb44745ceffb65558dd94b53af321099b94a28d9d2df74b99c4bc25405de",
+   "slice_file": "PLTR_companyfacts_equity_slice.json",
+   "slice_sha256": "c6b2a6e23498679d06e21d756d5a9bbfd14cf3b861746ddb0496f98dcb2a1cf8"
+  },
+  "SMCI": {
+   "concepts_present": [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Assets"
+   ],
+   "full_file": "SMCI_companyfacts.json",
+   "full_file_bytes": 3995762,
+   "full_file_sha256": "0384fc01da89eb26484de3c7bec39d23755d11742b2fd440c090828a3fc86014",
+   "slice_file": "SMCI_companyfacts_equity_slice.json",
+   "slice_sha256": "50c6bfe923c9e9af1a738d1503d9f677fe03379610c7c49734f94ff393b0e4a5"
+  }
+ }
+}

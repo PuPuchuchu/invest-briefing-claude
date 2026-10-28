@@ -1,4 +1,23 @@
+"""Stockholders' equity extraction on real SEC companyfacts.
+
+Two data sources, chosen by the SEC_RAW_DIR environment variable:
+
+* Not set (default, used by the Full Test Suite): fixed slices of real SEC
+  companyfacts in tests/fixtures/sec_equity/, built by
+  scripts/build_sec_equity_fixtures.py. Their source artifact and sha256 are
+  in PROVENANCE.json. The extracted result must equal the pinned values in
+  expected_stockholders_equity.json exactly.
+* Set to a directory of full TICKER_companyfacts.json files (used by the
+  Stockholders Equity Coverage Test workflow after a live SEC fetch): the
+  structural checks below run on live data; pinned values are not compared,
+  because live filings change.
+
+A missing file is a test failure, never a skip.
+"""
+
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -6,7 +25,10 @@ import pytest
 from src.fundamentals.sec_normalizer import normalize_company
 
 
-RAW_DIR = Path("data/raw/sec")
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "sec_equity"
+SLICE_SUFFIX = "_companyfacts_equity_slice.json"
+LIVE_RAW_DIR = os.environ.get("SEC_RAW_DIR")
+USING_FIXTURES = not LIVE_RAW_DIR
 
 TARGET_TICKERS = [
     "MSFT", "AAPL", "NVDA", "AVGO", "INTC", "MU",
@@ -28,8 +50,14 @@ ALLOWED_STOCKHOLDERS_EQUITY_CONCEPTS = {
 # HELPERS
 # ============================================================
 
+def companyfacts_path(ticker: str) -> Path:
+    if USING_FIXTURES:
+        return FIXTURE_DIR / f"{ticker}{SLICE_SUFFIX}"
+    return Path(LIVE_RAW_DIR) / f"{ticker}_companyfacts.json"
+
+
 def load_companyfacts(ticker: str) -> dict:
-    path = RAW_DIR / f"{ticker}_companyfacts.json"
+    path = companyfacts_path(ticker)
 
     if not path.exists():
         raise FileNotFoundError(
@@ -103,6 +131,39 @@ def test_stockholders_equity_real_company(ticker):
     ), (
         f"{ticker}: concept={metric.get('concept')}"
     )
+
+    if USING_FIXTURES:
+        expected = json.loads(
+            (FIXTURE_DIR / "expected_stockholders_equity.json").read_text(encoding="utf-8")
+        )[ticker]
+        assert metric == expected, (
+            f"{ticker}: extracted stockholders_equity differs from the pinned "
+            f"result in expected_stockholders_equity.json"
+        )
+
+
+# ============================================================
+# TEST: FIXTURE INTEGRITY
+# ============================================================
+
+@pytest.mark.skipif(not USING_FIXTURES, reason="live SEC_RAW_DIR run; fixtures not used")
+def test_equity_fixtures_match_provenance():
+    """Every slice exists, matches its recorded sha256, and contains only the
+    recorded concepts. Covers every ticker the coverage test uses."""
+    prov = json.loads((FIXTURE_DIR / "PROVENANCE.json").read_text(encoding="utf-8"))
+    assert set(prov["tickers"]) == set(TARGET_TICKERS)
+    src = prov["source"]
+    assert src["artifact_name"] and src["artifact_zip_sha256"] and src["artifact_created_utc"]
+    for ticker, rec in prov["tickers"].items():
+        data = (FIXTURE_DIR / rec["slice_file"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == rec["slice_sha256"], ticker
+        doc = json.loads(data)
+        assert set(doc) <= {"cik", "entityName", "facts"}, ticker
+        assert set(doc["facts"]) == {"us-gaap"}, ticker
+        concepts = set(doc["facts"]["us-gaap"])
+        assert concepts == set(rec["concepts_present"]), ticker
+        assert concepts <= set(prov["kept_concepts"]), ticker
+        assert "Assets" in concepts, f"{ticker}: freshness anchor missing"
 
 
 # ============================================================

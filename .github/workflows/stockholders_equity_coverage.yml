@@ -128,4 +128,4 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest -q tests/test_stockholders_equity_coverage.py -s
+          SEC_RAW_DIR=data/raw/sec pytest -q tests/test_stockholders_equity_coverage.py -s
