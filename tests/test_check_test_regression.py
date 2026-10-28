@@ -275,7 +275,7 @@ def test_committed_baseline_is_consistent():
     b = json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
     assert b["schema_version"] >= 2
     known = b["known_failures"]
-    assert known, "baseline must list its known failures explicitly"
+    assert isinstance(known, dict)  # may be empty once every known failure is fixed
     assert all(b["tests"].get(t) in ("failure", "error") for t in known)
     for t, sig in known.items():
         assert set(sig) == {"status", "exception", "message"}, t

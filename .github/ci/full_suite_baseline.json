@@ -1,70 +1,9 @@
 {
  "schema_version": 2,
- "description": "Full Test Suite baseline for the regression gate (DEC-025/DEC-027/DEC-029). Each known failure carries its failure signature (status, exception type, normalized message); a known failure that fails with a different signature is a regression. Anything else that fails, disappears, or goes from run to skipped is a regression. Changing this file is a reviewed decision.",
+ "description": "Full Test Suite baseline for the regression gate (DEC-025/DEC-027/DEC-029/DEC-031). Each known failure carries its failure signature (status, exception type, normalized message); a known failure that fails with a different signature is a regression. Anything else that fails, disappears, or goes from run to skipped is a regression. Changing this file is a reviewed decision.",
  "baseline_commit": "8c1cf41ab3e1eabb40cd31c077ee4e655f35428e",
- "baseline_source": "Full Test Suite run 40515387963 on de34af31cbaf1818309e9872adb32d4a70572211 (tree 5eeef627..., identical to 8c1cf41); report timestamp 2026-10-27T13:49:03Z",
- "known_failures": {
-  "tests.test_stockholders_equity_coverage::test_print_stockholders_equity_coverage": {
-   "status": "failure",
-   "exception": "FileNotFoundError",
-   "message": "FileNotFoundError: SEC raw file not found: data/raw/sec/MSFT_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AAPL]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/AAPL_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AMD]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/AMD_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AVGO]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/AVGO_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[CRWV]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/CRWV_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[INTC]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/INTC_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MSFT]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/MSFT_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MU]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/MU_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[NVDA]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/NVDA_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[ORCL]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/ORCL_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[PLTR]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/PLTR_companyfacts.json"
-  },
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[SMCI]": {
-   "status": "failure",
-   "exception": "Failed",
-   "message": "Failed: SEC raw file not found: data/raw/sec/SMCI_companyfacts.json"
-  }
- },
+ "baseline_source": "Full Test Suite run 40515387963 on de34af31cbaf1818309e9872adb32d4a70572211 (tree identical to 8c1cf41), updated in STEP 18 (DEC-031): the 12 stockholders-equity coverage tests now run on fixed SEC fixtures and are recorded as passed; the regression-gate tests and the fixture-integrity test are added as passed. These updated entries are confirmed by this branch's own full-suite-regression-gate run, which fails if any baseline 'passed' test does not pass.",
+ "known_failures": {},
  "protected": {
   "classname_markers": [
    "test_sec_history_eps_direct_only"
@@ -84,6 +23,36 @@
   "tests.test_batch_runner::test_ticker_subset_filter": "passed",
   "tests.test_batch_runner::test_unregistered_ticker_is_excluded_and_never_fetched": "passed",
   "tests.test_batch_runner::test_watchlist_entries_are_distinct_active_watchlist_only": "passed",
+  "tests.test_check_test_regression::test_added_failing_test_is_regression": "passed",
+  "tests.test_check_test_regression::test_added_passing_test_passes": "passed",
+  "tests.test_check_test_regression::test_bad_pytest_exit_code_is_unverifiable[2]": "passed",
+  "tests.test_check_test_regression::test_bad_pytest_exit_code_is_unverifiable[3]": "passed",
+  "tests.test_check_test_regression::test_bad_pytest_exit_code_is_unverifiable[4]": "passed",
+  "tests.test_check_test_regression::test_bad_pytest_exit_code_is_unverifiable[5]": "passed",
+  "tests.test_check_test_regression::test_baseline_without_signatures_is_unverifiable": "passed",
+  "tests.test_check_test_regression::test_committed_baseline_is_consistent": "passed",
+  "tests.test_check_test_regression::test_different_file_in_message_is_a_cause_change": "passed",
+  "tests.test_check_test_regression::test_empty_report_is_unverifiable": "passed",
+  "tests.test_check_test_regression::test_identical_to_baseline_passes_and_lists_known_failure": "passed",
+  "tests.test_check_test_regression::test_known_failure_now_passing_is_reported_not_failing": "passed",
+  "tests.test_check_test_regression::test_known_failure_now_skipped_is_regression": "passed",
+  "tests.test_check_test_regression::test_known_failure_turning_into_error_is_regression": "passed",
+  "tests.test_check_test_regression::test_known_failure_with_different_exception_type_is_regression": "passed",
+  "tests.test_check_test_regression::test_known_failure_with_different_message_is_regression": "passed",
+  "tests.test_check_test_regression::test_malformed_report_is_unverifiable": "passed",
+  "tests.test_check_test_regression::test_missing_baseline_test_is_regression": "passed",
+  "tests.test_check_test_regression::test_missing_known_failure_is_regression": "passed",
+  "tests.test_check_test_regression::test_missing_report_is_unverifiable": "passed",
+  "tests.test_check_test_regression::test_new_error_is_regression": "passed",
+  "tests.test_check_test_regression::test_new_failure_is_regression": "passed",
+  "tests.test_check_test_regression::test_passed_to_skipped_is_regression": "passed",
+  "tests.test_check_test_regression::test_protected_count_drop_is_regression": "passed",
+  "tests.test_check_test_regression::test_protected_failure_count_increase_is_regression": "passed",
+  "tests.test_check_test_regression::test_protected_tests_are_never_listed_by_name": "passed",
+  "tests.test_check_test_regression::test_shifted_line_number_is_not_a_cause_change": "passed",
+  "tests.test_check_test_regression::test_summary_mentions_cause_comparison": "passed",
+  "tests.test_check_test_regression::test_summary_states_known_failures_are_not_passing": "passed",
+  "tests.test_check_test_regression::test_workspace_path_prefix_is_normalized": "passed",
   "tests.test_company_type_registry::test_all_structurally_invalid_rows_for_a_cik_is_invalid_reference": "passed",
   "tests.test_company_type_registry::test_business_effective_but_not_yet_available_fails_closed_as_not_yet_available": "passed",
   "tests.test_company_type_registry::test_empty_or_missing_source_remains_invalid[None]": "passed",
@@ -1086,18 +1055,19 @@
   "tests.test_seed_identity_reference::test_seed_script_never_writes_a_reviewed_row": "passed",
   "tests.test_seed_identity_reference::test_seed_script_raises_on_unresolvable_ticker": "passed",
   "tests.test_seed_identity_reference::test_seed_script_writes_one_issuer_row_per_cik": "passed",
-  "tests.test_stockholders_equity_coverage::test_print_stockholders_equity_coverage": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AAPL]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AMD]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AVGO]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[CRWV]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[INTC]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MSFT]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MU]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[NVDA]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[ORCL]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[PLTR]": "failure",
-  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[SMCI]": "failure",
+  "tests.test_stockholders_equity_coverage::test_equity_fixtures_match_provenance": "passed",
+  "tests.test_stockholders_equity_coverage::test_print_stockholders_equity_coverage": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AAPL]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AMD]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[AVGO]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[CRWV]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[INTC]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MSFT]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[MU]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[NVDA]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[ORCL]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[PLTR]": "passed",
+  "tests.test_stockholders_equity_coverage::test_stockholders_equity_real_company[SMCI]": "passed",
   "tests.test_universe_membership::test_avgo_dual_membership_watchlist_and_core_both_lookup_ok_independently": "passed",
   "tests.test_universe_membership::test_get_universe_membership_as_of_availability_date_exactly_on_evaluation_date_is_ok": "passed",
   "tests.test_universe_membership::test_get_universe_membership_as_of_evaluation_date_before_effective_from_is_no_membership": "passed",
