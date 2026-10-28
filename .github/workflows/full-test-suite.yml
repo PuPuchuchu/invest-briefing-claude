@@ -1,19 +1,24 @@
 name: Full Test Suite
 
-# Runs the entire tests/ directory and uploads a JUnit report, so test results
-# (including tests that depend on protected modules) are produced by CI rather
-# than inspected in a chat session.
-# workflow_dispatch only works once this file is on the default branch, so a
-# push trigger limited to the feature branch is included for that branch.
+# Runs the entire tests/ directory, uploads a JUnit report, and applies the
+# full-suite regression gate (DEC-025 merge criterion; DEC-027).
+#
+# The job succeeds when there is NO REGRESSION against
+# .github/ci/full_suite_baseline.json. It does NOT mean every test passed:
+# the baseline's known failures may keep failing and are listed in the job
+# summary, never counted as passing. Tests that depend on protected modules
+# are evaluated by counts only.
 on:
   workflow_dispatch:
   push:
     branches:
-      - step14-company-type
-      - step15-batch-runner
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  full-test-suite:
+  full-suite-regression-gate:
     runs-on: ubuntu-latest
 
     steps:
@@ -31,14 +36,32 @@ jobs:
           pip install pytest
 
       - name: Run full test suite
+        id: pytest
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set +e
           pytest tests/ -q -rfEs --junitxml=pytest-report.xml
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "pytest exit code: $rc"
+          exit 0
+
+      - name: Regression gate
+        run: |
+          python .github/scripts/check_test_regression.py \
+            --report pytest-report.xml \
+            --baseline .github/ci/full_suite_baseline.json \
+            --pytest-exit-code "${{ steps.pytest.outputs.exit_code }}" \
+            --summary-out "$GITHUB_STEP_SUMMARY" \
+            --json-out regression-gate.json
 
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: full-test-suite-report
-          path: pytest-report.xml
+          path: |
+            pytest-report.xml
+            regression-gate.json
+          if-no-files-found: warn
