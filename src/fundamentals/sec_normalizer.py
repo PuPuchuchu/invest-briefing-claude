@@ -1721,9 +1721,21 @@ _DEBT_LEASE_SCOPE = {
     "LongTermDebtAndCapitalLeaseObligations": (FINANCE_LEASE_INCLUDED, "ELEMENT_DEFINITION"),
 }
 
+# Same-date short-term borrowing concepts that LongTermDebtCurrent (current
+# maturities of long-term debt) does not cover. Shared by the uncovered-
+# component detection and the DEC-038 component-sum rule so the two never
+# disagree about which concepts exist.
+_SHORT_TERM_BORROWING_CONCEPTS = (
+    "CommercialPaper",
+    "ShortTermBorrowings",
+    "ShortTermDebt",
+    "OtherShortTermBorrowings",
+    "CurrentDebt",
+)
+
 # Same-date facts that the selected current-debt concept does not cover.
 _NOT_COVERED_BY = {
-    "LongTermDebtCurrent": ("CommercialPaper", "ShortTermBorrowings", "ShortTermDebt"),
+    "LongTermDebtCurrent": _SHORT_TERM_BORROWING_CONCEPTS,
     "ShortTermBorrowings": ("LongTermDebtCurrent",),
     "ShortTermDebt": ("LongTermDebtCurrent",),
 }
@@ -1787,6 +1799,28 @@ def _instant_observation_at(data: dict, concept: str, end, unit):
     if not matches:
         return None
     return max(matches, key=lambda o: (_date_string(o.get("filed")) or "", o.get("accn") or ""))
+
+
+def _instant_observations_any_unit(data: dict, concept: str, end) -> list:
+    """The latest-filed instant observation of `concept` at `end` in each
+    unit (same selection rule as _instant_observation_at, applied per unit),
+    so a same-date fact reported in a different unit is never silently
+    missed. Earlier filings repeating the same date (e.g. comparatives) are
+    superseded by the latest one, exactly as for the selected components."""
+    concept_data = (data.get("facts", {}).get("us-gaap") or {}).get(concept)
+    if not isinstance(concept_data, dict):
+        return []
+    units = sorted({
+        obs.get("unit")
+        for obs in get_observations(concept_data)
+        if is_instant_observation(obs) and obs.get("end") == end and _is_number(obs.get("val"))
+    }, key=lambda u: str(u))
+    out = []
+    for unit in units:
+        obs = _instant_observation_at(data, concept, end, unit)
+        if obs is not None:
+            out.append(obs)
+    return out
 
 
 def annotate_debt_scope(metric: dict, data: dict = None) -> dict:
@@ -1921,17 +1955,276 @@ def detect_uncovered_current_components(current_debt: dict, data: dict) -> dict:
     if not others:
         return current_debt
     found = []
+    unit = current_debt.get("unit")
     for concept in others:
-        obs = _instant_observation_at(
-            data, concept, current_debt.get("period_end"), current_debt.get("unit")
-        )
-        if obs is not None and obs.get("val") not in (0, 0.0):
-            found.append({"concept": concept, "value": obs.get("val"), "accession": obs.get("accn")})
+        same_unit = _instant_observation_at(data, concept, current_debt.get("period_end"), unit)
+        if same_unit is not None and same_unit.get("val") not in (0, 0.0):
+            found.append({"concept": concept, "value": same_unit.get("val"),
+                          "unit": unit, "accession": same_unit.get("accn")})
+            continue
+        # DEC-038 review: a non-zero same-date fact in another unit is
+        # recorded too -- also when the selected unit reports 0 -- and is
+        # never silently ignored (no conversion is attempted).
+        for obs in _instant_observations_any_unit(data, concept, current_debt.get("period_end")):
+            if obs.get("unit") != unit and obs.get("val") not in (0, 0.0):
+                found.append({"concept": concept, "value": obs.get("val"),
+                              "unit": obs.get("unit"), "accession": obs.get("accn")})
+                break
     if not found:
         return current_debt
     annotated = dict(current_debt)
     annotated["uncovered_components"] = list(current_debt.get("uncovered_components") or []) + found
     return annotated
+
+
+# ------------------------------------------------------------
+# Rule 4 (2026-10-29, DEC-038): same-filing current-component sum.
+#
+# When the selected current-debt concept is LongTermDebtCurrent (current
+# maturities only) and the same filing reports exactly one additional
+# short-term borrowing component (e.g. CommercialPaper) at the same date
+# and unit, total debt may be computed as
+#     LongTermDebtCurrent + that component + selected noncurrent debt.
+# This applies inside the total-debt calculation only; the individual
+# current_debt field keeps its default selection and value. Every
+# condition must hold, otherwise the existing INCOMPLETE result stands:
+#   * all three facts exist (no zero substitution), same period end,
+#     unit and accession;
+#   * no DebtCurrent aggregate is reported at that date;
+#   * exactly one non-zero short-term component (several unequal ones may
+#     overlap -> AMBIGUOUS_SHORT_TERM_COMPONENTS);
+#   * an aggregate whose scope is total debt, if reported at that date,
+#     equals the sum exactly (no tolerance); subtotals such as
+#     LongTermDebt are recorded as evidence only and never verify or
+#     fail the sum.
+# ------------------------------------------------------------
+
+# The only short-term component this rule may add (DEC-038 scope). Other
+# short-term borrowing concepts are detected and block the sum, but are not
+# summed until their accounting scope is reviewed separately.
+_SUMMABLE_SHORT_TERM_CONCEPTS = ("CommercialPaper",)
+
+# Aggregates whose element scope is total short-term + long-term debt
+# excluding capital/finance lease obligations; the rule only ever forms a
+# lease-excluded sum (LongTermDebtCurrent + CommercialPaper +
+# lease-excluded noncurrent debt), so no lease-including aggregate is used.
+# LongTermDebt is deliberately absent: it is a long-term subtotal.
+_TOTAL_DEBT_AGGREGATES_LEASE_EXCLUDED = ("DebtLongtermAndShorttermCombinedAmount",)
+
+_COMPONENT_SUM_BASIS = "SAME_FILING_CURRENT_COMPONENT_SUM"
+
+
+def _sum_component(role: str, metric: dict) -> dict:
+    return {
+        "role": role,
+        "concept": metric.get("concept"),
+        "value": metric.get("value"),
+        "period_end": metric.get("period_end"),
+        "unit": metric.get("unit"),
+        "accession": metric.get("accession"),
+    }
+
+
+def apply_current_component_sum(
+    total_debt: dict, current_debt: dict, noncurrent_debt: dict, data: dict
+) -> dict:
+    """Resolve CURRENT_COMPONENT_NOT_COVERED by a same-filing sum when every
+    Rule 4 condition holds. Returns total_debt unchanged when the rule does
+    not apply, or an INCOMPLETE result with a specific reason_code when it
+    applies but a condition fails."""
+    if not isinstance(total_debt, dict) or total_debt.get("reason_code") != "CURRENT_COMPONENT_NOT_COVERED":
+        return total_debt
+    if not (
+        isinstance(current_debt, dict)
+        and isinstance(noncurrent_debt, dict)
+        and current_debt.get("status") == "OK"
+        and noncurrent_debt.get("status") == "OK"
+        and current_debt.get("concept") == "LongTermDebtCurrent"
+        and _is_number(current_debt.get("value"))
+        and _is_number(noncurrent_debt.get("value"))
+    ):
+        return total_debt
+
+    end = current_debt.get("period_end")
+    unit = current_debt.get("unit")
+    accession = current_debt.get("accession")
+
+    def _fail(code: str, why: str, **extra) -> dict:
+        failed = dict(total_debt)
+        failed["reason_code"] = code
+        failed["reason"] = why
+        attempt = {"basis": _COMPONENT_SUM_BASIS, "applied": False, "reason_code": code}
+        attempt.update(extra)
+        failed["component_sum_attempt"] = attempt
+        return failed
+
+    if not end or not unit or not accession:
+        return _fail(
+            "COMPONENT_SUM_PROVENANCE_MISSING",
+            "Selected current debt lacks period end, unit or accession; "
+            "refusing a component sum without full provenance.",
+        )
+    if (
+        noncurrent_debt.get("period_end") != end
+        or noncurrent_debt.get("unit") != unit
+        or noncurrent_debt.get("accession") != accession
+    ):
+        return _fail(
+            "COMPONENT_SUM_FILING_MISMATCH",
+            "current_debt and noncurrent_debt do not come from the same "
+            "filing, date and unit; refusing a component sum.",
+        )
+    debt_current = _instant_observations_any_unit(data, "DebtCurrent", end)
+    if debt_current:
+        # e.g. DebtCurrent replaced by scope alignment, or reported in
+        # another unit: the existing CURRENT_COMPONENT_NOT_COVERED result
+        # stands (INCOMPLETE); the refused attempt is recorded.
+        same_unit = any(o.get("unit") == unit for o in debt_current)
+        kept = dict(total_debt)
+        kept["component_sum_attempt"] = {
+            "basis": _COMPONENT_SUM_BASIS,
+            "applied": False,
+            "reason_code": (
+                "AGGREGATE_CURRENT_DEBT_PRESENT" if same_unit
+                else "AGGREGATE_CURRENT_DEBT_OTHER_UNIT"
+            ),
+            "reason": (
+                "DebtCurrent is reported at this date"
+                + ("" if same_unit else " in another unit ("
+                   + ", ".join(sorted(str(o.get("unit")) for o in debt_current)) + ")")
+                + "; components are not added on top of an aggregate, and no "
+                "unit conversion is attempted."
+            ),
+            "debt_current_units": sorted(str(o.get("unit")) for o in debt_current),
+        }
+        return kept
+
+    lease_scope = current_debt.get("lease_scope")
+    if lease_scope != FINANCE_LEASE_EXCLUDED or noncurrent_debt.get("lease_scope") != FINANCE_LEASE_EXCLUDED:
+        return total_debt
+
+    # Every non-zero same-date short-term fact, in any unit and filing.
+    short_term = []
+    for concept in _SHORT_TERM_BORROWING_CONCEPTS:
+        for obs in _instant_observations_any_unit(data, concept, end):
+            if obs.get("val") in (0, 0.0):
+                continue
+            short_term.append({
+                "concept": concept,
+                "value": obs.get("val"),
+                "period_end": end,
+                "unit": obs.get("unit"),
+                "accession": obs.get("accn"),
+            })
+    if not short_term:
+        return total_debt
+    if any(c["unit"] != unit for c in short_term):
+        return _fail(
+            "COMPONENT_SUM_UNIT_MISMATCH",
+            "A same-date short-term borrowing fact is reported in a different "
+            "unit; no conversion is attempted.",
+            short_term_components=short_term,
+        )
+    if any(c["accession"] != accession for c in short_term):
+        return _fail(
+            "COMPONENT_SUM_FILING_MISMATCH",
+            "A same-date short-term borrowing fact does not come from the same "
+            "filing as the selected debt components; refusing a component sum.",
+            short_term_components=short_term,
+        )
+    if len({c["concept"] for c in short_term}) > 1:
+        # Equal values are not evidence that two concepts are the same
+        # obligation, so they are never collapsed into one.
+        return _fail(
+            "AMBIGUOUS_SHORT_TERM_COMPONENTS",
+            "Several same-date short-term borrowing concepts are reported ("
+            + ", ".join(sorted({c["concept"] for c in short_term}))
+            + "); their overlap cannot be determined, so none is added.",
+            short_term_components=short_term,
+        )
+    if len(short_term) > 1:
+        return _fail(
+            "AMBIGUOUS_SHORT_TERM_COMPONENTS",
+            "More than one same-filing fact for the short-term component; "
+            "refusing to pick one.",
+            short_term_components=short_term,
+        )
+    component = short_term[0]
+    if component["concept"] not in _SUMMABLE_SHORT_TERM_CONCEPTS:
+        return _fail(
+            "SHORT_TERM_COMPONENT_NOT_APPROVED",
+            f"{component['concept']} is not an approved summable component "
+            "(DEC-038 covers CommercialPaper only); refusing a component sum.",
+            short_term_components=short_term,
+        )
+
+    value = current_debt["value"] + component["value"] + noncurrent_debt["value"]
+
+    # Verification uses only same-filing, same-date, same-unit aggregates
+    # whose element scope matches the sum. Same-date aggregates from other
+    # filings are kept as evidence only and never verify or fail the sum.
+    verification = []
+    other_filings = []
+    for concept in _TOTAL_DEBT_AGGREGATES_LEASE_EXCLUDED:
+        for obs in _instant_observations_any_unit(data, concept, end):
+            entry = {
+                "concept": concept,
+                "value": obs.get("val"),
+                "unit": obs.get("unit"),
+                "accession": obs.get("accn"),
+            }
+            if obs.get("accn") == accession and obs.get("unit") == unit:
+                entry["equals_sum"] = obs.get("val") == value
+                verification.append(entry)
+            else:
+                other_filings.append(entry)
+    components = [
+        _sum_component("current_debt", current_debt),
+        dict(component, role="short_term_component"),
+        _sum_component("noncurrent_debt", noncurrent_debt),
+    ]
+    if any(not v["equals_sum"] for v in verification):
+        return _fail(
+            "COMPONENT_SUM_RECONCILIATION_FAILED",
+            "A same-date total-debt aggregate does not equal the component "
+            "sum; refusing to report the sum as total debt.",
+            components=components,
+            computed_sum=value,
+            verification=verification,
+            aggregates_other_filings_evidence_only=other_filings,
+        )
+
+    if len({v["value"] for v in verification}) > 1:
+        return _fail(
+            "COMPONENT_SUM_RECONCILIATION_FAILED",
+            "Conflicting same-filing aggregates; refusing a component sum.",
+            components=components, computed_sum=value, verification=verification,
+        )
+    resolved = {
+        "metric": "total_debt",
+        "status": "OK",
+        "value": value,
+        "unit": unit,
+        "components": total_debt.get("components"),
+        "component_sum": {
+            "basis": _COMPONENT_SUM_BASIS,
+            "applied": True,
+            "resolved_reason_code": "CURRENT_COMPONENT_NOT_COVERED",
+            "components": components,
+            "verification": verification,
+            "verification_status": "VERIFIED" if verification else "NO_SAME_FILING_AGGREGATE",
+            "aggregates_other_filings_evidence_only": other_filings,
+            "note": (
+                "Total debt is the sum of the selected current maturities, "
+                "one same-filing short-term borrowing component and the "
+                "selected noncurrent debt. It is a computed sum, not a "
+                "reported total-debt line."
+            ),
+        },
+    }
+    if lease_scope:
+        resolved["lease_scope"] = lease_scope
+    return resolved
 
 
 # ============================================================
@@ -2151,6 +2444,17 @@ def normalize_company(
     current_debt = annotate_debt_scope(current_debt)
     noncurrent_debt = annotate_debt_scope(noncurrent_debt)
     current_debt = detect_uncovered_current_components(current_debt, data)
+    # DEC-038: an individual LongTermDebtCurrent value is current maturities
+    # of long-term debt only, whether or not other short-term facts exist; it
+    # is labelled so it is not read as complete short-term borrowings. This is a description,
+    # not scope_coverage=PARTIAL, so it does not by itself block total debt.
+    if (
+        isinstance(current_debt, dict)
+        and current_debt.get("status") == "OK"
+        and current_debt.get("concept") == "LongTermDebtCurrent"
+    ):
+        current_debt = dict(current_debt)
+        current_debt["component_scope"] = "CURRENT_MATURITIES_ONLY"
 
     # Total-debt components: the individual current_debt / noncurrent_debt
     # fields above keep their default selection (DebtCurrent first). Only
@@ -2221,6 +2525,9 @@ def normalize_company(
         total_current,
         total_noncurrent,
         company_type,
+    )
+    total_debt = apply_current_component_sum(
+        total_debt, total_current, total_noncurrent, data
     )
     if debt_alignment is not None:
         total_debt["scope_alignment"] = debt_alignment
