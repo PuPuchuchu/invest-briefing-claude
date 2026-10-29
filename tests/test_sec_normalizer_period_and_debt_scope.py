@@ -306,13 +306,18 @@ def test_avgo_reconciled_aggregate_with_lease_including_noncurrent_is_ok():
 
 def test_commercial_paper_not_covered_by_ltd_current_blocks_complete_total():
     # AAPL shape: LongTermDebtCurrent plus a same-date CommercialPaper fact.
+    # DEC-038: a same-filing CommercialPaper fact is now summed (see
+    # tests/test_sec_normalizer_current_component_sum.py). A fact from a
+    # different filing still cannot complete total debt.
     g = _base()
-    g["CommercialPaper"] = _c([_inst(2.0, BS)])
+    cp = _inst(2.0, BS)
+    cp["accn"] = "0000000000-26-000099"
+    g["CommercialPaper"] = _c([cp])
     m = _norm(g)["metrics"]
     assert m["current_debt"]["concept"] == "LongTermDebtCurrent"
     assert m["current_debt"]["uncovered_components"][0]["concept"] == "CommercialPaper"
     assert m["total_debt"]["status"] == "INCOMPLETE"
-    assert m["total_debt"]["reason_code"] == "CURRENT_COMPONENT_NOT_COVERED"
+    assert m["total_debt"]["reason_code"] == "COMPONENT_SUM_FILING_MISMATCH"
     assert m["total_debt"]["unqualified_sum"] == 42.0
 
 
