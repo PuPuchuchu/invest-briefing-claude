@@ -243,6 +243,11 @@ def run_batch(
                 company_type_rows=company_type_rows,
                 raw_companyfacts=raw,
                 membership_rows=membership_rows,
+                **(
+                    {"finance_lease_evidence_rows": finance_lease_evidence_rows}
+                    if finance_lease_evidence_rows is not None
+                    else {}
+                ),
             )
             if finance_lease_evidence_rows is not None:
                 record["total_debt_including_finance_leases"] = _attach_debt_tiers(

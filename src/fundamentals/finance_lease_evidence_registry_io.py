@@ -20,6 +20,7 @@ FINANCE_LEASE_EVIDENCE_FIELDNAMES = [
     "period_end",
     "unit",
     "finance_lease_status",
+    "finance_lease_amount_status",
     "finance_lease_liability_current",
     "finance_lease_liability_noncurrent",
     "finance_lease_liability_total",

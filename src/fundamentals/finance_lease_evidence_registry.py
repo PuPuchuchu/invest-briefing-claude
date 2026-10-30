@@ -55,12 +55,23 @@ BASIS_CAPTION_MAPPING = "LEASE_NOTE_CAPTION_MAPPING_AND_DEBT_RECONCILIATION"
 BASIS_DEBT_TABLE_ROW = "DEBT_TABLE_FINANCE_LEASE_ROW"
 BASIS_NO_FINANCE_LEASE = "NO_FINANCE_LEASE_D1"
 BASIS_INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
+# DEC-049: the issuer's lease note states that finance leases are included
+# in the named debt lines (e.g. LLY Note 10). Supports INCLUDED placements.
+BASIS_NOTE_STATES_INCLUDED = "LEASE_NOTE_STATES_INCLUDED_IN_DEBT_LINES"
 EVIDENCE_BASES = frozenset({
     BASIS_CAPTION_MAPPING,
     BASIS_DEBT_TABLE_ROW,
+    BASIS_NOTE_STATES_INCLUDED,
     BASIS_NO_FINANCE_LEASE,
     BASIS_INSUFFICIENT,
 })
+
+# DEC-049: whether finance-lease amounts are disclosed. Amounts may be blank
+# only as NOT_DISCLOSED_IMMATERIAL with every part INCLUDED, so tier 2 never
+# needs them.
+AMOUNT_DISCLOSED = "DISCLOSED"
+AMOUNT_NOT_DISCLOSED_IMMATERIAL = "NOT_DISCLOSED_IMMATERIAL"
+AMOUNT_STATUSES = frozenset({AMOUNT_DISCLOSED, AMOUNT_NOT_DISCLOSED_IMMATERIAL})
 
 LOOKUP_OK = "OK"
 LOOKUP_NO_EVIDENCE = "NO_EVIDENCE"
@@ -167,15 +178,9 @@ def validate_finance_lease_evidence_row(row: dict) -> list[str]:
     placements = {f: row.get(f) for f in ("current_in_total_debt", "noncurrent_in_total_debt")}
 
     if status == STATUS_PRESENT:
-        parsed = {f: _parse_amount(v) for f, v in amounts.items()}
-        for f, v in parsed.items():
-            if v is None:
-                failures.append(f)
-        if None not in parsed.values() and (
-            parsed["finance_lease_liability_current"] + parsed["finance_lease_liability_noncurrent"]
-            != parsed["finance_lease_liability_total"]
-        ):
-            failures.append("finance_lease_liability_total")
+        amount_status = row.get("finance_lease_amount_status")
+        if amount_status not in AMOUNT_STATUSES:
+            failures.append("finance_lease_amount_status")
         for f, v in placements.items():
             if v not in PLACEMENTS:
                 failures.append(f)
@@ -184,15 +189,35 @@ def validate_finance_lease_evidence_row(row: dict) -> list[str]:
             if placements[part] in (PLACEMENT_INCLUDED, PLACEMENT_EXCLUDED) and not row.get(loc):
                 failures.append(loc)
         placed = set(placements.values())
-        if PLACEMENT_EXCLUDED in placed and row.get("evidence_basis") != BASIS_CAPTION_MAPPING:
-            failures.append("evidence_basis")
-        if placed <= {PLACEMENT_INCLUDED} and row.get("evidence_basis") not in (
-            BASIS_DEBT_TABLE_ROW, BASIS_CAPTION_MAPPING
-        ):
-            failures.append("evidence_basis")
+        if amount_status == AMOUNT_NOT_DISCLOSED_IMMATERIAL:
+            for f, v in amounts.items():
+                if v:
+                    failures.append(f)
+            if placed != {PLACEMENT_INCLUDED}:
+                failures.extend(placements)
+            if row.get("evidence_basis") != BASIS_NOTE_STATES_INCLUDED:
+                failures.append("evidence_basis")
+        else:
+            parsed = {f: _parse_amount(v) for f, v in amounts.items()}
+            for f, v in parsed.items():
+                if v is None:
+                    failures.append(f)
+            if None not in parsed.values() and (
+                parsed["finance_lease_liability_current"] + parsed["finance_lease_liability_noncurrent"]
+                != parsed["finance_lease_liability_total"]
+            ):
+                failures.append("finance_lease_liability_total")
+            if PLACEMENT_EXCLUDED in placed and row.get("evidence_basis") != BASIS_CAPTION_MAPPING:
+                failures.append("evidence_basis")
+            if placed <= {PLACEMENT_INCLUDED} and row.get("evidence_basis") not in (
+                BASIS_DEBT_TABLE_ROW, BASIS_CAPTION_MAPPING, BASIS_NOTE_STATES_INCLUDED
+            ):
+                failures.append("evidence_basis")
     elif status == STATUS_VERIFIED_NONE:
         if row.get("evidence_basis") != BASIS_NO_FINANCE_LEASE:
             failures.append("evidence_basis")
+        if row.get("finance_lease_amount_status"):
+            failures.append("finance_lease_amount_status")
         for f, v in {**amounts, **placements}.items():
             if v:
                 failures.append(f)
@@ -338,6 +363,102 @@ def compute_total_debt_including_finance_leases(
     return result
 
 
+COMBINED_DEBT_CONCEPT = "DebtLongtermAndShorttermCombinedAmount"
+SCOPE_RESOLUTION_DECISION = "DEC-049"
+
+
+def _combined_debt_facts(data: dict, accession: str, period_end: str, unit: str) -> list:
+    concept = (((data or {}).get("facts") or {}).get("us-gaap") or {}).get(COMBINED_DEBT_CONCEPT) or {}
+    return [
+        obs.get("val") for obs in ((concept.get("units") or {}).get(unit) or [])
+        if obs.get("accn") == accession and obs.get("end") == period_end and "start" not in obs
+    ]
+
+
+def resolve_lease_scope_mismatch_with_evidence(
+    total_debt: dict, cik: Any, evaluation_date: Any, evidence_rows: list[dict], data: dict
+) -> dict:
+    """DEC-049: tier-1 scope resolution from filing-specific evidence.
+
+    Applies only to total_debt that is INCOMPLETE with LEASE_SCOPE_MISMATCH.
+    The sum of the two components is accepted as total_debt (lease scope
+    CAPITAL_FINANCE_LEASE_INCLUDED) only when, for the SAME accession,
+    period end and unit:
+      1. a valid, PIT-available evidence row records finance leases as
+         PRESENT with both parts INCLUDED on the basis
+         LEASE_NOTE_STATES_INCLUDED_IN_DEBT_LINES; and
+      2. the filing's DebtLongtermAndShorttermCombinedAmount fact(s) equal
+         the sum exactly.
+    No carry-forward (D3): evidence for one filing never covers another.
+    Without a matching evidence row, total_debt is returned unchanged (the
+    same object). With a row that fails a check, a copy is returned with a
+    ``lease_scope_resolution`` note and the original INCOMPLETE status."""
+    if not isinstance(total_debt, dict) or total_debt.get("status") != "INCOMPLETE" or (
+        total_debt.get("reason_code") != "LEASE_SCOPE_MISMATCH"
+    ):
+        return total_debt
+    components = total_debt.get("components") or {}
+    cur = components.get("current_debt") or {}
+    non = components.get("noncurrent_debt") or {}
+    if any(c.get("status") != "OK" or not isinstance(c.get("value"), (int, float))
+           or isinstance(c.get("value"), bool) for c in (cur, non)):
+        return total_debt
+    keys = {(c.get("accession"), c.get("period_end"), c.get("unit")) for c in (cur, non)}
+    if len(keys) != 1:
+        return total_debt
+    accession, period_end, unit = next(iter(keys))
+    if not (accession and period_end and unit):
+        return total_debt
+    lookup = get_finance_lease_evidence(cik, accession, period_end, unit, evaluation_date, evidence_rows)
+    if lookup["lookup_status"] == LOOKUP_NO_EVIDENCE:
+        return total_debt
+
+    def _not_resolved(why: str) -> dict:
+        kept = dict(total_debt)
+        kept["lease_scope_resolution"] = {
+            "status": "NOT_RESOLVED", "reason": why, "accession": accession,
+            "decision_ref": SCOPE_RESOLUTION_DECISION,
+        }
+        return kept
+
+    if lookup["lookup_status"] != LOOKUP_OK:
+        return _not_resolved(f"Finance-lease evidence lookup: {lookup['lookup_status']}.")
+    row = lookup["row"]
+    if not (
+        row.get("finance_lease_status") == STATUS_PRESENT
+        and row.get("current_in_total_debt") == PLACEMENT_INCLUDED
+        and row.get("noncurrent_in_total_debt") == PLACEMENT_INCLUDED
+        and row.get("evidence_basis") == BASIS_NOTE_STATES_INCLUDED
+    ):
+        return _not_resolved("Evidence does not state that finance leases are included in both debt lines.")
+    total = cur["value"] + non["value"]
+    combined = _combined_debt_facts(data, accession, period_end, unit)
+    if not combined or any(v != total for v in combined):
+        return _not_resolved(
+            f"Same-filing {COMBINED_DEBT_CONCEPT} {combined or 'absent'} does not equal the component sum {total}."
+        )
+    resolved = dict(total_debt)
+    for key in ("reason", "reason_code", "unqualified_sum"):
+        resolved.pop(key, None)
+    resolved.update({
+        "status": "OK",
+        "value": total,
+        "unit": unit,
+        "lease_scope": "CAPITAL_FINANCE_LEASE_INCLUDED",
+        "lease_scope_resolution": {
+            "status": "RESOLVED",
+            "previous_reason_code": "LEASE_SCOPE_MISMATCH",
+            "basis": BASIS_NOTE_STATES_INCLUDED,
+            "accession": accession,
+            "period_end": period_end,
+            "reconciled_to": {"concept": COMBINED_DEBT_CONCEPT, "value": total},
+            "evidence": {"source_urls": row.get("source_urls"), "decision_ref": row.get("decision_ref")},
+            "decision_ref": SCOPE_RESOLUTION_DECISION,
+        },
+    })
+    return resolved
+
+
 def finance_lease_flag_for_total_debt(tier2: dict) -> dict | None:
     """D4: metadata for ``total_debt`` when evidence places finance leases
     outside it. Returns None otherwise. Never changes total_debt's value."""
@@ -367,5 +488,6 @@ __all__ = [
     "validate_finance_lease_evidence_reference_data",
     "get_finance_lease_evidence",
     "compute_total_debt_including_finance_leases",
+    "resolve_lease_scope_mismatch_with_evidence",
     "finance_lease_flag_for_total_debt",
 ]
