@@ -37,7 +37,7 @@ def _row(**over):
     row = {
         "ticker": "MSFT", "cik": "0000789019", "accession": "0001193125-26-323660",
         "form": "10-K", "filing_date": "2026-07-29", "period_end": "2026-06-30", "unit": "USD",
-        "finance_lease_status": "PRESENT",
+        "finance_lease_status": "PRESENT", "finance_lease_amount_status": "DISCLOSED",
         "finance_lease_liability_current": str(4290 * M),
         "finance_lease_liability_noncurrent": str(62304 * M),
         "finance_lease_liability_total": str(66594 * M),
@@ -84,11 +84,12 @@ def test_committed_csv_is_valid_and_has_the_approved_seed_rows():
     rows = read_finance_lease_evidence_csv(CSV)
     report = validate_finance_lease_evidence_reference_data(rows)
     assert report == {"row_failures": {}, "duplicates": []}
-    assert sorted(r["ticker"] for r in rows) == ["AAPL", "GOOGL", "META", "MSFT", "MU"]
+    assert sorted(r["ticker"] for r in rows) == ["AAPL", "GOOGL", "LLY", "LLY", "LLY", "META", "MSFT", "MU"]
     header = CSV.read_text(encoding="utf-8").splitlines()[0].split(",")
     assert header == FINANCE_LEASE_EVIDENCE_FIELDNAMES
     for r in rows:
-        assert r["policy_version"] == "LEASE_TIER2_V1" and r["decision_ref"].startswith("DEC-045")
+        assert r["policy_version"] == "LEASE_TIER2_V1"
+        assert r["decision_ref"].startswith("DEC-049" if r["ticker"] == "LLY" else "DEC-045")
         assert r["form"] == "10-K"  # seeded from 10-K evidence only
         assert r["source_urls"].startswith("https://www.sec.gov/")
 
@@ -126,7 +127,7 @@ def test_bad_placement_value_rejected():
 
 
 def test_verified_none_requires_d1_basis_and_no_amounts():
-    ok = _row(finance_lease_status="VERIFIED_NONE", evidence_basis="NO_FINANCE_LEASE_D1",
+    ok = _row(finance_lease_status="VERIFIED_NONE", evidence_basis="NO_FINANCE_LEASE_D1", finance_lease_amount_status=None,
               finance_lease_liability_current=None, finance_lease_liability_noncurrent=None,
               finance_lease_liability_total=None, current_in_total_debt=None,
               noncurrent_in_total_debt=None, current_location=None, noncurrent_location=None)
@@ -216,7 +217,7 @@ def test_unknown_status_row_is_incomplete():
 
 
 def test_verified_none_equals_tier1():
-    row = _row(finance_lease_status="VERIFIED_NONE", evidence_basis="NO_FINANCE_LEASE_D1",
+    row = _row(finance_lease_status="VERIFIED_NONE", evidence_basis="NO_FINANCE_LEASE_D1", finance_lease_amount_status=None,
                finance_lease_liability_current=None, finance_lease_liability_noncurrent=None,
                finance_lease_liability_total=None, current_in_total_debt=None,
                noncurrent_in_total_debt=None, current_location=None, noncurrent_location=None)

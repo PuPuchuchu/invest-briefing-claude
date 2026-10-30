@@ -212,6 +212,9 @@ from src.fundamentals.company_type_registry import (
 )
 from src.fundamentals.data_sufficiency import classify_growth_data_sufficiency
 from src.fundamentals.derived_metrics import calculate_derived_metrics
+from src.fundamentals.finance_lease_evidence_registry import (
+    resolve_lease_scope_mismatch_with_evidence,
+)
 from src.fundamentals.growth import calculate_growth
 from src.fundamentals.peer_classification import get_peer_mapping_as_of
 from src.fundamentals.point_in_time import (
@@ -496,6 +499,7 @@ def run_fundamentals_pipeline(
     peer_rows: list[dict] | None = None,
     membership_rows: list[dict] | None = None,
     sec_user_agent: str | None = None,
+    finance_lease_evidence_rows: list[dict] | None = None,
 ) -> dict:
     """
     Run the Thin Production Orchestrator's wired execution path for one
@@ -569,6 +573,10 @@ def run_fundamentals_pipeline(
         read from the SEC_USER_AGENT environment variable (see
         src.sec.fetcher.get_user_agent) -- only consulted when
         raw_companyfacts was not provided.
+    finance_lease_evidence_rows : optional, already-loaded
+        data/reference/finance_lease_evidence.csv rows. When given, a
+        total_debt that is INCOMPLETE with LEASE_SCOPE_MISMATCH may be
+        resolved from same-filing evidence (DEC-049). Omitted: unchanged.
 
     Returns
     -------
@@ -720,6 +728,18 @@ def run_fundamentals_pipeline(
     # --------------------------------------------------------
 
     normalized = normalize_company(ticker, gated_companyfacts, company_type)
+    # DEC-049: when finance-lease evidence rows are supplied, a total_debt
+    # that is INCOMPLETE only because of LEASE_SCOPE_MISMATCH may be
+    # resolved from filing-specific evidence (same accession, same-filing
+    # combined-debt reconciliation, no carry-forward). Without rows, or
+    # without a matching row, total_debt is unchanged. Runs before derived
+    # metrics so net_debt / debt_to_cash use the same total_debt.
+    if finance_lease_evidence_rows is not None:
+        metrics = normalized.get("metrics")
+        if isinstance(metrics, dict) and isinstance(metrics.get("total_debt"), dict):
+            metrics["total_debt"] = resolve_lease_scope_mismatch_with_evidence(
+                metrics["total_debt"], cik, eval_date, finance_lease_evidence_rows, gated_companyfacts
+            )
     stages["normalization"] = {
         "status": STAGE_OK,
         "normalized": normalized,
