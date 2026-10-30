@@ -40,6 +40,10 @@ from src.fundamentals.company_type_registry import (
     get_company_type_as_of,
 )
 from src.fundamentals.company_type_registry_io import read_company_type_csv
+from src.fundamentals.finance_lease_evidence_registry import (
+    compute_total_debt_including_finance_leases,
+    finance_lease_flag_for_total_debt,
+)
 from src.fundamentals.universe_membership_io import read_universe_membership_csv
 
 BATCH_SCHEMA_VERSION = "fundamentals_batch.v1"
@@ -126,6 +130,23 @@ def _stage_statuses(result: dict) -> dict:
     }
 
 
+def _attach_debt_tiers(result: dict, cik: str, evaluation_date: Any, evidence_rows: list[dict]) -> dict:
+    """DEC-045: add the tier-2 metric as its own stage and, when evidence
+    places finance leases outside total_debt, the D4 metadata flag on
+    total_debt. total_debt's value and status are never changed. Returns a
+    short summary for the batch record."""
+    stages = result.setdefault("stages", {})
+    normalized = ((stages.get("normalization") or {}).get("normalized") or {})
+    metrics = normalized.get("metrics") if isinstance(normalized, dict) else None
+    total_debt = metrics.get("total_debt") if isinstance(metrics, dict) else None
+    tier2 = compute_total_debt_including_finance_leases(total_debt or {}, cik, evaluation_date, evidence_rows)
+    stages["debt_tiers"] = {"status": STATUS_OK, "total_debt_including_finance_leases": tier2}
+    flag = finance_lease_flag_for_total_debt(tier2)
+    if flag is not None and isinstance(total_debt, dict):
+        total_debt.update(flag)
+    return {key: tier2.get(key) for key in ("status", "value", "reason_code", "finance_lease_added", "accession")}
+
+
 def run_batch(
     *,
     evaluation_date: Any,
@@ -137,6 +158,7 @@ def run_batch(
     output_dir: Path | None = None,
     sleep_seconds: float = 0.0,
     tickers: list[str] | None = None,
+    finance_lease_evidence_rows: list[dict] | None = None,
 ) -> dict:
     """
     Run the pipeline for every WATCHLIST ticker and return a summary dict.
@@ -148,6 +170,11 @@ def run_batch(
     raw_dir: where cached companyfacts are read from and fetched ones saved.
     output_dir: if given, per-ticker result JSON files are written there.
     tickers: optional subset filter (upper-case tickers).
+    finance_lease_evidence_rows: data/reference/finance_lease_evidence.csv
+        rows (DEC-045). When given, each OK result gains a "debt_tiers" stage
+        with total_debt_including_finance_leases, and total_debt gains the D4
+        metadata flag when evidence places finance leases outside it. When
+        None, results are unchanged.
     """
     entries = load_watchlist_entries(membership_rows)
     if tickers:
@@ -217,6 +244,10 @@ def run_batch(
                 raw_companyfacts=raw,
                 membership_rows=membership_rows,
             )
+            if finance_lease_evidence_rows is not None:
+                record["total_debt_including_finance_leases"] = _attach_debt_tiers(
+                    result, cik, evaluation_date, finance_lease_evidence_rows
+                )
             record["status"] = STATUS_OK
             record["stage_statuses"] = _stage_statuses(result)
             record["metrics"] = _metric_summary(result)

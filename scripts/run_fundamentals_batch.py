@@ -27,6 +27,9 @@ from src.fundamentals.batch_runner import (
     load_reference_rows,
     run_batch,
 )
+from src.fundamentals.finance_lease_evidence_registry_io import (
+    read_finance_lease_evidence_csv,
+)
 from src.fundamentals.orchestrator import run_fundamentals_pipeline
 from src.sec.fetcher import fetch_companyfacts, get_user_agent
 
@@ -56,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     company_type_rows, membership_rows = load_reference_rows()
+    finance_lease_evidence_rows = read_finance_lease_evidence_csv()
 
     fetch_fn = None
     if not args.no_fetch:
@@ -76,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=Path(args.output_dir),
         sleep_seconds=SEC_REQUEST_INTERVAL_SECONDS,
         tickers=tickers,
+        finance_lease_evidence_rows=finance_lease_evidence_rows,
     )
 
     print(f"evaluation_date={summary['evaluation_date']} tickers={summary['ticker_count']}")
