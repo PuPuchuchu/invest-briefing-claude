@@ -212,6 +212,10 @@ from src.fundamentals.company_type_registry import (
 )
 from src.fundamentals.data_sufficiency import classify_growth_data_sufficiency
 from src.fundamentals.derived_metrics import calculate_derived_metrics
+from src.fundamentals.metric_eligibility_registry import (
+    apply_metric_eligibility_gate,
+    relabel_withheld_dependents,
+)
 from src.fundamentals.finance_lease_evidence_registry import (
     resolve_lease_scope_mismatch_with_evidence,
 )
@@ -500,6 +504,7 @@ def run_fundamentals_pipeline(
     membership_rows: list[dict] | None = None,
     sec_user_agent: str | None = None,
     finance_lease_evidence_rows: list[dict] | None = None,
+    metric_eligibility_rows: list[dict] | None = None,
 ) -> dict:
     """
     Run the Thin Production Orchestrator's wired execution path for one
@@ -577,6 +582,15 @@ def run_fundamentals_pipeline(
         data/reference/finance_lease_evidence.csv rows. When given, a
         total_debt that is INCOMPLETE with LEASE_SCOPE_MISMATCH may be
         resolved from same-filing evidence (DEC-049). Omitted: unchanged.
+    metric_eligibility_rows : optional, already-loaded
+        data/reference/metric_eligibility.csv rows (DEC-055). When given,
+        governance-WITHHELD metrics are masked right after normalization
+        (status WITHHELD, value None; originals kept in
+        stages['eligibility_gate']['unmasked_originals']) and their
+        dependent derived / growth / data-sufficiency outputs are
+        relabelled WITHHELD. Scoped ELIGIBLE metrics gain eligibility
+        metadata only. Invalid reference data raises ValueError.
+        Omitted: stage SKIPPED, output unchanged.
 
     Returns
     -------
@@ -745,6 +759,20 @@ def run_fundamentals_pipeline(
         "normalized": normalized,
     }
 
+    # DEC-055: runtime metric eligibility gate. Masks governance-WITHHELD
+    # metrics in place (so every later stage, and any consumer reading
+    # stages["normalization"], sees the masked value); the unmasked
+    # originals are kept in the gate record for audit.
+    if metric_eligibility_rows is not None:
+        stages["eligibility_gate"] = apply_metric_eligibility_gate(
+            normalized, cik, eval_date, metric_eligibility_rows
+        )
+    else:
+        stages["eligibility_gate"] = {
+            "status": STAGE_SKIPPED,
+            "reason": "No metric_eligibility_rows provided.",
+        }
+
     # --------------------------------------------------------
     # STAGE: NORMALIZED_DATA_VALIDATION (STEP 14 Finalization Review,
     # 2026-10-26)
@@ -906,6 +934,13 @@ def run_fundamentals_pipeline(
         "status": STAGE_OK,
         "sufficiency": sufficiency,
     }
+
+    # DEC-055 D4: outputs depending on a withheld metric are labelled
+    # WITHHELD rather than MISSING / CONCEPT_NOT_FOUND.
+    if stages["eligibility_gate"].get("status") == STAGE_OK:
+        stages["eligibility_gate"]["relabelled"] = relabel_withheld_dependents(
+            stages["eligibility_gate"]["withheld"], derived, growth_result, sufficiency
+        )
 
     # --------------------------------------------------------
     # STAGE: PEER_GROUP (optional)
