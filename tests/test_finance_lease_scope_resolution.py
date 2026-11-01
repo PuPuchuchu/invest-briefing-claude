@@ -213,7 +213,9 @@ def test_batch_passes_rows_to_pipeline_only_when_given(tmp_path):
         return {"ticker": kwargs["ticker"], "stages": {"normalization": {"status": "OK", "normalized": {
             "metrics": {"total_debt": _mismatch()}}}}}
 
-    members = [{"cik": "0000059478", "ticker": "LLY", "universe_type": "WATCHLIST", "membership_status": "ACTIVE"}]
+    members = [{"cik": "0000059478", "ticker": "LLY", "universe_type": "WATCHLIST", "membership_status": "ACTIVE",
+    # STEP 23-B1: PIT WATCHLIST fields (run_batch selects by PIT membership).
+    "membership_source": "LEGACY_SEED", "membership_version": "1", "effective_from": "2026-09-21", "effective_to": None, "membership_available_date": "2026-09-21"}]
     ct = [{"ticker": "LLY", "cik": "0000059478", "company_type": "NON_FINANCIAL", "effective_from": "2026-09-20",
            "effective_to": None, "classification_available_date": "2026-09-20",
            "mapping_source": "SEC_10K_BUSINESS_MODEL_EVIDENCE", "mapping_rationale": "t",

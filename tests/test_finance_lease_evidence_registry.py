@@ -276,7 +276,9 @@ def _pipeline_with(total_debt):
     return pipeline
 
 
-_MEMBERS = [{"cik": "0000789019", "ticker": "MSFT", "universe_type": "WATCHLIST", "membership_status": "ACTIVE"}]
+_MEMBERS = [{"cik": "0000789019", "ticker": "MSFT", "universe_type": "WATCHLIST", "membership_status": "ACTIVE",
+    # STEP 23-B1: PIT WATCHLIST fields (run_batch selects by PIT membership).
+    "membership_source": "LEGACY_SEED", "membership_version": "1", "effective_from": "2026-09-21", "effective_to": None, "membership_available_date": "2026-09-21"}]
 _CT = [{"ticker": "MSFT", "cik": "0000789019", "company_type": "NON_FINANCIAL", "effective_from": "2026-09-20",
         "effective_to": None, "classification_available_date": "2026-09-20",
         "mapping_source": "SEC_10K_BUSINESS_MODEL_EVIDENCE", "mapping_rationale": "t",

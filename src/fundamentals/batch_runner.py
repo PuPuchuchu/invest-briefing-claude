@@ -45,12 +45,24 @@ from src.fundamentals.finance_lease_evidence_registry import (
     finance_lease_flag_for_total_debt,
 )
 from src.fundamentals.universe_membership_io import read_universe_membership_csv
+from src.fundamentals.universe_membership import (
+    LOOKUP_OK as MEMBERSHIP_LOOKUP_OK,
+    get_universe_membership_as_of,
+)
+from src.fundamentals.batch_coverage import (
+    build_coverage,
+    coverage_headline,
+    render_coverage_markdown,
+)
 
 BATCH_SCHEMA_VERSION = "fundamentals_batch.v1"
 
 STATUS_OK = "OK"
 STATUS_EXCLUDED_COMPANY_TYPE = "EXCLUDED_COMPANY_TYPE"
 STATUS_ERROR = "ERROR"
+# STEP 23-B1: ACTIVE WATCHLIST row exists but the ticker is not a WATCHLIST
+# member as of the evaluation date (PIT). No SEC request, no pipeline run.
+STATUS_EXCLUDED_NOT_IN_WATCHLIST = "EXCLUDED_NOT_IN_WATCHLIST"
 
 DEFAULT_COMPANY_TYPE_CSV = Path("data/reference/company_type.csv")
 DEFAULT_MEMBERSHIP_CSV = Path("data/reference/universe_membership.csv")
@@ -192,8 +204,11 @@ def run_batch(
         When None, results are unchanged.
     """
     entries = load_watchlist_entries(membership_rows)
+    requested_not_in_watchlist: list[str] = []
     if tickers:
         wanted = {t.upper() for t in tickers}
+        known = {e["ticker"] for e in entries}
+        requested_not_in_watchlist = sorted(wanted - known)
         entries = [e for e in entries if e["ticker"] in wanted]
 
     if output_dir is not None:
@@ -204,11 +219,20 @@ def run_batch(
         raw_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
+    results: dict[str, dict] = {}
     fetched_count = 0
 
     for entry in entries:
         ticker, cik = entry["ticker"], entry["cik"]
         record: dict[str, Any] = {"ticker": ticker, "cik": cik}
+
+        # 0. STEP 23-B1: PIT WATCHLIST membership as of the evaluation date.
+        membership = get_universe_membership_as_of(cik, "WATCHLIST", evaluation_date, membership_rows)
+        if membership["lookup_status"] != MEMBERSHIP_LOOKUP_OK:
+            record["status"] = STATUS_EXCLUDED_NOT_IN_WATCHLIST
+            record["watchlist_lookup_status"] = membership["lookup_status"]
+            records.append(record)
+            continue
 
         # 1. Company Type gate first: no SEC request for excluded tickers.
         lookup = get_company_type_as_of(cik, evaluation_date, company_type_rows)
@@ -276,11 +300,12 @@ def run_batch(
             if metric_eligibility_rows is not None:
                 gate = (result.get("stages") or {}).get("eligibility_gate") or {}
                 record["eligibility"] = {
-                    key: gate.get(key) for key in ("status", "withheld", "scoped", "not_yet_available")
+                    key: gate.get(key) for key in ("status", "withheld", "scoped", "not_yet_available", "no_record")
                 }
             record["status"] = STATUS_OK
             record["stage_statuses"] = _stage_statuses(result)
             record["metrics"] = _metric_summary(result)
+            results[ticker] = result
             if output_dir is not None:
                 with (output_dir / f"{ticker}.json").open("w", encoding="utf-8") as f:
                     json.dump(result, f, ensure_ascii=False, indent=2, default=str)
@@ -299,6 +324,18 @@ def run_batch(
         if isinstance(evaluation_date, (date, datetime))
         else str(evaluation_date)
     )
+    coverage = build_coverage(
+        records=records,
+        results=results,
+        evaluation_date=eval_str,
+        inputs={
+            "metric_eligibility_rows_supplied": metric_eligibility_rows is not None,
+            "finance_lease_evidence_rows_supplied": finance_lease_evidence_rows is not None,
+            "tickers_filter": ",".join(sorted({t.upper() for t in tickers})) if tickers else None,
+        },
+        requested_not_in_watchlist=requested_not_in_watchlist,
+        batch_schema_version=BATCH_SCHEMA_VERSION,
+    )
     summary = {
         "schema_version": BATCH_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -309,8 +346,12 @@ def run_batch(
             ELIGIBILITY_NOTE_ENFORCED if metric_eligibility_rows is not None else ELIGIBILITY_NOTE
         ),
         "records": records,
+        "coverage": coverage_headline(coverage),
     }
     if output_dir is not None:
+        with (output_dir / "coverage.json").open("w", encoding="utf-8") as f:
+            json.dump(coverage, f, ensure_ascii=False, indent=2, default=str)
+        (output_dir / "coverage.md").write_text(render_coverage_markdown(coverage), encoding="utf-8")
         with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
         (output_dir / "summary.md").write_text(render_summary_markdown(summary), encoding="utf-8")
@@ -332,6 +373,16 @@ def render_summary_markdown(summary: dict) -> str:
         "",
         f"> {summary['eligibility_note']}",
         "",
+        *(
+            [
+                "Coverage: see coverage.md / coverage.json — PIT WATCHLIST members "
+                f"{summary['coverage']['pit_watchlist_members']}, evaluated "
+                f"{summary['coverage']['evaluated_tickers']}.",
+                "",
+            ]
+            if summary.get("coverage")
+            else []
+        ),
         "| Ticker | Status | " + " | ".join(SUMMARY_METRICS) + " | Note |",
         "|" + "---|" * (len(SUMMARY_METRICS) + 3),
     ]
@@ -346,7 +397,9 @@ def render_summary_markdown(summary: dict) -> str:
                 cells.append(_fmt_value(m.get("value")))
             else:
                 cells.append(str(m.get("status")))
-        if rec["status"] == STATUS_EXCLUDED_COMPANY_TYPE:
+        if rec["status"] == STATUS_EXCLUDED_NOT_IN_WATCHLIST:
+            note = f"WATCHLIST {rec.get('watchlist_lookup_status')}"
+        elif rec["status"] == STATUS_EXCLUDED_COMPANY_TYPE:
             note = f"Company Type {rec.get('company_type_lookup_status')}"
         elif rec["status"] == STATUS_ERROR:
             note = f"{rec.get('error_type')}: {rec.get('error', '')[:80]}"
@@ -371,6 +424,7 @@ __all__ = [
     "STATUS_OK",
     "STATUS_EXCLUDED_COMPANY_TYPE",
     "STATUS_ERROR",
+    "STATUS_EXCLUDED_NOT_IN_WATCHLIST",
     "ELIGIBILITY_NOTE",
     "ELIGIBILITY_NOTE_ENFORCED",
     "load_watchlist_entries",
