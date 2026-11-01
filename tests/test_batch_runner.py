@@ -47,6 +47,14 @@ def _member(ticker, cik, universe_type="WATCHLIST"):
         "ticker": ticker,
         "universe_type": universe_type,
         "membership_status": "ACTIVE",
+        # STEP 23-B1: run_batch() now selects tickers by PIT WATCHLIST
+        # membership, so fixtures carry the PIT fields (mirroring the real
+        # CSV's 2026-09-21 effective/available dates).
+        "membership_source": "LEGACY_SEED",
+        "membership_version": "1",
+        "effective_from": "2026-09-21",
+        "effective_to": None,
+        "membership_available_date": "2026-09-21",
     }
 
 

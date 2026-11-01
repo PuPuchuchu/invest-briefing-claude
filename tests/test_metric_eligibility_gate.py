@@ -351,7 +351,9 @@ def test_batch_runner_forwards_rows_and_reports(tmp_path):
             "normalization": {"normalized": {"metrics": {"cfo": {"status": "WITHHELD", "value": None}}}},
         }}
 
-    members = [{"cik": CIK, "ticker": "TST", "universe_type": "WATCHLIST", "membership_status": "ACTIVE"}]
+    members = [{"cik": CIK, "ticker": "TST", "universe_type": "WATCHLIST", "membership_status": "ACTIVE",
+                "membership_source": "LEGACY_SEED", "membership_version": "1", "effective_from": "2026-09-21",
+                "effective_to": None, "membership_available_date": "2026-09-21"}]
     summary = run_batch(
         evaluation_date="2026-11-05", company_type_rows=CT_ROWS, membership_rows=members,
         pipeline_fn=pipeline, fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw",
@@ -375,7 +377,9 @@ def test_batch_runner_without_rows_keeps_old_note(tmp_path):
         calls.append(kwargs)
         return {"stages": {"normalization": {"normalized": {"metrics": {}}}}}
 
-    members = [{"cik": CIK, "ticker": "TST", "universe_type": "WATCHLIST", "membership_status": "ACTIVE"}]
+    members = [{"cik": CIK, "ticker": "TST", "universe_type": "WATCHLIST", "membership_status": "ACTIVE",
+                "membership_source": "LEGACY_SEED", "membership_version": "1", "effective_from": "2026-09-21",
+                "effective_to": None, "membership_available_date": "2026-09-21"}]
     summary = run_batch(
         evaluation_date="2026-11-05", company_type_rows=CT_ROWS, membership_rows=members,
         pipeline_fn=pipeline, fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw",
