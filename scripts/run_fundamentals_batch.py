@@ -27,6 +27,8 @@ from src.fundamentals.batch_runner import (
     load_reference_rows,
     run_batch,
 )
+from src.fundamentals.metric_eligibility_registry import assert_valid_metric_eligibility_reference_data
+from src.fundamentals.metric_eligibility_registry_io import read_metric_eligibility_csv
 from src.fundamentals.finance_lease_evidence_registry_io import (
     read_finance_lease_evidence_csv,
 )
@@ -60,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
 
     company_type_rows, membership_rows = load_reference_rows()
     finance_lease_evidence_rows = read_finance_lease_evidence_csv()
+    metric_eligibility_rows = read_metric_eligibility_csv()
+    assert_valid_metric_eligibility_reference_data(metric_eligibility_rows)
 
     fetch_fn = None
     if not args.no_fetch:
@@ -81,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         sleep_seconds=SEC_REQUEST_INTERVAL_SECONDS,
         tickers=tickers,
         finance_lease_evidence_rows=finance_lease_evidence_rows,
+        metric_eligibility_rows=metric_eligibility_rows,
     )
 
     print(f"evaluation_date={summary['evaluation_date']} tickers={summary['ticker_count']}")

@@ -72,6 +72,16 @@ ELIGIBILITY_NOTE = (
     "withheld under Decision B-1.D, Decision Log DEC-023) must be applied "
     "by any consumer of these results."
 )
+# DEC-055: used instead of ELIGIBILITY_NOTE when metric_eligibility_rows
+# are supplied.
+ELIGIBILITY_NOTE_ENFORCED = (
+    "Metric eligibility gate applied (DEC-055): metrics withheld in "
+    "data/reference/metric_eligibility.csv are shown as WITHHELD, and "
+    "their dependent outputs are relabelled WITHHELD. Metrics without a "
+    "row are not reviewed by the gate (NO_RECORD). Scoped ELIGIBLE "
+    "metrics (e.g. GE debt: consolidated reported borrowings only) carry "
+    "their use_scope in the per-ticker results."
+)
 
 
 def load_watchlist_entries(membership_rows: list[dict]) -> list[dict]:
@@ -159,6 +169,7 @@ def run_batch(
     sleep_seconds: float = 0.0,
     tickers: list[str] | None = None,
     finance_lease_evidence_rows: list[dict] | None = None,
+    metric_eligibility_rows: list[dict] | None = None,
 ) -> dict:
     """
     Run the pipeline for every WATCHLIST ticker and return a summary dict.
@@ -175,6 +186,10 @@ def run_batch(
         with total_debt_including_finance_leases, and total_debt gains the D4
         metadata flag when evidence places finance leases outside it. When
         None, results are unchanged.
+    metric_eligibility_rows: data/reference/metric_eligibility.csv rows
+        (DEC-055). When given, they are forwarded to pipeline_fn and each OK
+        record gains an "eligibility" summary (withheld / scoped metrics).
+        When None, results are unchanged.
     """
     entries = load_watchlist_entries(membership_rows)
     if tickers:
@@ -248,11 +263,21 @@ def run_batch(
                     if finance_lease_evidence_rows is not None
                     else {}
                 ),
+                **(
+                    {"metric_eligibility_rows": metric_eligibility_rows}
+                    if metric_eligibility_rows is not None
+                    else {}
+                ),
             )
             if finance_lease_evidence_rows is not None:
                 record["total_debt_including_finance_leases"] = _attach_debt_tiers(
                     result, cik, evaluation_date, finance_lease_evidence_rows
                 )
+            if metric_eligibility_rows is not None:
+                gate = (result.get("stages") or {}).get("eligibility_gate") or {}
+                record["eligibility"] = {
+                    key: gate.get(key) for key in ("status", "withheld", "scoped", "not_yet_available")
+                }
             record["status"] = STATUS_OK
             record["stage_statuses"] = _stage_statuses(result)
             record["metrics"] = _metric_summary(result)
@@ -280,7 +305,9 @@ def run_batch(
         "evaluation_date": eval_str,
         "ticker_count": len(records),
         "status_counts": counts,
-        "eligibility_note": ELIGIBILITY_NOTE,
+        "eligibility_note": (
+            ELIGIBILITY_NOTE_ENFORCED if metric_eligibility_rows is not None else ELIGIBILITY_NOTE
+        ),
         "records": records,
     }
     if output_dir is not None:
@@ -345,6 +372,7 @@ __all__ = [
     "STATUS_EXCLUDED_COMPANY_TYPE",
     "STATUS_ERROR",
     "ELIGIBILITY_NOTE",
+    "ELIGIBILITY_NOTE_ENFORCED",
     "load_watchlist_entries",
     "run_batch",
     "render_summary_markdown",
