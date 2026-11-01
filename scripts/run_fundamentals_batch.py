@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from src.fundamentals.batch_runner import (
@@ -38,13 +39,41 @@ from src.sec.fetcher import fetch_companyfacts, get_user_agent
 # SEC fair-access guidance: stay well under 10 requests/second.
 SEC_REQUEST_INTERVAL_SECONDS = 0.25
 
+# STEP 23-B0: the default evaluation date is today's date in Korea (KST).
+# PIT availability dates in the reference data (e.g. DEC-020's next-
+# calendar-day KST convention) are KST calendar days; the previous UTC
+# default lagged by up to 9 hours. An explicit --evaluation-date always
+# wins and is passed through unchanged.
+EVALUATION_DATE_TIMEZONE = ZoneInfo("Asia/Seoul")
 
-def main(argv: list[str] | None = None) -> int:
+
+def default_evaluation_date(now: datetime | None = None) -> str:
+    """Today's date in Asia/Seoul as YYYY-MM-DD.
+
+    now: an aware datetime (any zone) for reproducible tests; defaults to
+    the current instant. A naive datetime is rejected so the result never
+    depends on the machine's local time zone.
+    """
+    if now is None:
+        now = datetime.now(EVALUATION_DATE_TIMEZONE)
+    elif now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    return now.astimezone(EVALUATION_DATE_TIMEZONE).date().isoformat()
+
+
+def resolve_evaluation_date(explicit: str | None, now: datetime | None = None) -> str:
+    """The explicit --evaluation-date if given (unchanged), else the KST default."""
+    if explicit:
+        return explicit
+    return default_evaluation_date(now)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--evaluation-date",
-        default=datetime.now(timezone.utc).date().isoformat(),
-        help="ISO date (default: today, UTC).",
+        default=None,
+        help="ISO date (default: today in Asia/Seoul, KST).",
     )
     parser.add_argument("--output-dir", default="out/fundamentals_batch")
     parser.add_argument("--raw-dir", default="data/raw/sec")
@@ -58,7 +87,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use cached companyfacts only; never call SEC.",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    evaluation_date = resolve_evaluation_date(args.evaluation_date)
 
     company_type_rows, membership_rows = load_reference_rows()
     finance_lease_evidence_rows = read_finance_lease_evidence_csv()
@@ -75,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()] or None
 
     summary = run_batch(
-        evaluation_date=args.evaluation_date,
+        evaluation_date=evaluation_date,
         company_type_rows=company_type_rows,
         membership_rows=membership_rows,
         pipeline_fn=run_fundamentals_pipeline,

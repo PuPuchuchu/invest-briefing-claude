@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       evaluation_date:
-        description: "Evaluation date (YYYY-MM-DD). Empty = today (UTC)."
+        description: "Evaluation date (YYYY-MM-DD). Empty = today (Asia/Seoul, KST)."
         required: false
         default: ""
       tickers:
