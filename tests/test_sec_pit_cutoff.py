@@ -284,7 +284,7 @@ def test_t10_one_byte_change_changes_hashes_and_is_detected(tmp_path):
     assert sec_snapshot.snapshot_content_sha256(m1) != sec_snapshot.snapshot_content_sha256(m2)
     assert sec_snapshot.manifest_sha256(m1) != sec_snapshot.manifest_sha256(m2)
     v = sec_snapshot.verify_manifest(m1, raw)
-    assert v["status"] == sec_snapshot.VERIFY_FAIL and v["mismatched"] == ["CUT_companyfacts.json"]
+    assert v["status"] == sec_snapshot.VERIFY_FAIL and v["mismatched_files"] == ["CUT_companyfacts.json"]
 
 
 @pytest.mark.parametrize("ev, expected", [
@@ -462,7 +462,7 @@ def test_manifest_verification_fails_closed(tmp_path, monkeypatch):
     empty = tmp_path / "artifact_empty"
     empty.mkdir()
     v = sec_snapshot.verify_manifest(manifest, empty)
-    assert v["status"] == "FAIL" and v["missing"] == ["CUT_companyfacts.json"]
+    assert v["status"] == "FAIL" and v["missing_files"] == ["CUT_companyfacts.json"]
     none = sec_snapshot.build_manifest([])
     assert none["status"] == "NO_SEC_INPUTS"
     assert sec_snapshot.verify_manifest(none, empty)["status"] == "NO_SEC_INPUTS"  # never OK

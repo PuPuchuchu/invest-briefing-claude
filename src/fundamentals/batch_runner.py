@@ -251,6 +251,57 @@ def _sec_cutoff_consistency(results: dict[str, dict], expected: str) -> dict:
     return {"status": status, "expected": expected, "mismatched_tickers": mismatched}
 
 
+def _self_verify_snapshot(manifest: dict, raw_dir: Path | None, output_dir: Path | None) -> dict:
+    """C2: verify the snapshot at the end of the run, before results are
+    published. The expected hashes are computed in memory from the manifest
+    the run built; the manifest file is written, read back from disk and
+    checked against them (never against a hash stored inside itself), then
+    every listed SEC input file in raw_dir is checked."""
+    expected_manifest = sec_snapshot.manifest_sha256(manifest)
+    expected_content = sec_snapshot.snapshot_content_sha256(manifest)
+    file_errors: list[str] = []
+    to_verify: Any = manifest
+    manifest_file_status = "NOT_WRITTEN"  # no output_dir: in-memory manifest is verified
+    if output_dir is not None:
+        path = sec_snapshot.write_manifest(manifest, output_dir)
+        try:
+            stored = path.read_bytes()
+            to_verify = json.loads(stored.decode("utf-8"))
+            if sec_snapshot.sha256_bytes(stored) != expected_manifest:
+                file_errors.append("stored manifest file bytes do not match the expected manifest_sha256")
+            manifest_file_status = "WRITTEN_AND_REREAD"
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            file_errors.append(f"stored manifest could not be re-read: {type(exc).__name__}: {exc}")
+            to_verify = None
+            manifest_file_status = "UNREADABLE"
+    if raw_dir is None:
+        result = sec_snapshot.verify_manifest_with_reader(
+            to_verify, lambda p: None,
+            expected_manifest_sha256=expected_manifest, expected_snapshot_content_sha256=expected_content,
+        )
+    else:
+        result = sec_snapshot.verify_manifest(
+            to_verify, raw_dir,
+            expected_manifest_sha256=expected_manifest, expected_snapshot_content_sha256=expected_content,
+        )
+    if file_errors:
+        result["status"] = sec_snapshot.VERIFY_FAIL
+        result["validation_errors"] = file_errors + list(result.get("validation_errors") or [])
+        result["reason"] = "integrity check failed"
+    return {
+        "verification_status": result["status"],
+        "manifest_file_status": manifest_file_status,
+        "reason": result.get("reason"),
+        "expected_manifest_sha256": expected_manifest,
+        "actual_manifest_sha256": result.get("actual_manifest_sha256"),
+        "expected_snapshot_content_sha256": expected_content,
+        "actual_snapshot_content_sha256": result.get("actual_snapshot_content_sha256"),
+        "missing_files": result.get("missing_files") or [],
+        "mismatched_files": result.get("mismatched_files") or [],
+        "validation_errors": result.get("validation_errors") or [],
+    }
+
+
 def _reproducibility_block(
     *,
     eval_date: date,
@@ -258,6 +309,7 @@ def _reproducibility_block(
     expected_sec_cutoff: str,
     results: dict[str, dict],
     manifest: dict,
+    self_verification: dict,
     metric_eligibility_rows: list[dict] | None,
     run_metadata: dict | None,
 ) -> dict:
@@ -273,6 +325,12 @@ def _reproducibility_block(
     if consistency["status"] == "MISMATCH":
         reasons.append({"level": OPERATIONAL_FAIL, "code": "SEC_CUTOFF_MISMATCH",
                         "detail": f"Tickers gated to a different SEC cutoff: {consistency['mismatched_tickers']}"})
+    vstatus = self_verification["verification_status"]
+    if vstatus == sec_snapshot.VERIFY_FAIL:
+        reasons.append({"level": OPERATIONAL_FAIL, "code": "SNAPSHOT_VERIFICATION_FAILED",
+                        "detail": f"{self_verification.get('reason')}: missing={self_verification['missing_files']} "
+                                  f"mismatched={self_verification['mismatched_files']} "
+                                  f"errors={self_verification['validation_errors'][:5]}"})
     if manifest["status"] == sec_snapshot.SNAPSHOT_INCOMPLETE:
         reasons.append({"level": OPERATIONAL_REVIEW, "code": "SNAPSHOT_INCOMPLETE",
                         "detail": "SEC inputs used without a stored file (no raw_dir)."})
@@ -304,6 +362,9 @@ def _reproducibility_block(
             "snapshot_content_sha256": sec_snapshot.snapshot_content_sha256(manifest),
             "manifest_sha256": sec_snapshot.manifest_sha256(manifest),
             "inputs_without_stored_file": manifest["inputs_without_stored_file"],
+            # C2: end-of-run verification (OK / FAIL / NO_SEC_INPUTS / NOT_VERIFIABLE).
+            # Only OK is a pass; FAIL makes the operational review FAIL.
+            "self_verification": self_verification,
         },
         "provenance": provenance,
         "operational_review": {"status": status, "reasons": reasons},
@@ -520,12 +581,14 @@ def run_batch(
         batch_schema_version=BATCH_SCHEMA_VERSION,
     )
     manifest = sec_snapshot.build_manifest(snapshot_entries, missing_stored_inputs=inputs_without_stored_file)
+    self_verification = _self_verify_snapshot(manifest, raw_dir, output_dir)
     reproducibility = _reproducibility_block(
         eval_date=eval_date_obj,
         started=started,
         expected_sec_cutoff=expected_sec_cutoff,
         results=results,
         manifest=manifest,
+        self_verification=self_verification,
         metric_eligibility_rows=metric_eligibility_rows,
         run_metadata=run_metadata,
     )
@@ -545,7 +608,6 @@ def run_batch(
         "reproducibility": reproducibility,
     }
     if output_dir is not None:
-        sec_snapshot.write_manifest(manifest, output_dir)
         with (output_dir / "coverage.json").open("w", encoding="utf-8") as f:
             json.dump(coverage, f, ensure_ascii=False, indent=2, default=str)
         (output_dir / "coverage.md").write_text(render_coverage_markdown(coverage), encoding="utf-8")
@@ -575,7 +637,8 @@ def _reproducibility_markdown(summary: dict) -> list[str]:
         f"run timing {rep.get('run_timing_status')} (started {rep.get('run_started_at_kst')}).",
         "",
         f"SEC snapshot: {snap.get('status')}, {snap.get('file_count')} file(s), "
-        f"content sha256 {snap.get('snapshot_content_sha256')}, manifest {snap.get('manifest_file')}.",
+        f"content sha256 {snap.get('snapshot_content_sha256')}, manifest {snap.get('manifest_file')}; "
+        f"self-verification {(snap.get('self_verification') or {}).get('verification_status')}.",
         "",
     ]
     if prov:
@@ -646,6 +709,9 @@ def load_reference_rows(
 __all__ = [
     "BATCH_SCHEMA_VERSION",
     "FutureEvaluationDateError",
+    "OPERATIONAL_PASS",
+    "OPERATIONAL_REVIEW",
+    "OPERATIONAL_FAIL",
     "check_evaluation_date_not_future",
     "run_timing_status",
     "STATUS_OK",

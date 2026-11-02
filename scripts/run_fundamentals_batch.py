@@ -10,9 +10,18 @@ Usage (from the repository root, with PYTHONPATH set to it):
 
 Writes per-ticker result JSON, summary.json and summary.md to --output-dir.
 Cached companyfacts in --raw-dir are reused; missing ones are fetched from
-SEC EDGAR (requires SEC_USER_AGENT). Exits 1 if any ticker ended in ERROR,
-so a CI run surfaces failures; EXCLUDED_COMPANY_TYPE is expected and does
-not fail the run.
+SEC EDGAR (requires SEC_USER_AGENT).
+
+Exit codes (STEP 23 SEC PIT):
+  0  completed; the operational review may still be REVIEW (e.g. early run,
+     unverified commit SHA) -- see summary.json "operational_review".
+  1  completed, at least one ticker ended in ERROR (EXCLUDED_COMPANY_TYPE is
+     expected and does not count).
+  2  refused before any SEC request (evaluation date after today's KST date).
+  3  completed, operational review FAIL (SEC snapshot integrity verification
+     failed, or tickers were gated to different SEC cutoffs). Takes
+     precedence over 1. Results and raw files are still written so the
+     failure can be inspected; they must not be used as a valid baseline.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from pathlib import Path
 from src.fundamentals.batch_runner import (
     DEFAULT_COMPANY_TYPE_CSV,
     DEFAULT_MEMBERSHIP_CSV,
+    OPERATIONAL_FAIL,
     STATUS_ERROR,
     FutureEvaluationDateError,
     check_evaluation_date_not_future,
@@ -45,6 +55,11 @@ from src.fundamentals.finance_lease_evidence_registry_io import (
 from src.fundamentals.metric_eligibility_registry_io import DEFAULT_METRIC_ELIGIBILITY_CSV
 from src.fundamentals.orchestrator import run_fundamentals_pipeline
 from src.sec.fetcher import fetch_companyfacts, get_user_agent
+
+EXIT_OK = 0
+EXIT_TICKER_ERROR = 1
+EXIT_FUTURE_DATE_REFUSED = 2
+EXIT_OPERATIONAL_FAIL = 3
 
 # SEC fair-access guidance: stay well under 10 requests/second.
 SEC_REQUEST_INTERVAL_SECONDS = 0.25
@@ -173,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         check_evaluation_date_not_future(evaluation_date, run_started_at)
     except FutureEvaluationDateError as exc:
         print(f"Refused before any SEC request: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_FUTURE_DATE_REFUSED
 
     company_type_rows, membership_rows = load_reference_rows()
     finance_lease_evidence_rows = read_finance_lease_evidence_csv()
@@ -215,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
         extra = rec.get("error") or rec.get("company_type_lookup_status") or ""
         print(f"  {rec['ticker']:6s} {rec['status']:22s} {extra}")
 
-    return 1 if summary["status_counts"].get(STATUS_ERROR) else 0
+    if (summary.get("operational_review") or {}).get("status") == OPERATIONAL_FAIL:
+        return EXIT_OPERATIONAL_FAIL
+    return EXIT_TICKER_ERROR if summary["status_counts"].get(STATUS_ERROR) else EXIT_OK
 
 
 if __name__ == "__main__":

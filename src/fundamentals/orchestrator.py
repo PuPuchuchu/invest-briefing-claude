@@ -161,13 +161,15 @@ date, candidate priority) -- see find_best_instant_concept()'s
 docstring. That ranking function reads `data["facts"]` directly and has
 no evaluation_date parameter at all; it is NOT point-in-time-aware by
 itself. If it were run on raw, ungated data, it could legitimately
-select an observation that was not yet public as of evaluation_date --
+select an observation that was not yet usable as of evaluation_date --
 a look-ahead-bias violation. So this orchestrator gates the ENTIRE
 companyfacts document FIRST (point_in_time.gate_companyfacts_as_of()),
 and only then calls normalize_company() on the gated snapshot --
 normalize_company()'s own already-approved selection logic then runs
 correctly and safely, unmodified, because every observation it can
-possibly see was already filtered to filed <= evaluation_date.
+possibly see was already filtered to filed <= sec_filed_cutoff_date
+(= evaluation_date - 1 calendar day; STEP 23 SEC PIT, see
+sec_filed_cutoff_for() below).
 
 STEP 14 update (2026-10-26) -- Company Type is now a validated,
 registry-backed lookup, not a bare caller-supplied value
@@ -401,10 +403,12 @@ def _pit_annual_history_for_selected_concept(
 
     # gated_data is already PIT-gated (see gate_companyfacts_as_of()
     # above in the caller), so calling get_point_in_time_history() again
-    # here gates a second time -- harmless (gating an already-gated set
-    # to the same evaluation_date is idempotent: every observation that
-    # remains already satisfies filed <= evaluation_date, so the second
-    # pass removes nothing further) and keeps this call symmetric with
+    # here gates a second time -- harmless (the caller passes the SAME
+    # SEC cutoff it gated with -- `evaluation_date` here is the
+    # sec_filed_cutoff_date, i.e. the pipeline's evaluation_date - 1
+    # calendar day -- and gating an already-gated set to the same date is
+    # idempotent: every observation that remains already satisfies
+    # filed <= that cutoff, so the second pass removes nothing further) and keeps this call symmetric with
     # every other point_in_time.py entry point in this codebase, which
     # all expect to receive raw, ungated data and do their own gating.
     history = get_point_in_time_history(
@@ -467,7 +471,8 @@ def _pit_history_for_selected_concept(
 
     # Idempotent re-gate -- see _pit_annual_history_for_selected_concept()
     # above for why calling get_point_in_time_history() again here on
-    # already-gated data is harmless.
+    # already-gated data is harmless. As there, `evaluation_date` here is
+    # the caller's SEC cutoff (evaluation_date - 1 calendar day).
     return get_point_in_time_history(
         gated_data,
         namespace,
@@ -549,10 +554,14 @@ def run_fundamentals_pipeline(
     ticker, cik : the target company. cik is the authoritative key used
         for every downstream lookup (see src/sec/identity.py's module
         docstring on why CIK, never ticker, is the identity key).
-    evaluation_date : the point-in-time cutoff. Coerced via
-        point_in_time.coerce_evaluation_date() -- raises ValueError on
-        an unparseable value, matching every other point-in-time entry
-        point in this codebase (fail closed, never silently unbounded).
+    evaluation_date : the run's evaluation date (a KST calendar day).
+        Coerced via point_in_time.coerce_evaluation_date() -- raises
+        ValueError on an unparseable value (fail closed, never silently
+        unbounded). Company Type, metric eligibility, finance-lease
+        evidence availability, peer mapping and universe membership use
+        it directly; SEC companyfacts are gated to
+        sec_filed_cutoff_for(evaluation_date) = evaluation_date - 1
+        calendar day (filed <= that cutoff), computed once here.
     company_type : "NON_FINANCIAL" or "FINANCIAL", passed straight
         through to sec_normalizer.normalize_company(). As of the STEP 14
         Company Type Source of Truth round (2026-10-26), this
