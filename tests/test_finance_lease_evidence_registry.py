@@ -285,11 +285,19 @@ _CT = [{"ticker": "MSFT", "cik": "0000789019", "company_type": "NON_FINANCIAL", 
         "reviewed_at_utc": "2026-10-26T00:00:00Z", "decision_ref": "t"}]
 
 
+
+# STEP 23 SEC PIT: run_batch refuses evaluation dates after the run's KST date;
+# a fixed run start keeps these fixed-date tests independent of the real clock.
+from datetime import datetime as _datetime, timezone as _timezone  # noqa: E402
+
+_RUN_AT = _datetime(2026, 12, 1, tzinfo=_timezone.utc)
+
+
 def test_batch_adds_debt_tiers_and_flag_without_changing_total_debt(tmp_path):
     summary = run_batch(evaluation_date=EVAL, company_type_rows=_CT, membership_rows=_MEMBERS,
                         pipeline_fn=_pipeline_with(MSFT_TOTAL), fetch_fn=lambda t, c: {},
                         raw_dir=tmp_path / "raw", output_dir=tmp_path / "out",
-                        finance_lease_evidence_rows=[_row()])
+                        finance_lease_evidence_rows=[_row()], run_started_at=_RUN_AT)
     rec = summary["records"][0]
     assert rec["status"] == STATUS_OK
     assert rec["total_debt_including_finance_leases"]["value"] == (40294 + 66594) * M
@@ -305,7 +313,7 @@ def test_batch_adds_debt_tiers_and_flag_without_changing_total_debt(tmp_path):
 def test_batch_without_evidence_rows_is_unchanged(tmp_path):
     summary = run_batch(evaluation_date=EVAL, company_type_rows=_CT, membership_rows=_MEMBERS,
                         pipeline_fn=_pipeline_with(MSFT_TOTAL), fetch_fn=lambda t, c: {},
-                        raw_dir=tmp_path / "raw", output_dir=None)
+                        raw_dir=tmp_path / "raw", output_dir=None, run_started_at=_RUN_AT)
     rec = summary["records"][0]
     assert "total_debt_including_finance_leases" not in rec
     assert "debt_tiers" not in rec["stage_statuses"]

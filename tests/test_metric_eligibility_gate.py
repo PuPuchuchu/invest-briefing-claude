@@ -339,6 +339,12 @@ def test_orchestrator_invalid_rows_raise():
 # Batch runner forwarding
 # ------------------------------------------------------------------
 
+# STEP 23 SEC PIT: run_batch refuses evaluation dates after the run's KST date;
+# a fixed run start keeps these fixed-date tests independent of the real clock.
+from datetime import datetime as _datetime, timezone as _timezone  # noqa: E402
+
+_RUN_AT = _datetime(2026, 12, 1, tzinfo=_timezone.utc)
+
 def test_batch_runner_forwards_rows_and_reports(tmp_path):
     from src.fundamentals.batch_runner import ELIGIBILITY_NOTE, ELIGIBILITY_NOTE_ENFORCED, run_batch
 
@@ -357,7 +363,7 @@ def test_batch_runner_forwards_rows_and_reports(tmp_path):
     summary = run_batch(
         evaluation_date="2026-11-05", company_type_rows=CT_ROWS, membership_rows=members,
         pipeline_fn=pipeline, fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw",
-        output_dir=tmp_path / "out", metric_eligibility_rows=ROWS,
+        output_dir=tmp_path / "out", metric_eligibility_rows=ROWS, run_started_at=_RUN_AT,
     )
     rec = summary["records"][0]
     assert seen.get("metric_eligibility_rows") is ROWS
@@ -382,7 +388,7 @@ def test_batch_runner_without_rows_keeps_old_note(tmp_path):
                 "effective_to": None, "membership_available_date": "2026-09-21"}]
     summary = run_batch(
         evaluation_date="2026-11-05", company_type_rows=CT_ROWS, membership_rows=members,
-        pipeline_fn=pipeline, fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw",
+        pipeline_fn=pipeline, fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw", run_started_at=_RUN_AT,
     )
     assert "metric_eligibility_rows" not in calls[0]
     assert "eligibility" not in summary["records"][0]
