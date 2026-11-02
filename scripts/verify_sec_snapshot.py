@@ -35,6 +35,7 @@ import json
 import stat
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -46,6 +47,17 @@ EXIT_FAIL = 1
 EXIT_USAGE = 2
 
 SUMMARY_FILENAME = "summary.json"
+# Only a snapshot that the run itself wrote, re-read and verified can pass.
+REQUIRED_SNAPSHOT_STATUS = "OK"
+REQUIRED_SELF_VERIFICATION_STATUS = "OK"
+REQUIRED_MANIFEST_FILE_STATUS = "WRITTEN_AND_REREAD"
+
+# Errors raised while reading ZIP data (corrupt archive, corrupt compressed
+# stream, CRC failure, truncated data, unsupported compression). Converted to
+# OSError so callers report them as FAIL; KeyboardInterrupt/SystemExit are
+# never caught.
+_ZIP_READ_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError, OSError, RuntimeError, NotImplementedError,
+                    ValueError)
 
 
 class InputError(Exception):
@@ -71,7 +83,7 @@ class Archive:
         try:
             zf = zipfile.ZipFile(p)
             infos = zf.infolist()
-        except (zipfile.BadZipFile, OSError) as exc:
+        except _ZIP_READ_ERRORS as exc:
             raise InputError(f"{label} could not be opened: {exc}") from exc
         names: dict[str, zipfile.ZipInfo] = {}
         for info in infos:
@@ -101,8 +113,8 @@ class Archive:
             return None
         try:
             return self._zip.read(info)
-        except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
-            raise OSError(f"{self.label}: cannot read {rel!r}: {exc}") from exc
+        except _ZIP_READ_ERRORS as exc:
+            raise OSError(f"{self.label}: cannot read {rel!r}: {type(exc).__name__}: {exc}") from exc
 
     def names(self) -> list[str]:
         if self._dir is not None:
@@ -136,23 +148,43 @@ def verify(results_path: str, raw_path: str) -> dict:
         return out
     try:
         summary = json.loads(summary_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         reasons.append(f"summary.json is not valid JSON: {exc}")
         return out
-    sec = ((summary or {}).get("reproducibility") or {}).get("sec_snapshot") if isinstance(summary, dict) else None
+    if not isinstance(summary, dict):
+        reasons.append("summary.json is not a JSON object")
+        return out
+    repro = summary.get("reproducibility")
+    if not isinstance(repro, dict):
+        reasons.append("summary.json reproducibility is missing or not an object (pre-STEP-23 or damaged results)")
+        return out
+    sec = repro.get("sec_snapshot")
     if not isinstance(sec, dict):
-        reasons.append("summary.json has no reproducibility.sec_snapshot (pre-STEP-23 or damaged results)")
+        reasons.append("summary.json reproducibility.sec_snapshot is missing or not an object")
         return out
     expected_manifest = sec.get("manifest_sha256")
     expected_content = sec.get("snapshot_content_sha256")
     if not _is_sha256(expected_manifest) or not _is_sha256(expected_content):
         reasons.append("summary.json lacks a valid expected manifest_sha256 / snapshot_content_sha256")
         return out
+    # R1: the recorded run-time state must be the one fully verified state;
+    # a value that is merely present is not enough.
     out["summary_snapshot_status"] = sec.get("status")
-    self_v = (sec.get("self_verification") or {}).get("verification_status")
-    out["summary_self_verification"] = self_v
-    if self_v != snap.VERIFY_OK:
-        reasons.append(f"run-time self-verification recorded in summary.json is {self_v!r}, not OK")
+    if "status" not in sec:
+        reasons.append("summary.json sec_snapshot.status is missing")
+    elif sec.get("status") != REQUIRED_SNAPSHOT_STATUS:
+        reasons.append(f"summary.json sec_snapshot.status is {sec.get('status')!r}, not {REQUIRED_SNAPSHOT_STATUS!r}")
+    sv = sec.get("self_verification")
+    if not isinstance(sv, dict):
+        reasons.append("summary.json sec_snapshot.self_verification is missing or not an object")
+    else:
+        out["summary_self_verification"] = sv.get("verification_status")
+        if sv.get("verification_status") != REQUIRED_SELF_VERIFICATION_STATUS:
+            reasons.append(f"run-time self-verification recorded in summary.json is "
+                           f"{sv.get('verification_status')!r}, not {REQUIRED_SELF_VERIFICATION_STATUS!r}")
+        if sv.get("manifest_file_status") != REQUIRED_MANIFEST_FILE_STATUS:
+            reasons.append(f"run-time manifest_file_status is {sv.get('manifest_file_status')!r}, "
+                           f"not {REQUIRED_MANIFEST_FILE_STATUS!r}")
 
     manifest_name = sec.get("manifest_file")
     if snap.check_relative_path(manifest_name) or manifest_name != snap.MANIFEST_FILENAME:
@@ -168,12 +200,14 @@ def verify(results_path: str, raw_path: str) -> dict:
         return out
     try:
         manifest = json.loads(manifest_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         reasons.append(f"manifest is not valid JSON: {exc}")
         return out
     if snap.sha256_bytes(manifest_bytes) != expected_manifest:
         reasons.append("manifest file SHA-256 does not match summary.json manifest_sha256")
-    if isinstance(manifest, dict) and sec.get("file_count") != manifest.get("file_count"):
+    if not isinstance(manifest, dict):
+        reasons.append("manifest is not a JSON object")
+    elif sec.get("file_count") != manifest.get("file_count"):
         reasons.append("summary.json file_count does not match the manifest")
 
     res = snap.verify_manifest_with_reader(
@@ -190,7 +224,8 @@ def verify(results_path: str, raw_path: str) -> dict:
         if res.get("mismatched_files"):
             reasons.append(f"raw files with different size/SHA-256: {res['mismatched_files']}")
 
-    listed = {f.get("path") for f in (manifest.get("files") or []) if isinstance(f, dict)} if isinstance(manifest, dict) else set()
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    listed = {f.get("path") for f in files if isinstance(f, dict)} if isinstance(files, list) else set()
     unlisted = [n for n in raw.names() if n not in listed]
     if unlisted:
         info.append(f"raw files not listed in the manifest (not pipeline inputs, not a failure): {unlisted}")

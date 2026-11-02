@@ -633,3 +633,192 @@ def test_c3_summary_recording_failed_self_verification_fails(artifacts):
 
 def test_c3_usage_error_exit_code():
     assert _verifier().main([]) == 2
+
+
+# ================================================================== R1-R4 (final review)
+
+def _mutate_summary(tmp, name, fn):
+    def mutate(d):
+        s = json.loads((d / "summary.json").read_text())
+        fn(s)
+        (d / "summary.json").write_text(json.dumps(s))
+    return _rezip_results(tmp, name, mutate)
+
+
+# ------------------------------------------------------------------ R1: recorded run-time state
+
+@pytest.mark.parametrize("change, expected_reason", [
+    (lambda s: s["reproducibility"]["sec_snapshot"].update(status="INCOMPLETE"), "sec_snapshot.status is 'INCOMPLETE'"),
+    (lambda s: s["reproducibility"]["sec_snapshot"].update(status="NO_SEC_INPUTS"), "sec_snapshot.status is 'NO_SEC_INPUTS'"),
+    (lambda s: s["reproducibility"]["sec_snapshot"].pop("status"), "sec_snapshot.status is missing"),
+    (lambda s: s["reproducibility"]["sec_snapshot"].pop("self_verification"), "self_verification is missing or not an object"),
+    (lambda s: s["reproducibility"]["sec_snapshot"].update(self_verification=["OK"]), "self_verification is missing or not an object"),
+    (lambda s: s["reproducibility"]["sec_snapshot"].update(self_verification="OK"), "self_verification is missing or not an object"),
+    (lambda s: s["reproducibility"]["sec_snapshot"]["self_verification"].update(manifest_file_status="NOT_WRITTEN"),
+     "manifest_file_status is 'NOT_WRITTEN'"),
+    (lambda s: s["reproducibility"]["sec_snapshot"]["self_verification"].update(verification_status="NOT_VERIFIABLE"),
+     "self-verification recorded in summary.json is 'NOT_VERIFIABLE'"),
+])
+def test_r1_summary_snapshot_state_must_be_fully_verified(artifacts, change, expected_reason):
+    tmp, _, raw = artifacts
+    out, _ = _c3(_mutate_summary(tmp, "r1.zip", change), raw)
+    assert out["result"] == "FAIL"
+    assert any(expected_reason in r for r in out["reasons"]), out["reasons"]
+
+
+# ------------------------------------------------------------------ R2: malformed input is FAIL, not an exception
+
+@pytest.mark.parametrize("change, expected_reason", [
+    (lambda s: s.__setitem__("reproducibility", ["x"]), "reproducibility is missing or not an object"),
+    (lambda s: s.__setitem__("reproducibility", "x"), "reproducibility is missing or not an object"),
+    (lambda s: s["reproducibility"].__setitem__("sec_snapshot", "x"), "sec_snapshot is missing or not an object"),
+    (lambda s: s["reproducibility"].__setitem__("sec_snapshot", None), "sec_snapshot is missing or not an object"),
+])
+def test_r2_summary_wrong_types(artifacts, change, expected_reason):
+    tmp, _, raw = artifacts
+    out, _ = _c3(_mutate_summary(tmp, "r2.zip", change), raw)
+    assert out["result"] == "FAIL" and expected_reason in out["reasons"][0]
+
+
+def test_r2_summary_is_a_json_array(artifacts):
+    tmp, _, raw = artifacts
+    out, _ = _c3(_rezip_results(tmp, "r2.zip", lambda d: (d / "summary.json").write_text("[1, 2]")), raw)
+    assert out["result"] == "FAIL" and "not a JSON object" in out["reasons"][0]
+
+
+@pytest.mark.parametrize("payload", ["[1, 2]", '{"files": 5}', '"text"'])
+def test_r2_manifest_wrong_shape_fails_without_exception(artifacts, payload):
+    tmp, _, raw = artifacts
+    out, _ = _c3(_rezip_results(tmp, "r2.zip", lambda d: (d / snap.MANIFEST_FILENAME).write_text(payload)), raw)
+    assert out["result"] == "FAIL"
+    assert any("manifest file SHA-256 does not match" in r for r in out["reasons"])
+    assert any("manifest verification FAIL" in r for r in out["reasons"])
+
+
+def _corrupt_member(zip_path: Path, member: str, dest: Path) -> Path:
+    """Copy a ZIP and flip bytes inside one member's compressed data."""
+    data = bytearray(zip_path.read_bytes())
+    with zipfile.ZipFile(zip_path) as zf:
+        info = zf.getinfo(member)
+    # local header: 30 bytes + name + extra; data follows
+    name_len = int.from_bytes(data[info.header_offset + 26:info.header_offset + 28], "little")
+    extra_len = int.from_bytes(data[info.header_offset + 28:info.header_offset + 30], "little")
+    start = info.header_offset + 30 + name_len + extra_len
+    for i in range(start, start + min(8, info.compress_size)):
+        data[i] ^= 0xFF
+    dest.write_bytes(bytes(data))
+    return dest
+
+
+def _deflate_zip(src: Path, dest: Path) -> Path:
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in sorted(src.iterdir()):
+            if p.is_file():
+                zf.write(p, p.name)
+    return dest
+
+
+def test_r2_corrupt_compressed_raw_member(artifacts):
+    tmp, results, _ = artifacts
+    raw = _deflate_zip(tmp / "raw", tmp / "raw_deflate.zip")
+    assert _c3(results, raw)[0]["result"] == "PASS"
+    bad = _corrupt_member(raw, "AAA_companyfacts.json", tmp / "raw_bad.zip")
+    out, v = _c3(results, bad)
+    assert out["result"] == "FAIL"
+    assert any("cannot read 'AAA_companyfacts.json'" in r for r in out["reasons"]), out["reasons"]
+    assert v.main([str(results), str(bad)]) == 1
+
+
+def test_r2_corrupt_compressed_summary_member(artifacts):
+    tmp, _, raw = artifacts
+    results = _deflate_zip(tmp / "out", tmp / "res_deflate.zip")
+    bad = _corrupt_member(results, "summary.json", tmp / "res_bad.zip")
+    out, _ = _c3(bad, raw)
+    assert out["result"] == "FAIL" and "summary.json unreadable" in out["reasons"][0]
+
+
+def test_r2_truncated_zip(artifacts):
+    tmp, results, _ = artifacts
+    raw_zip = _zip_dir(tmp / "raw", tmp / "raw_full.zip")
+    cut = tmp / "raw_cut.zip"
+    cut.write_bytes(raw_zip.read_bytes()[:-30])
+    out, _ = _c3(results, cut)
+    assert out["result"] == "FAIL"
+    assert ("not a valid ZIP" in out["reasons"][0]) or ("could not be opened" in out["reasons"][0])
+
+
+# ------------------------------------------------------------------ R3: manifest write failure
+
+def _failing_write(manifest, output_dir):
+    raise OSError(28, "No space left on device")
+
+
+def test_r3_manifest_write_failure_is_fail(tmp_path, monkeypatch):
+    ok = _batch(tmp_path / "ok", _fake_pipeline())
+    monkeypatch.setattr(snap, "write_manifest", _failing_write)
+    s = _batch(tmp_path / "bad", _fake_pipeline())
+    sv = _sv(s)
+    assert sv["verification_status"] == "FAIL" and sv["manifest_file_status"] == "WRITE_FAILED"
+    assert any("manifest could not be written" in e and "No space left on device" in e for e in sv["validation_errors"])
+    assert s["operational_review"]["status"] == "FAIL" and "SNAPSHOT_VERIFICATION_FAILED" in _codes(s)
+    strip = lambda recs: [{k: v for k, v in r.items() if k != "raw_input"} for r in recs]  # noqa: E731
+    assert strip(s["records"]) == strip(ok["records"])  # ticker results unchanged
+
+
+def test_r3_manifest_write_failure_cli_exit_code(tmp_path, monkeypatch):
+    cli = _cli()
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    monkeypatch.setattr(cli, "load_reference_rows", lambda: (copy.deepcopy(CT_ROWS), copy.deepcopy(MEMBERS)))
+    monkeypatch.setattr(cli, "read_finance_lease_evidence_csv", lambda: None)
+    monkeypatch.setattr(cli, "read_metric_eligibility_csv", lambda: None)
+    monkeypatch.setattr(cli, "assert_valid_metric_eligibility_reference_data", lambda rows: None)
+    monkeypatch.setattr(cli, "run_fundamentals_pipeline", _fake_pipeline())
+    monkeypatch.setattr(snap, "write_manifest", _failing_write)
+    code = cli.main(["--no-fetch", "--evaluation-date", "2026-11-02",
+                     "--raw-dir", str(raw), "--output-dir", str(tmp_path / "out")])
+    assert code == cli.EXIT_OPERATIONAL_FAIL == 3
+    s = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert s["records"][0]["status"] == "OK"
+    assert _sv(s)["manifest_file_status"] == "WRITE_FAILED"
+
+
+def test_r3_cli_normal_run_exits_zero_or_review(tmp_path, monkeypatch):
+    cli = _cli()
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    monkeypatch.setattr(cli, "load_reference_rows", lambda: (copy.deepcopy(CT_ROWS), copy.deepcopy(MEMBERS)))
+    monkeypatch.setattr(cli, "read_finance_lease_evidence_csv", lambda: None)
+    monkeypatch.setattr(cli, "read_metric_eligibility_csv", lambda: None)
+    monkeypatch.setattr(cli, "assert_valid_metric_eligibility_reference_data", lambda rows: None)
+    monkeypatch.setattr(cli, "run_fundamentals_pipeline", _fake_pipeline())
+    code = cli.main(["--no-fetch", "--evaluation-date", "2026-11-02",
+                     "--raw-dir", str(raw), "--output-dir", str(tmp_path / "out")])
+    assert code == 0
+    s = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert _sv(s)["verification_status"] == "OK" and _sv(s)["manifest_file_status"] == "WRITTEN_AND_REREAD"
+
+
+# ------------------------------------------------------------------ R4: manifest not stored is never PASS
+
+def test_r4_no_output_dir_is_not_verifiable(tmp_path):
+    s = run_batch(evaluation_date="2026-11-02", company_type_rows=copy.deepcopy(CT_ROWS),
+                  membership_rows=copy.deepcopy(MEMBERS), pipeline_fn=_fake_pipeline(),
+                  fetch_fn=lambda t, c: {"cik": 999003, "facts": {}}, raw_dir=tmp_path / "raw", output_dir=None,
+                  run_started_at=RUN_AT)
+    sv = _sv(s)
+    assert sv["manifest_file_status"] == "NOT_WRITTEN"
+    assert sv["verification_status"] == "NOT_VERIFIABLE"
+    assert "manifest file not written" in sv["reason"]
+    assert sv["missing_files"] == sv["mismatched_files"] == []  # raw files themselves were still checked
+    assert s["operational_review"]["status"] == "REVIEW" and "SNAPSHOT_MANIFEST_NOT_WRITTEN" in _codes(s)
+
+
+def test_r4_no_output_dir_still_fails_on_raw_damage(tmp_path):
+    def tamper():
+        (tmp_path / "raw" / "AAA_companyfacts.json").write_bytes(b"{}")
+    s = run_batch(evaluation_date="2026-11-02", company_type_rows=copy.deepcopy(CT_ROWS),
+                  membership_rows=copy.deepcopy(MEMBERS), pipeline_fn=_fake_pipeline(after_load=tamper),
+                  fetch_fn=lambda t, c: {"cik": 999003, "facts": {}}, raw_dir=tmp_path / "raw", output_dir=None,
+                  run_started_at=RUN_AT)
+    assert _sv(s)["verification_status"] == "FAIL" and s["operational_review"]["status"] == "FAIL"

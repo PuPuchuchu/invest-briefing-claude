@@ -251,29 +251,44 @@ def _sec_cutoff_consistency(results: dict[str, dict], expected: str) -> dict:
     return {"status": status, "expected": expected, "mismatched_tickers": mismatched}
 
 
+MANIFEST_FILE_WRITTEN_AND_REREAD = "WRITTEN_AND_REREAD"
+MANIFEST_FILE_NOT_WRITTEN = "NOT_WRITTEN"
+MANIFEST_FILE_WRITE_FAILED = "WRITE_FAILED"
+MANIFEST_FILE_UNREADABLE = "UNREADABLE"
+
+
 def _self_verify_snapshot(manifest: dict, raw_dir: Path | None, output_dir: Path | None) -> dict:
     """C2: verify the snapshot at the end of the run, before results are
     published. The expected hashes are computed in memory from the manifest
     the run built; the manifest file is written, read back from disk and
     checked against them (never against a hash stored inside itself), then
-    every listed SEC input file in raw_dir is checked."""
+    every listed SEC input file in raw_dir is checked.
+
+    manifest_file_status: WRITTEN_AND_REREAD (the only state that can be
+    OK), NOT_WRITTEN (no output_dir: at best NOT_VERIFIABLE, never OK),
+    WRITE_FAILED or UNREADABLE (always FAIL)."""
     expected_manifest = sec_snapshot.manifest_sha256(manifest)
     expected_content = sec_snapshot.snapshot_content_sha256(manifest)
     file_errors: list[str] = []
     to_verify: Any = manifest
-    manifest_file_status = "NOT_WRITTEN"  # no output_dir: in-memory manifest is verified
+    manifest_file_status = MANIFEST_FILE_NOT_WRITTEN
     if output_dir is not None:
-        path = sec_snapshot.write_manifest(manifest, output_dir)
         try:
-            stored = path.read_bytes()
-            to_verify = json.loads(stored.decode("utf-8"))
-            if sec_snapshot.sha256_bytes(stored) != expected_manifest:
-                file_errors.append("stored manifest file bytes do not match the expected manifest_sha256")
-            manifest_file_status = "WRITTEN_AND_REREAD"
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            file_errors.append(f"stored manifest could not be re-read: {type(exc).__name__}: {exc}")
-            to_verify = None
-            manifest_file_status = "UNREADABLE"
+            path = sec_snapshot.write_manifest(manifest, output_dir)
+        except (OSError, TypeError, ValueError) as exc:
+            file_errors.append(f"manifest could not be written: {type(exc).__name__}: {exc}")
+            manifest_file_status = MANIFEST_FILE_WRITE_FAILED
+        else:
+            try:
+                stored = path.read_bytes()
+                to_verify = json.loads(stored.decode("utf-8"))
+                if sec_snapshot.sha256_bytes(stored) != expected_manifest:
+                    file_errors.append("stored manifest file bytes do not match the expected manifest_sha256")
+                manifest_file_status = MANIFEST_FILE_WRITTEN_AND_REREAD
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                file_errors.append(f"stored manifest could not be re-read: {type(exc).__name__}: {exc}")
+                to_verify = None
+                manifest_file_status = MANIFEST_FILE_UNREADABLE
     if raw_dir is None:
         result = sec_snapshot.verify_manifest_with_reader(
             to_verify, lambda p: None,
@@ -288,6 +303,11 @@ def _self_verify_snapshot(manifest: dict, raw_dir: Path | None, output_dir: Path
         result["status"] = sec_snapshot.VERIFY_FAIL
         result["validation_errors"] = file_errors + list(result.get("validation_errors") or [])
         result["reason"] = "integrity check failed"
+    elif manifest_file_status == MANIFEST_FILE_NOT_WRITTEN and result["status"] == sec_snapshot.VERIFY_OK:
+        # R4: only the in-memory manifest and the raw files were checked;
+        # without a stored manifest this is not the verified state.
+        result["status"] = sec_snapshot.VERIFY_NOT_VERIFIABLE
+        result["reason"] = "manifest file not written (no output_dir); stored manifest not verified"
     return {
         "verification_status": result["status"],
         "manifest_file_status": manifest_file_status,
@@ -331,6 +351,11 @@ def _reproducibility_block(
                         "detail": f"{self_verification.get('reason')}: missing={self_verification['missing_files']} "
                                   f"mismatched={self_verification['mismatched_files']} "
                                   f"errors={self_verification['validation_errors'][:5]}"})
+    if (vstatus == sec_snapshot.VERIFY_NOT_VERIFIABLE
+            and self_verification.get("manifest_file_status") == MANIFEST_FILE_NOT_WRITTEN
+            and manifest["status"] == sec_snapshot.SNAPSHOT_OK):
+        reasons.append({"level": OPERATIONAL_REVIEW, "code": "SNAPSHOT_MANIFEST_NOT_WRITTEN",
+                        "detail": "No output_dir: the manifest was not stored, so the snapshot is not verified."})
     if manifest["status"] == sec_snapshot.SNAPSHOT_INCOMPLETE:
         reasons.append({"level": OPERATIONAL_REVIEW, "code": "SNAPSHOT_INCOMPLETE",
                         "detail": "SEC inputs used without a stored file (no raw_dir)."})
