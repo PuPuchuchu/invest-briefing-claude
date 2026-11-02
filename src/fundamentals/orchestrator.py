@@ -203,7 +203,7 @@ not a structural error, so this orchestrator does not block on it.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from src.fundamentals.company_type_registry import (
@@ -235,7 +235,35 @@ from src.fundamentals.universe_membership import get_universe_membership_as_of
 from src.sec.fetcher import fetch_companyfacts, get_user_agent
 from src.sec.identity import normalize_issuer_identity
 
-SCHEMA_VERSION = "orchestrator_v0.1"
+SCHEMA_VERSION = "orchestrator_v0.2"
+
+# STEP 23 SEC PIT (2026-11-02): SEC companyfacts observations are usable
+# for an evaluation date only if they were filed on or before the PREVIOUS
+# calendar day. evaluation_date is a KST calendar day while SEC "filed" is
+# a US calendar day, so a same-day rule let the run time decide whether a
+# filing dated evaluation_date was visible (the 2026-11-02 TEM 10-Q was
+# absent from a morning run and present in an evening run of the same
+# evaluation date). The policy lives here, in one place, and applies to
+# SEC data only: Company Type, metric eligibility, finance-lease evidence
+# availability, peer mapping, universe membership and FRED keep using
+# evaluation_date itself. point_in_time.py is unchanged (filed <= cutoff).
+SEC_PIT_POLICY_VERSION = "SEC_PIT_NEXT_KST_DAY_V1"
+
+
+def sec_filed_cutoff_for(evaluation_date: Any) -> date:
+    """The last SEC ``filed`` date usable on ``evaluation_date``:
+    evaluation_date - 1 calendar day (no business-day logic: EDGAR only
+    assigns business-day filing dates, so the previous calendar day
+    already covers weekends and holidays). Raises ValueError on an
+    unparseable or missing date (fail closed), like
+    point_in_time.coerce_evaluation_date."""
+    if evaluation_date is None:
+        raise ValueError("evaluation_date is required for the SEC filed cutoff.")
+    eval_date = coerce_evaluation_date(evaluation_date)
+    cutoff = eval_date - timedelta(days=1)
+    if not cutoff < eval_date:  # defensive: the cutoff must precede evaluation_date
+        raise ValueError("SEC filed cutoff must be earlier than evaluation_date.")
+    return cutoff
 
 # normalize_company()'s NON_FINANCIAL current-metrics that
 # derived_metrics.calculate_derived_metrics() knows how to compute a
@@ -601,6 +629,8 @@ def run_fundamentals_pipeline(
             "cik": cik,
             "company_type": company_type,
             "evaluation_date": "<ISO date>",
+            "sec_filed_cutoff_date": "<ISO date, evaluation_date - 1>",
+            "sec_pit_policy_version": SEC_PIT_POLICY_VERSION,
             "stages": {
                 "company_type_validation": {"status": ..., "lookup": {...}},
                 "sec_fetch": {"status": ..., ...},
@@ -629,6 +659,9 @@ def run_fundamentals_pipeline(
     point_in_time.get_point_in_time_history's self-validation).
     """
     eval_date = coerce_evaluation_date(evaluation_date)
+    # Computed once; the SAME value is passed to every SEC slicing call
+    # below (PIT_GATING, annual history, growth history). Never recompute.
+    sec_cutoff = sec_filed_cutoff_for(eval_date)
     stages: dict[str, Any] = {}
 
     # --------------------------------------------------------
@@ -730,10 +763,14 @@ def run_fundamentals_pipeline(
     # module docstring for why this must happen in this order.
     # --------------------------------------------------------
 
-    gated_companyfacts = gate_companyfacts_as_of(raw_companyfacts, eval_date)
+    gated_companyfacts = gate_companyfacts_as_of(raw_companyfacts, sec_cutoff)
     stages["pit_gating"] = {
         "status": STAGE_OK,
+        # Unchanged meaning: the run's evaluation date.
         "evaluation_date": eval_date.isoformat(),
+        # The date SEC observations were actually gated to (filed <= this).
+        "sec_filed_cutoff_date": sec_cutoff.isoformat(),
+        "sec_pit_policy_version": SEC_PIT_POLICY_VERSION,
     }
 
     # --------------------------------------------------------
@@ -834,7 +871,7 @@ def run_fundamentals_pipeline(
         metric_result = normalized["metrics"].get(metric_name)
         annual_records = _pit_annual_history_for_selected_concept(
             gated_companyfacts,
-            eval_date,
+            sec_cutoff,
             metric_result,
         )
         if annual_records:
@@ -893,7 +930,7 @@ def run_fundamentals_pipeline(
         metric_result = normalized["metrics"].get(concept_key)
         concept_history = _pit_history_for_selected_concept(
             gated_companyfacts,
-            eval_date,
+            sec_cutoff,
             metric_result,
         )
         concept_found_by_concept[concept_key] = concept_history is not None
@@ -1026,12 +1063,16 @@ def run_fundamentals_pipeline(
         "cik": cik,
         "company_type": company_type,
         "evaluation_date": eval_date.isoformat(),
+        "sec_filed_cutoff_date": sec_cutoff.isoformat(),
+        "sec_pit_policy_version": SEC_PIT_POLICY_VERSION,
         "stages": stages,
     }
 
 
 __all__ = [
     "SCHEMA_VERSION",
+    "SEC_PIT_POLICY_VERSION",
+    "sec_filed_cutoff_for",
     "STAGE_NOT_WIRED",
     "STAGE_SKIPPED",
     "STAGE_OK",

@@ -18,21 +18,31 @@ not fail the run.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
+import platform
+import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from src.fundamentals.batch_runner import (
+    DEFAULT_COMPANY_TYPE_CSV,
+    DEFAULT_MEMBERSHIP_CSV,
     STATUS_ERROR,
+    FutureEvaluationDateError,
+    check_evaluation_date_not_future,
     load_reference_rows,
     run_batch,
 )
 from src.fundamentals.metric_eligibility_registry import assert_valid_metric_eligibility_reference_data
 from src.fundamentals.metric_eligibility_registry_io import read_metric_eligibility_csv
 from src.fundamentals.finance_lease_evidence_registry_io import (
+    DEFAULT_FINANCE_LEASE_EVIDENCE_CSV,
     read_finance_lease_evidence_csv,
 )
+from src.fundamentals.metric_eligibility_registry_io import DEFAULT_METRIC_ELIGIBILITY_CSV
 from src.fundamentals.orchestrator import run_fundamentals_pipeline
 from src.sec.fetcher import fetch_companyfacts, get_user_agent
 
@@ -68,6 +78,69 @@ def resolve_evaluation_date(explicit: str | None, now: datetime | None = None) -
     return default_evaluation_date(now)
 
 
+# STEP 23 SEC PIT (2026-11-02): run provenance. GITHUB_* variables are set
+# by GitHub Actions itself (no workflow change needed); outside Actions they
+# are null. The workflow SHA identifies the workflow file's commit and is NOT
+# treated as the code SHA.
+GITHUB_ENV_FIELDS = {
+    "github_sha": "GITHUB_SHA",
+    "github_workflow_sha": "GITHUB_WORKFLOW_SHA",
+    "github_run_id": "GITHUB_RUN_ID",
+    "github_run_attempt": "GITHUB_RUN_ATTEMPT",
+    "github_workflow_ref": "GITHUB_WORKFLOW_REF",
+    "github_event_name": "GITHUB_EVENT_NAME",
+}
+
+REFERENCE_FILES = {
+    "company_type.csv": DEFAULT_COMPANY_TYPE_CSV,
+    "universe_membership.csv": DEFAULT_MEMBERSHIP_CSV,
+    "finance_lease_evidence.csv": DEFAULT_FINANCE_LEASE_EVIDENCE_CSV,
+    "metric_eligibility.csv": DEFAULT_METRIC_ELIGIBILITY_CSV,
+}
+
+
+def checkout_head_sha() -> str | None:
+    """`git rev-parse HEAD` of the working directory, or None."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha or None
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def collect_run_metadata(env: dict | None = None, head_sha: str | None = None) -> dict:
+    """Provenance for summary["reproducibility"]["provenance"]. A missing or
+    mismatched code SHA becomes an operational flag (batch-level REVIEW)."""
+    env = os.environ if env is None else env
+    meta = {key: (env.get(var) or None) for key, var in GITHUB_ENV_FIELDS.items()}
+    meta["checkout_head_sha"] = head_sha
+    meta["python_version"] = platform.python_version()
+    meta["reference_data_hashes"] = {name: file_sha256(path) for name, path in REFERENCE_FILES.items()}
+    flags = []
+    if meta["github_sha"] and head_sha:
+        meta["commit_sha_consistency"] = "MATCH" if meta["github_sha"] == head_sha else "MISMATCH"
+    else:
+        meta["commit_sha_consistency"] = "UNKNOWN"
+    if meta["commit_sha_consistency"] == "MISMATCH":
+        flags.append("COMMIT_SHA_MISMATCH")
+    elif meta["commit_sha_consistency"] == "UNKNOWN":
+        flags.append("COMMIT_SHA_UNVERIFIED")
+    if any(h is None for h in meta["reference_data_hashes"].values()):
+        flags.append("REFERENCE_HASH_UNAVAILABLE")
+    meta["operational_flags"] = flags
+    return meta
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -92,7 +165,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    evaluation_date = resolve_evaluation_date(args.evaluation_date)
+    # Read the clock once: the default evaluation date, the future-date
+    # refusal and the run-timing status all use this same instant.
+    run_started_at = datetime.now(timezone.utc)
+    evaluation_date = resolve_evaluation_date(args.evaluation_date, run_started_at)
+    try:
+        check_evaluation_date_not_future(evaluation_date, run_started_at)
+    except FutureEvaluationDateError as exc:
+        print(f"Refused before any SEC request: {exc}", file=sys.stderr)
+        return 2
 
     company_type_rows, membership_rows = load_reference_rows()
     finance_lease_evidence_rows = read_finance_lease_evidence_csv()
@@ -120,10 +201,16 @@ def main(argv: list[str] | None = None) -> int:
         tickers=tickers,
         finance_lease_evidence_rows=finance_lease_evidence_rows,
         metric_eligibility_rows=metric_eligibility_rows,
+        run_started_at=run_started_at,
+        run_metadata=collect_run_metadata(head_sha=checkout_head_sha()),
     )
 
     print(f"evaluation_date={summary['evaluation_date']} tickers={summary['ticker_count']}")
     print(f"status_counts={summary['status_counts']}")
+    review = summary.get("operational_review") or {}
+    if review:
+        print(f"operational_review={review.get('status')} "
+              + ",".join(r.get("code", "") for r in review.get("reasons") or []))
     for rec in summary["records"]:
         extra = rec.get("error") or rec.get("company_type_lookup_status") or ""
         print(f"  {rec['ticker']:6s} {rec['status']:22s} {extra}")

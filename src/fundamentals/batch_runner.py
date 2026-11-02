@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from src.fundamentals.company_type_registry import (
     LOOKUP_OK,
@@ -54,8 +55,37 @@ from src.fundamentals.batch_coverage import (
     coverage_headline,
     render_coverage_markdown,
 )
+from src.fundamentals.orchestrator import SEC_PIT_POLICY_VERSION, sec_filed_cutoff_for
+from src.fundamentals import sec_snapshot
 
-BATCH_SCHEMA_VERSION = "fundamentals_batch.v1"
+BATCH_SCHEMA_VERSION = "fundamentals_batch.v2"
+
+# STEP 23 SEC PIT (2026-11-02): batch-level operational metadata.
+KST = ZoneInfo("Asia/Seoul")
+# Operational minimum run time for the CURRENT KST evaluation date. EDGAR's
+# latest same-day acceptance (22:00 US Eastern) is 11:00/12:00 KST the next
+# day; 13:00 adds margin. It is NOT a guarantee that SEC data is complete
+# (companyfacts processing can lag); exact reproducibility is defined by the
+# stored snapshot (sec_snapshot), not by the run time.
+RECOMMENDED_EARLIEST_RUN_KST = dtime(13, 0)
+RUN_TIMING_EARLY_RUN = "EARLY_RUN"
+RUN_TIMING_RECOMMENDED_WINDOW = "RECOMMENDED_WINDOW"
+RUN_TIMING_HISTORICAL = "HISTORICAL"
+
+OPERATIONAL_PASS = "PASS"
+OPERATIONAL_REVIEW = "REVIEW"
+OPERATIONAL_FAIL = "FAIL"
+
+# The governance behaviour these results were produced under (DEC-055 gate:
+# WITHHELD metrics masked; dependents relabelled when they were produced).
+# Kept separate from SEC_PIT_POLICY_VERSION; changes only with the gate.
+GOVERNANCE_POLICY_VERSION_GATED = "DEC055_GATE_V1_RELABEL_PRODUCED_DEPENDENTS"
+GOVERNANCE_POLICY_VERSION_NOT_APPLIED = "NO_METRIC_ELIGIBILITY_GATE"
+
+
+class FutureEvaluationDateError(ValueError):
+    """evaluation_date is later than the current KST date: refused before
+    any SEC request."""
 
 STATUS_OK = "OK"
 STATUS_EXCLUDED_COMPANY_TYPE = "EXCLUDED_COMPANY_TYPE"
@@ -169,6 +199,117 @@ def _attach_debt_tiers(result: dict, cik: str, evaluation_date: Any, evidence_ro
     return {key: tier2.get(key) for key in ("status", "value", "reason_code", "finance_lease_added", "accession")}
 
 
+def _coerce_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise ValueError(f"Unparseable evaluation_date: {value!r}")
+
+
+def _run_started_at(run_started_at: datetime | None) -> datetime:
+    started = run_started_at or datetime.now(timezone.utc)
+    if started.tzinfo is None or started.utcoffset() is None:
+        raise ValueError("run_started_at must be timezone-aware.")
+    return started.astimezone(timezone.utc)
+
+
+def check_evaluation_date_not_future(evaluation_date: Any, run_started_at: datetime) -> date:
+    """Refuse an evaluation date later than the KST date at run start."""
+    eval_date = _coerce_date(evaluation_date)
+    kst_today = run_started_at.astimezone(KST).date()
+    if eval_date > kst_today:
+        raise FutureEvaluationDateError(
+            f"evaluation_date {eval_date.isoformat()} is after the current KST date {kst_today.isoformat()}."
+        )
+    return eval_date
+
+
+def run_timing_status(evaluation_date: date, run_started_at: datetime) -> str:
+    kst_now = run_started_at.astimezone(KST)
+    if evaluation_date < kst_now.date():
+        return RUN_TIMING_HISTORICAL
+    if kst_now.time() < RECOMMENDED_EARLIEST_RUN_KST:
+        return RUN_TIMING_EARLY_RUN
+    return RUN_TIMING_RECOMMENDED_WINDOW
+
+
+def _sec_cutoff_consistency(results: dict[str, dict], expected: str) -> dict:
+    seen = {
+        t: ((r.get("stages") or {}).get("pit_gating") or {}).get("sec_filed_cutoff_date")
+        for t, r in sorted(results.items())
+    }
+    mismatched = sorted(t for t, v in seen.items() if v != expected)
+    if not seen:
+        status = "NO_RESULTS"
+    elif mismatched:
+        status = "MISMATCH"
+    else:
+        status = "MATCH"
+    return {"status": status, "expected": expected, "mismatched_tickers": mismatched}
+
+
+def _reproducibility_block(
+    *,
+    eval_date: date,
+    started: datetime,
+    expected_sec_cutoff: str,
+    results: dict[str, dict],
+    manifest: dict,
+    metric_eligibility_rows: list[dict] | None,
+    run_metadata: dict | None,
+) -> dict:
+    timing = run_timing_status(eval_date, started)
+    consistency = _sec_cutoff_consistency(results, expected_sec_cutoff)
+    provenance = dict(run_metadata or {})
+    flags = list(provenance.pop("operational_flags", []) or [])
+
+    reasons: list[dict] = []
+    if timing == RUN_TIMING_EARLY_RUN:
+        reasons.append({"level": OPERATIONAL_REVIEW, "code": "EARLY_RUN",
+                        "detail": "Current-date run before 13:00 KST; SEC filings of the previous US day may be incomplete."})
+    if consistency["status"] == "MISMATCH":
+        reasons.append({"level": OPERATIONAL_FAIL, "code": "SEC_CUTOFF_MISMATCH",
+                        "detail": f"Tickers gated to a different SEC cutoff: {consistency['mismatched_tickers']}"})
+    if manifest["status"] == sec_snapshot.SNAPSHOT_INCOMPLETE:
+        reasons.append({"level": OPERATIONAL_REVIEW, "code": "SNAPSHOT_INCOMPLETE",
+                        "detail": "SEC inputs used without a stored file (no raw_dir)."})
+    elif manifest["status"] == sec_snapshot.SNAPSHOT_NO_SEC_INPUTS:
+        reasons.append({"level": OPERATIONAL_REVIEW, "code": "NO_SEC_INPUTS",
+                        "detail": "No SEC input file was loaded in this batch."})
+    for flag in flags:
+        reasons.append({"level": OPERATIONAL_REVIEW, "code": str(flag), "detail": "Reported by the caller (provenance)."})
+    levels = {r["level"] for r in reasons}
+    status = OPERATIONAL_FAIL if OPERATIONAL_FAIL in levels else (OPERATIONAL_REVIEW if levels else OPERATIONAL_PASS)
+
+    kst = started.astimezone(KST)
+    return {
+        "sec_pit_policy_version": SEC_PIT_POLICY_VERSION,
+        "sec_filed_cutoff_date": expected_sec_cutoff,
+        "sec_cutoff_consistency": consistency,
+        "governance_policy_version": (
+            GOVERNANCE_POLICY_VERSION_GATED if metric_eligibility_rows is not None
+            else GOVERNANCE_POLICY_VERSION_NOT_APPLIED
+        ),
+        "run_started_at_utc": started.isoformat(),
+        "run_started_at_kst": kst.isoformat(),
+        "run_timing_status": timing,
+        "sec_snapshot": {
+            "manifest_version": manifest["manifest_version"],
+            "manifest_file": sec_snapshot.MANIFEST_FILENAME,
+            "status": manifest["status"],
+            "file_count": manifest["file_count"],
+            "snapshot_content_sha256": sec_snapshot.snapshot_content_sha256(manifest),
+            "manifest_sha256": sec_snapshot.manifest_sha256(manifest),
+            "inputs_without_stored_file": manifest["inputs_without_stored_file"],
+        },
+        "provenance": provenance,
+        "operational_review": {"status": status, "reasons": reasons},
+    }
+
+
 def run_batch(
     *,
     evaluation_date: Any,
@@ -182,6 +323,8 @@ def run_batch(
     tickers: list[str] | None = None,
     finance_lease_evidence_rows: list[dict] | None = None,
     metric_eligibility_rows: list[dict] | None = None,
+    run_started_at: datetime | None = None,
+    run_metadata: dict | None = None,
 ) -> dict:
     """
     Run the pipeline for every WATCHLIST ticker and return a summary dict.
@@ -202,7 +345,25 @@ def run_batch(
         (DEC-055). When given, they are forwarded to pipeline_fn and each OK
         record gains an "eligibility" summary (withheld / scoped metrics).
         When None, results are unchanged.
+    run_started_at: aware datetime of the batch start (default: now). Read
+        once; used for the future-date refusal and the run-timing status.
+    run_metadata: optional provenance (commit SHAs, reference-data hashes,
+        Python version) collected by the caller; stored under
+        summary["reproducibility"]["provenance"]. Its "operational_flags"
+        list, if any, feeds the batch-level operational review.
+
+    STEP 23 SEC PIT: an evaluation_date later than the current KST date is
+    refused (FutureEvaluationDateError) before any lookup or SEC request.
+    Every SEC input is read back from its stored file in raw_dir, and those
+    exact bytes are hashed into the snapshot manifest and parsed as the
+    pipeline input. The operational review (run timing, provenance,
+    snapshot, cutoff consistency) is batch-level only: it never changes a
+    ticker record, metric or score.
     """
+    started = _run_started_at(run_started_at)
+    eval_date_obj = check_evaluation_date_not_future(evaluation_date, started)
+    expected_sec_cutoff = sec_filed_cutoff_for(eval_date_obj).isoformat()
+
     entries = load_watchlist_entries(membership_rows)
     requested_not_in_watchlist: list[str] = []
     if tickers:
@@ -221,6 +382,8 @@ def run_batch(
     records: list[dict] = []
     results: dict[str, dict] = {}
     fetched_count = 0
+    snapshot_entries: list[dict] = []
+    inputs_without_stored_file: list[str] = []
 
     for entry in entries:
         ticker, cik = entry["ticker"], entry["cik"]
@@ -254,23 +417,43 @@ def run_batch(
                 if raw_dir is not None
                 else None
             )
+            fetched_at = None
             if cache_path is not None and cache_path.exists():
-                with cache_path.open("r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                source = "CACHE"
+                source = sec_snapshot.SOURCE_CACHE
             elif fetch_fn is not None:
                 if fetched_count and sleep_seconds:
                     time.sleep(sleep_seconds)
-                raw = fetch_fn(ticker, cik)
+                fetched = fetch_fn(ticker, cik)
+                fetched_at = datetime.now(timezone.utc).isoformat()
                 fetched_count += 1
-                source = "FETCHED"
+                source = sec_snapshot.SOURCE_FETCHED
                 if cache_path is not None:
                     with cache_path.open("w", encoding="utf-8") as f:
-                        json.dump(raw, f, ensure_ascii=False)
+                        json.dump(fetched, f, ensure_ascii=False)
+                else:
+                    raw = fetched  # no raw_dir: no stored file, snapshot INCOMPLETE
             else:
                 raise RuntimeError(
                     "No cached companyfacts and no fetch function provided."
                 )
+            if cache_path is not None:
+                # Read the stored file once: these bytes are hashed AND
+                # parsed as the pipeline input (FETCHED included).
+                raw, file_entry = sec_snapshot.load_input_file(cache_path, raw_dir)
+                file_entry.update({"ticker": ticker, "cik": cik, "source": source})
+                snapshot_entries.append(file_entry)
+                record["raw_input"] = {
+                    "path": file_entry["path"],
+                    "sha256": file_entry["sha256"],
+                    "size_bytes": file_entry["size_bytes"],
+                    # Original acquisition time is unknown for a cached file.
+                    "fetched_at_utc": fetched_at,
+                    "loaded_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            else:
+                inputs_without_stored_file.append(ticker)
+                record["raw_input"] = {"path": None, "sha256": None, "size_bytes": None,
+                                       "fetched_at_utc": fetched_at, "loaded_at_utc": None}
             record["raw_source"] = source
 
             # 3. Pipeline.
@@ -336,6 +519,16 @@ def run_batch(
         requested_not_in_watchlist=requested_not_in_watchlist,
         batch_schema_version=BATCH_SCHEMA_VERSION,
     )
+    manifest = sec_snapshot.build_manifest(snapshot_entries, missing_stored_inputs=inputs_without_stored_file)
+    reproducibility = _reproducibility_block(
+        eval_date=eval_date_obj,
+        started=started,
+        expected_sec_cutoff=expected_sec_cutoff,
+        results=results,
+        manifest=manifest,
+        metric_eligibility_rows=metric_eligibility_rows,
+        run_metadata=run_metadata,
+    )
     summary = {
         "schema_version": BATCH_SCHEMA_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -347,8 +540,12 @@ def run_batch(
         ),
         "records": records,
         "coverage": coverage_headline(coverage),
+        # Batch-level only; ticker records, metrics and scores never read it.
+        "operational_review": reproducibility.pop("operational_review"),
+        "reproducibility": reproducibility,
     }
     if output_dir is not None:
+        sec_snapshot.write_manifest(manifest, output_dir)
         with (output_dir / "coverage.json").open("w", encoding="utf-8") as f:
             json.dump(coverage, f, ensure_ascii=False, indent=2, default=str)
         (output_dir / "coverage.md").write_text(render_coverage_markdown(coverage), encoding="utf-8")
@@ -362,6 +559,32 @@ def _fmt_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"{value / 1e9:,.2f}B"
     return "—"
+
+
+def _reproducibility_markdown(summary: dict) -> list[str]:
+    rep = summary["reproducibility"]
+    review = summary.get("operational_review") or {}
+    snap = rep.get("sec_snapshot") or {}
+    prov = rep.get("provenance") or {}
+    lines = [
+        f"Operational review (batch-level, does not change ticker results): **{review.get('status')}**"
+        + ("".join(f"; {r['level']} {r['code']}" for r in review.get("reasons") or [])),
+        "",
+        f"SEC PIT: filed <= {rep.get('sec_filed_cutoff_date')} ({rep.get('sec_pit_policy_version')}); "
+        f"cutoff consistency {rep.get('sec_cutoff_consistency', {}).get('status')}; "
+        f"run timing {rep.get('run_timing_status')} (started {rep.get('run_started_at_kst')}).",
+        "",
+        f"SEC snapshot: {snap.get('status')}, {snap.get('file_count')} file(s), "
+        f"content sha256 {snap.get('snapshot_content_sha256')}, manifest {snap.get('manifest_file')}.",
+        "",
+    ]
+    if prov:
+        lines += [
+            f"Code: checkout {prov.get('checkout_head_sha')} · GITHUB_SHA {prov.get('github_sha')} "
+            f"({prov.get('commit_sha_consistency')}) · Python {prov.get('python_version')}.",
+            "",
+        ]
+    return lines
 
 
 def render_summary_markdown(summary: dict) -> str:
@@ -383,6 +606,7 @@ def render_summary_markdown(summary: dict) -> str:
             if summary.get("coverage")
             else []
         ),
+        *(_reproducibility_markdown(summary) if summary.get("reproducibility") else []),
         "| Ticker | Status | " + " | ".join(SUMMARY_METRICS) + " | Note |",
         "|" + "---|" * (len(SUMMARY_METRICS) + 3),
     ]
@@ -421,6 +645,9 @@ def load_reference_rows(
 
 __all__ = [
     "BATCH_SCHEMA_VERSION",
+    "FutureEvaluationDateError",
+    "check_evaluation_date_not_future",
+    "run_timing_status",
     "STATUS_OK",
     "STATUS_EXCLUDED_COMPANY_TYPE",
     "STATUS_ERROR",

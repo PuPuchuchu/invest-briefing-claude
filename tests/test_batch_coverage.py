@@ -291,8 +291,17 @@ def _pipeline(metrics_by_ticker, calls=None, fail_for=()):
     return pipeline
 
 
+
+# STEP 23 SEC PIT: run_batch refuses evaluation dates after the run's KST date;
+# a fixed run start keeps these fixed-date tests independent of the real clock.
+from datetime import datetime as _datetime, timezone as _timezone  # noqa: E402
+
+_RUN_AT = _datetime(2026, 12, 1, tzinfo=_timezone.utc)
+
+
 def _run(tmp_path, members, cts, metrics_by_ticker, **kw):
     out = tmp_path / "out"
+    kw.setdefault("run_started_at", _RUN_AT)
     summary = run_batch(
         company_type_rows=cts, membership_rows=members, pipeline_fn=kw.pop("pipeline", _pipeline(metrics_by_ticker)),
         fetch_fn=lambda t, c: {}, raw_dir=tmp_path / "raw", output_dir=out, **kw,
@@ -367,7 +376,7 @@ def test_backward_compatible_summary_and_error_text_not_in_coverage(tmp_path):
     data = {"AAA": _normalized(), "BAD": _normalized()}
     summary, c, out = _run(tmp_path, members, cts, data, evaluation_date=EVAL, pipeline=_pipeline(data, fail_for=("BAD",)))
     # Existing summary keys and record fields are unchanged; coverage is additive.
-    assert summary["schema_version"] == BATCH_SCHEMA_VERSION == "fundamentals_batch.v1"
+    assert summary["schema_version"] == BATCH_SCHEMA_VERSION == "fundamentals_batch.v2"  # STEP 23 SEC PIT
     for key in ("schema_version", "generated_at_utc", "evaluation_date", "ticker_count", "status_counts",
                 "eligibility_note", "records"):
         assert key in summary
