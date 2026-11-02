@@ -513,9 +513,15 @@ def _build_fcf_history(
     capex_history: Any,
 ) -> list[dict[str, Any]]:
     """
-    FCF = CFO + CapEx
+    FCF = CFO - abs(CapEx)
 
-    Historical CapEx is expected to be negative.
+    Historical CapEx may be reported as positive or negative; the raw SEC
+    CapEx sign is not assumed. abs() treats either sign as the same cash
+    outflow, matching derived_metrics.calculate_fcf (2026-10-18). The
+    CapEx history records themselves are not modified.
+
+    STEP 23-FCF (2026-11-01): previously FCF = CFO + CapEx, which was
+    correct only for negative CapEx and overstated FCF for positive CapEx.
     """
 
     cfo_records = _valid_history_records(
@@ -560,7 +566,7 @@ def _build_fcf_history(
 
         fcf = (
             cfo["value"]
-            + capex["value"]
+            - abs(capex["value"])
         )
 
         fcf_record = {

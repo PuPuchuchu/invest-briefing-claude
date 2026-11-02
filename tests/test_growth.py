@@ -774,3 +774,141 @@ def test_validate_growth_rejects_invalid_status():
     failures = validate_growth(result)
 
     assert "growth.status" in failures
+
+
+# ============================================================
+# STEP 23-FCF (2026-11-01): CAPEX SIGN CONVENTION
+# FCF = CFO - abs(CapEx), whatever sign the raw SEC CapEx carries.
+# Policies unchanged: calculate_positive_yoy positivity, quarter pair
+# selection, weights, thresholds, minimum components, schema.
+# ============================================================
+
+import copy
+
+from src.fundamentals.growth import _build_fcf_history
+
+
+def _q(value, period_end, quarter, fy, **extra):
+    record = _record(value, period_end, quarter=quarter, fy=fy)
+    record.update(extra)
+    return record
+
+
+def _fcf_values(cfo, capex):
+    return [r["value"] for r in _build_fcf_history({"quarterly": cfo}, {"quarterly": capex})]
+
+
+def _history_with_capex(capex_prev, capex_cur, cfo_prev=30.0, cfo_cur=40.0):
+    history = _historical()
+    history["cfo"]["quarterly"] = [
+        _q(cfo_prev, "2025-06-30", "Q2", 2025),
+        _q(cfo_cur, "2026-06-30", "Q2", 2026),
+    ]
+    history["capex"]["quarterly"] = [
+        _q(capex_prev, "2025-06-30", "Q2", 2025),
+        _q(capex_cur, "2026-06-30", "Q2", 2026),
+    ]
+    return history
+
+
+def _fcf_yoy(history):
+    return calculate_growth(_normalized(), _derived(), history)["components"]["fcf_yoy"]
+
+
+# A. Negative CapEx
+def test_fcf_history_negative_capex():
+    assert _fcf_values([_q(30.0, "2026-06-30", "Q2", 2026)], [_q(-10.0, "2026-06-30", "Q2", 2026)]) == [20.0]
+
+
+# B. Positive CapEx (previously 30 + 10 = 40)
+def test_fcf_history_positive_capex():
+    assert _fcf_values([_q(30.0, "2026-06-30", "Q2", 2026)], [_q(10.0, "2026-06-30", "Q2", 2026)]) == [20.0]
+
+
+# C. Mixed sign across periods
+def test_fcf_history_mixed_sign_capex():
+    values = _fcf_values(
+        [_q(30.0, "2025-06-30", "Q2", 2025), _q(40.0, "2026-06-30", "Q2", 2026)],
+        [_q(10.0, "2025-06-30", "Q2", 2025), _q(-12.0, "2026-06-30", "Q2", 2026)],
+    )
+    assert values == [20.0, 28.0]
+
+    component = _fcf_yoy(_history_with_capex(10.0, -12.0))
+    assert component["status"] == "OK"
+    assert abs(component["value"] - 0.40) < 1e-10
+
+
+# D. Zero CapEx
+def test_fcf_history_zero_capex():
+    assert _fcf_values([_q(30.0, "2026-06-30", "Q2", 2026)], [_q(0.0, "2026-06-30", "Q2", 2026)]) == [30.0]
+
+
+# E. Growth consistency: same economics, opposite raw signs
+def test_fcf_yoy_identical_for_positive_and_negative_capex():
+    negative = _fcf_yoy(_history_with_capex(-10.0, -12.0))
+    positive = _fcf_yoy(_history_with_capex(10.0, 12.0))
+
+    assert negative["status"] == positive["status"] == "OK"
+    assert negative["value"] == positive["value"]
+    assert abs(positive["value"] - 0.40) < 1e-10
+    assert negative["stars"] == positive["stars"]
+
+
+# F. Negative / zero FCF policy preserved with positive CapEx
+def test_fcf_yoy_positive_capex_negative_prior_stays_invalid():
+    # prior FCF = 5 - 10 = -5 (old formula would have given +15)
+    component = _fcf_yoy(_history_with_capex(10.0, 5.0, cfo_prev=5.0, cfo_cur=20.0))
+    assert component["status"] == "INVALID"
+    assert component["value"] is None
+    assert component["reason"].startswith("Previous value must be greater than zero")
+
+
+def test_fcf_yoy_positive_capex_negative_current_stays_invalid():
+    # current FCF = 5 - 10 = -5 (old formula would have given +15)
+    component = _fcf_yoy(_history_with_capex(10.0, 10.0, cfo_prev=30.0, cfo_cur=5.0))
+    assert component["status"] == "INVALID"
+    assert component["value"] is None
+    assert component["reason"].startswith("Current value must be greater than zero")
+
+
+def test_fcf_yoy_positive_capex_zero_fcf_stays_invalid():
+    component = _fcf_yoy(_history_with_capex(10.0, 10.0, cfo_prev=10.0, cfo_cur=40.0))
+    assert component["status"] == "INVALID"
+    assert component["value"] is None
+
+
+# G. Period pair and period metadata unchanged by CapEx sign
+def test_fcf_period_pair_and_metadata_independent_of_capex_sign():
+    negative = _fcf_yoy(_history_with_capex(-10.0, -12.0))
+    positive = _fcf_yoy(_history_with_capex(10.0, 12.0))
+
+    for component in (negative, positive):
+        assert component["current_period_end"] == "2026-06-30"
+        assert component["previous_period_end"] == "2025-06-30"
+        assert component["source"] == ["historical", "quarterly"]
+
+    def meta(capex_sign):
+        cfo = [_q(30.0, "2025-06-30", "Q2", 2025), _q(40.0, "2026-06-30", "Q2", 2026)]
+        capex = [
+            _q(capex_sign * 10.0, "2025-06-30", "Q2", 2025, concept_scope="S", concept="C"),
+            _q(capex_sign * 12.0, "2026-06-30", "Q2", 2026, concept_scope="S", concept="C"),
+        ]
+        return [
+            {k: v for k, v in r.items() if k != "value"}
+            for r in _build_fcf_history({"quarterly": cfo}, {"quarterly": capex})
+        ]
+
+    assert meta(-1) == meta(1)
+    assert meta(1)[0]["capex_concept_scope"] == "S"
+    assert meta(1)[0]["capex_concept"] == "C"
+
+
+# H. Input integrity: raw CapEx history (value and sign) is not modified
+def test_fcf_calculation_does_not_mutate_capex_history():
+    history = _history_with_capex(10.0, -12.0)
+    before = copy.deepcopy(history)
+
+    calculate_growth(_normalized(), _derived(), history)
+
+    assert history == before
+    assert [r["value"] for r in history["capex"]["quarterly"]] == [10.0, -12.0]
