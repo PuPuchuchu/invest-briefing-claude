@@ -77,9 +77,11 @@ OPERATIONAL_REVIEW = "REVIEW"
 OPERATIONAL_FAIL = "FAIL"
 
 # The governance behaviour these results were produced under (DEC-055 gate:
-# WITHHELD metrics masked; dependents relabelled when they were produced).
+# WITHHELD metrics masked; every dependency-map dependent of a withheld input
+# listed as WITHHELD, including outputs not produced -- materialized=False).
+# V1 (until 2026-11-03, main 83276c5) relabelled only produced dependents.
 # Kept separate from SEC_PIT_POLICY_VERSION; changes only with the gate.
-GOVERNANCE_POLICY_VERSION_GATED = "DEC055_GATE_V1_RELABEL_PRODUCED_DEPENDENTS"
+GOVERNANCE_POLICY_VERSION_GATED = "DEC055_GATE_V2_RELABEL_ALL_DEPENDENTS"
 GOVERNANCE_POLICY_VERSION_NOT_APPLIED = "NO_METRIC_ELIGIBILITY_GATE"
 
 
