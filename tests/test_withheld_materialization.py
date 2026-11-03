@@ -111,16 +111,50 @@ def test_no_withheld_changes_nothing():
     assert changed == {"derived": [], "growth": [], "data_sufficiency": []}
 
 
-def test_idempotent():
+def test_idempotent_full_structure():
+    """Re-applying the gate with the same withheld set changes nothing at all:
+    derived, growth and data_sufficiency are compared in full (materialized,
+    original_status, reason_code, reason/detail, withheld_inputs, ...), and so
+    is the returned change list."""
+    derived, growth, suff = _stages()
+    first_changed = reg.relabel_withheld_dependents(W, derived, growth, suff)
+    once = copy.deepcopy((derived, growth, suff))
+    for _ in range(3):
+        again = reg.relabel_withheld_dependents(W, derived, growth, suff)
+        assert (derived, growth, suff) == once
+        assert again == first_changed
+    dm = derived["derived_metrics"]
+    for name in ("cfo_yoy", "capex_yoy", "operating_income_yoy"):  # first call: not produced
+        assert dm[name]["materialized"] is False and dm[name]["original_status"] is None, name
+    for name in ("fcf", "fcf_margin", "operating_margin"):  # first call: produced (MISSING)
+        assert dm[name]["materialized"] is True and dm[name]["original_status"] == "MISSING", name
+    assert growth["components"]["operating_income_yoy"]["materialized"] is False
+    assert growth["components"]["fcf_yoy"]["original_status"] == "MISSING"
+    assert suff["fcf_yoy"]["original_status"] == "MISSING" and suff["fcf_yoy"]["materialized"] is True
+    assert suff["operating_income_yoy"]["materialized"] is False and suff["operating_income_yoy"]["original_status"] is None
+
+
+def test_gate_marker_is_distinguished_from_a_stage_output_by_set_by_not_by_key_presence():
+    # A stage's own record that happens to look WITHHELD is still a stage output.
+    derived = {"derived_metrics": {"cfo_yoy": {"status": "WITHHELD", "value": None, "materialized": False}}}
+    reg.relabel_withheld_dependents(["cfo"], derived, None, None)
+    m = derived["derived_metrics"]["cfo_yoy"]
+    assert m["materialized"] is True and m["original_status"] == "WITHHELD" and m["set_by"] == reg.GATE_MARKER_SET_BY
+    # A gate marker keeps its first values even if inputs widen later.
+    derived = {"derived_metrics": {}}
+    reg.relabel_withheld_dependents(["cfo"], derived, None, None)
+    reg.relabel_withheld_dependents(["cfo", "capex"], derived, None, None)
+    fcf = derived["derived_metrics"]["fcf"]
+    assert fcf["materialized"] is False and fcf["original_status"] is None and fcf["withheld_inputs"] == ["cfo", "capex"]
+
+
+def test_sufficiency_marker_carries_withheld_inputs_additively():
     derived, growth, suff = _stages()
     reg.relabel_withheld_dependents(W, derived, growth, suff)
-    once = copy.deepcopy((derived, growth, suff))
-    reg.relabel_withheld_dependents(W, derived, growth, suff)
-    # re-marking keeps status/value/inputs; materialized flips to True only
-    # because the entry now exists -- the masked content is unchanged
-    for name in ("cfo_yoy", "capex_yoy", "operating_income_yoy"):
-        a, b = once[0]["derived_metrics"][name], derived["derived_metrics"][name]
-        assert (a["status"], a["value"], a["withheld_inputs"]) == (b["status"], b["value"], b["withheld_inputs"])
+    f = suff["fcf_yoy"]
+    assert f["withheld_inputs"] == ["cfo", "capex"]
+    assert {"metric", "calculation_status", "reason_code", "detail"} <= set(f)  # existing fields kept
+    assert f["calculation_status"] == "WITHHELD" and f["reason_code"] == reg.SUFFICIENCY_REASON_WITHHELD
 
 
 # ------------------------------------------------------------------ coverage effect
@@ -225,4 +259,4 @@ def test_orchestrator_lists_unproduced_dependents_as_withheld():
 
 def test_batch_reports_governance_policy_v2():
     from src.fundamentals import batch_runner
-    assert batch_runner.GOVERNANCE_POLICY_VERSION_GATED == "DEC055_GATE_V2_MATERIALIZED_WITHHELD"
+    assert batch_runner.GOVERNANCE_POLICY_VERSION_GATED == "DEC055_GATE_V2_RELABEL_ALL_DEPENDENTS"

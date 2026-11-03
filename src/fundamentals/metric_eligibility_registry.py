@@ -280,21 +280,44 @@ def apply_metric_eligibility_gate(normalized: dict, cik: Any, evaluation_date: A
     }
 
 
-def _withheld_marker(previous: Any, inputs: list[str], *, materialized: bool = True) -> dict:
+# Identifies a record written by this gate (as opposed to a stage's own output).
+GATE_MARKER_SET_BY = "DEC055_GATE"
+
+
+def _is_gate_marker(record: Any) -> bool:
+    return isinstance(record, dict) and record.get("set_by") == GATE_MARKER_SET_BY
+
+
+def _prior_state(previous: Any, status_key: str = "status") -> tuple[bool, Any]:
+    """(materialized, original_status) as of BEFORE the gate first touched the
+    record. A record the gate wrote earlier is not a stage output: its first
+    values are carried over unchanged, so a repeated call cannot turn
+    "not produced" into "produced" or record WITHHELD as the original status."""
+    if _is_gate_marker(previous):
+        return bool(previous.get("materialized")), previous.get("original_status")
+    if previous is None:
+        return False, None
+    return True, previous.get(status_key) if isinstance(previous, dict) else None
+
+
+def _withheld_marker(previous: Any, inputs: list[str]) -> dict:
     """WITHHELD marker for a dependent output. ``materialized`` is a display
-    field, not a status: True when the stage had produced the output (now
-    masked), False when it was never produced because its governance-
-    withheld input was masked upstream (e.g. no history is extracted for a
-    masked metric, so cfo_yoy is never computed). Governance WITHHELD takes
-    precedence over "not produced": the output is listed either way, so a
-    consumer can see why it has no value."""
+    field, not a status: True when the stage had produced the output before
+    the gate ran (now masked), False when it was never produced because its
+    governance-withheld input was masked upstream (e.g. no history is
+    extracted for a masked metric, so cfo_yoy is never computed). Governance
+    WITHHELD takes precedence over "not produced": the output is listed
+    either way, so a consumer can see why it has no value. Re-applying the
+    gate to its own marker returns an identical marker (idempotent)."""
+    materialized, original_status = _prior_state(previous)
     return {
         "status": STATUS_WITHHELD,
         "value": None,
         "reason_code": DEPENDENT_REASON_WITHHELD,
         "withheld_inputs": inputs,
         "materialized": materialized,
-        "original_status": previous.get("status") if isinstance(previous, dict) else None,
+        "original_status": original_status,
+        "set_by": GATE_MARKER_SET_BY,
         "reason": "Depends on governance-withheld input(s): " + ", ".join(inputs) + "."
         + ("" if materialized else " Not produced: the input was withheld upstream."),
     }
@@ -323,8 +346,7 @@ def relabel_withheld_dependents(
         for name, deps in DERIVED_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
             if inputs:
-                present = name in derived_metrics
-                derived_metrics[name] = _withheld_marker(derived_metrics.get(name), inputs, materialized=present)
+                derived_metrics[name] = _withheld_marker(derived_metrics.get(name), inputs)
                 changed["derived"].append(name)
 
     components = growth.get("components") if isinstance(growth, dict) else None
@@ -333,8 +355,7 @@ def relabel_withheld_dependents(
         for name, deps in GROWTH_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
             if inputs:
-                present = name in components
-                components[name] = _withheld_marker(components.get(name), inputs, materialized=present)
+                components[name] = _withheld_marker(components.get(name), inputs)
                 growth_inputs[name] = inputs
                 changed["growth"].append(name)
         if growth_inputs and isinstance(growth.get("growth"), dict):
@@ -344,12 +365,15 @@ def relabel_withheld_dependents(
         for name, deps in GROWTH_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
             if inputs:
-                present = name in sufficiency
+                materialized, original_status = _prior_state(sufficiency.get(name), "calculation_status")
                 sufficiency[name] = {
                     "metric": name,
                     "calculation_status": STATUS_WITHHELD,
                     "reason_code": SUFFICIENCY_REASON_WITHHELD,
-                    "materialized": present,
+                    "withheld_inputs": inputs,  # additive (2026-11-03)
+                    "materialized": materialized,
+                    "original_status": original_status,  # additive: prior calculation_status
+                    "set_by": GATE_MARKER_SET_BY,
                     "detail": "Depends on governance-withheld input(s): " + ", ".join(inputs) + ".",
                 }
                 changed["data_sufficiency"].append(name)
