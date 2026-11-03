@@ -82,6 +82,8 @@ GROWTH_DEPENDENCIES = {
 }
 
 SUFFICIENCY_REASON_WITHHELD = "GOVERNANCE_WITHHELD"
+# Reason code carried by every WITHHELD dependent marker (derived / growth).
+DEPENDENT_REASON_WITHHELD = "GOVERNANCE_WITHHELD"
 
 
 def _parse_date(value: Any) -> date | None:
@@ -278,13 +280,23 @@ def apply_metric_eligibility_gate(normalized: dict, cik: Any, evaluation_date: A
     }
 
 
-def _withheld_marker(previous: Any, inputs: list[str]) -> dict:
+def _withheld_marker(previous: Any, inputs: list[str], *, materialized: bool = True) -> dict:
+    """WITHHELD marker for a dependent output. ``materialized`` is a display
+    field, not a status: True when the stage had produced the output (now
+    masked), False when it was never produced because its governance-
+    withheld input was masked upstream (e.g. no history is extracted for a
+    masked metric, so cfo_yoy is never computed). Governance WITHHELD takes
+    precedence over "not produced": the output is listed either way, so a
+    consumer can see why it has no value."""
     return {
         "status": STATUS_WITHHELD,
         "value": None,
+        "reason_code": DEPENDENT_REASON_WITHHELD,
         "withheld_inputs": inputs,
+        "materialized": materialized,
         "original_status": previous.get("status") if isinstance(previous, dict) else None,
-        "reason": "Depends on governance-withheld input(s): " + ", ".join(inputs) + ".",
+        "reason": "Depends on governance-withheld input(s): " + ", ".join(inputs) + "."
+        + ("" if materialized else " Not produced: the input was withheld upstream."),
     }
 
 
@@ -294,7 +306,13 @@ def relabel_withheld_dependents(
     growth: dict | None,
     sufficiency: dict | None,
 ) -> dict:
-    """D4: relabel outputs that depend on withheld metrics. In place; returns what changed."""
+    """D4: relabel outputs that depend on withheld metrics. In place; returns what changed.
+
+    STEP 23 (2026-11-03): every dependency-map entry with a withheld input is
+    listed as WITHHELD, including outputs the stage did not produce
+    (materialized=False). Only entries of the dependency maps are added, only
+    into a stage that ran (its container dict exists), and always with value
+    None. R1/R2 (normalized metrics) are not affected."""
     withheld_set = set(withheld)
     changed: dict[str, list[str]] = {"derived": [], "growth": [], "data_sufficiency": []}
     if not withheld_set:
@@ -304,8 +322,9 @@ def relabel_withheld_dependents(
     if isinstance(derived_metrics, dict):
         for name, deps in DERIVED_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
-            if inputs and name in derived_metrics:
-                derived_metrics[name] = _withheld_marker(derived_metrics[name], inputs)
+            if inputs:
+                present = name in derived_metrics
+                derived_metrics[name] = _withheld_marker(derived_metrics.get(name), inputs, materialized=present)
                 changed["derived"].append(name)
 
     components = growth.get("components") if isinstance(growth, dict) else None
@@ -313,8 +332,9 @@ def relabel_withheld_dependents(
     if isinstance(components, dict):
         for name, deps in GROWTH_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
-            if inputs and name in components:
-                components[name] = _withheld_marker(components[name], inputs)
+            if inputs:
+                present = name in components
+                components[name] = _withheld_marker(components.get(name), inputs, materialized=present)
                 growth_inputs[name] = inputs
                 changed["growth"].append(name)
         if growth_inputs and isinstance(growth.get("growth"), dict):
@@ -323,11 +343,13 @@ def relabel_withheld_dependents(
     if isinstance(sufficiency, dict):
         for name, deps in GROWTH_DEPENDENCIES.items():
             inputs = [d for d in deps if d in withheld_set]
-            if inputs and name in sufficiency:
+            if inputs:
+                present = name in sufficiency
                 sufficiency[name] = {
                     "metric": name,
                     "calculation_status": STATUS_WITHHELD,
                     "reason_code": SUFFICIENCY_REASON_WITHHELD,
+                    "materialized": present,
                     "detail": "Depends on governance-withheld input(s): " + ", ".join(inputs) + ".",
                 }
                 changed["data_sufficiency"].append(name)
@@ -343,6 +365,7 @@ __all__ = [
     "LOOKUP_NOT_YET_AVAILABLE",
     "GOVERNED_METRICS",
     "USE_SCOPES",
+    "DEPENDENT_REASON_WITHHELD",
     "DERIVED_DEPENDENCIES",
     "GROWTH_DEPENDENCIES",
     "SUFFICIENCY_REASON_WITHHELD",
