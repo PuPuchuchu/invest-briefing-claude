@@ -59,8 +59,18 @@ FRAME_IDENTITY = ("value", "period_start", "period_end", "filing_date", "form", 
                   "status", "fy", "fp")
 # keys of a gate marker that may change when a V1 marker becomes a V2 marker (status/value may not)
 MARKER_MUTABLE = {"materialized", "reason_code", "set_by", "withheld_inputs", "reason", "detail", "original_status"}
-LEAK_MIN_ABS = 1000
+LARGE_ABS = 1000          # |original| >= this: any numeric token anywhere is a leak (rounded displays: +-0.5)
+VALUE_KEYS = {"value", "val", "amount", "original_value"}   # keys that carry an amount (fy etc. never do)
 ACCN_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
+# SEC snapshot manifest contract, re-implemented from src/fundamentals/sec_snapshot.py (a1a86d7) without importing it
+MANIFEST_VERSION = "SEC_SNAPSHOT_MANIFEST_V1"
+MANIFEST_KEYS = {"manifest_version", "status", "file_count", "files", "inputs_without_stored_file"}
+MANIFEST_FILE_KEYS = {"path", "ticker", "cik", "source", "size_bytes", "sha256"}
+SNAPSHOT_STATUSES = {"OK", "NO_SEC_INPUTS", "INCOMPLETE"}
+RAW_SOURCES = {"CACHE", "FETCHED"}
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CIK_RE = re.compile(r"^[0-9]{10}$")
+TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 MAX_MEMBER = 512 * 1024 * 1024
 
@@ -285,26 +295,145 @@ def recompute_normalized(run: Run, metric: str):
 
 # ---------------------------------------------------------------- leak scan
 NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?")
-def numbers_json(o, path="", out=None):
+def withheld_targets(run: Run) -> list[dict]:
+    """Every amount inside every unmasked original, nested ones included (e.g. stale_observation.value).
+    Magnitude is not filtered: small values and 0 are targets too."""
+    out = []
+    for t, r in run.results.items():
+        for m, o in (gate(r).get("unmasked_originals") or {}).items():
+            names = {m} | {n for deps in (DERIVED_DEPS, GROWTH_DEPS) for n, d in deps.items() if m in d}
+            for p, v in flat(o).items():
+                if parent_and_key(p)[1] in VALUE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
+                    out.append({"ticker": t, "metric": m, "value": float(v), "names": names})
+    return out
+
+
+def same_amount(x: float, t: float) -> bool:
+    if abs(t) >= LARGE_ABS: return abs(x - t) <= 0.5
+    return abs(x - t) <= 1e-9 * max(1.0, abs(t))       # small values: exact (no rounding slack)
+
+
+def _json_leaves(o, path="", ticker=None, out=None):
+    """(path, key, number, ticker context, kind) for every number. kind: "num" (JSON number), "numstr" (a string
+    that is exactly one number, e.g. "3" or "-1,234.5"), "embedded" (a number inside other text)."""
     out = [] if out is None else out
     if isinstance(o, dict):
-        for k, v in o.items(): numbers_json(v, f"{path}/{k}", out)
+        # The outermost record that names a ticker fixes the scope; a nested "ticker" field cannot re-scope
+        # the amounts below it (e.g. {"ticker": "GE", "metrics": {"cfo": {"ticker": "LLY", "value": ...}}} stays GE).
+        tk = ticker if ticker is not None else (o.get("ticker") if isinstance(o.get("ticker"), str) else None)
+        for k, v in o.items(): _json_leaves(v, f"{path}/{k}", tk, out)
     elif isinstance(o, list):
-        for i, v in enumerate(o): numbers_json(v, f"{path}[{i}]", out)
-    elif isinstance(o, (int, float)) and not isinstance(o, bool): out.append((path, float(o)))
+        for i, v in enumerate(o): _json_leaves(v, f"{path}[{i}]", ticker, out)
+    elif isinstance(o, (int, float)) and not isinstance(o, bool):
+        out.append((path, parent_and_key(path)[1], float(o), ticker, "num"))
     elif isinstance(o, str):
-        for t in NUM_RE.findall(o): out.append((path + "#str", float(t.replace(",", ""))))
+        toks = NUM_RE.findall(o)
+        kind = "numstr" if len(toks) == 1 and o.strip() == toks[0] else "embedded"
+        for tok in toks: out.append((path + "#str", parent_and_key(path)[1], float(tok.replace(",", "")), ticker, kind))
     return out
-def numbers_text(txt):
-    return [(f"line {txt.count(chr(10), 0, m.start()) + 1}", float(m.group().replace(",", ""))) for m in NUM_RE.finditer(txt)]
-def leak_hits(nums, targets): return sorted({p for p, x in nums for t in targets if abs(x - t) <= 0.5})
-def withheld_targets(run: Run):
-    out = []
-    for r in run.results.values():
-        for o in (gate(r).get("unmasked_originals") or {}).values():
-            v = (o or {}).get("value") if isinstance(o, dict) else None
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) >= LEAK_MIN_ABS: out.append(float(v))
-    return out
+
+
+def scan_json(obj, targets):
+    """-> (fail_locations, review_locations); locations only, never values.
+    FAIL  : a large original anywhere; a small original (0 included) written as an amount -- a JSON number or a
+            string that is exactly that number -- under a value-like key on a path naming that metric or a
+            dependent, and not inside another ticker's record.
+    REVIEW: a non-zero small original matching anywhere else (ambiguous with counts)."""
+    fail, review = set(), set()
+    for path, key, x, tk, kind in _json_leaves(obj):
+        segs = set(re.split(r"[/\[\]#]", path))
+        for t in targets:
+            if not same_amount(x, t["value"]): continue
+            if abs(t["value"]) >= LARGE_ABS:
+                fail.add(path)
+            elif key in VALUE_KEYS and kind != "embedded" and tk in (None, t["ticker"]) and segs & t["names"]:
+                fail.add(path)
+            elif t["value"] != 0:
+                review.add(path)
+    return sorted(fail), sorted(review)
+
+
+def scan_text(txt, targets):
+    """Markdown/plain text: a large original anywhere -> FAIL; a small original (0 included) on a line that names
+    that metric or a dependent -> REVIEW (line context only)."""
+    fail, review = set(), set()
+    for ln, line in enumerate(txt.splitlines(), 1):
+        nums = [float(m.replace(",", "")) for m in NUM_RE.findall(line)]
+        for t in targets:
+            if not any(same_amount(x, t["value"]) for x in nums): continue
+            if abs(t["value"]) >= LARGE_ABS:
+                fail.add(f"line {ln}")
+            elif any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", line) for n in t["names"]):
+                review.add(f"line {ln}")
+    return sorted(fail), sorted(review)
+
+
+VALUE_ASSIGN_RE = re.compile(r"""\b(?:value|val|amount|original_value)['"]?\s*[:=]\s*['"]?(-?\d[\d,]*(?:\.\d+)?)""")
+def report_leaks(text, targets) -> bool:
+    """Self-check of the checker's own output: large originals anywhere, small ones written as an amount."""
+    nums = [float(m.replace(",", "")) for m in NUM_RE.findall(text)]
+    assigned = [float(m.replace(",", "")) for m in VALUE_ASSIGN_RE.findall(text)]
+    return any(same_amount(x, t["value"]) for t in targets for x in (nums if abs(t["value"]) >= LARGE_ABS else assigned))
+
+
+def safe_relative_posix(path) -> list[str]:
+    """Same rules as sec_snapshot.check_relative_path: plain relative POSIX path inside the snapshot root."""
+    if not isinstance(path, str) or not path: return ["path must be a non-empty string"]
+    e = []
+    if "\x00" in path: e.append("NUL")
+    if "\\" in path: e.append("backslash")
+    if path.startswith("/"): e.append("absolute path")
+    if re.match(r"^[A-Za-z]:", path): e.append("drive-qualified path")
+    if any(seg in ("", ".", "..") for seg in path.split("/")): e.append("empty, '.' or '..' segment")
+    return e
+
+
+def raw_entry_problems(path, ticker, cik, source, size, sha) -> list[str]:
+    """Independent validity of one raw-input description (manifest entry or summary record)."""
+    p = [f"path {x}" for x in safe_relative_posix(path)]
+    if not isinstance(ticker, str) or not TICKER_RE.match(ticker): p.append("invalid ticker")
+    if not isinstance(cik, str) or not CIK_RE.match(cik): p.append("invalid cik (10-digit string)")
+    if source not in RAW_SOURCES: p.append("invalid source (CACHE/FETCHED)")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0: p.append("invalid size_bytes")
+    if not isinstance(sha, str) or not SHA256_RE.match(sha): p.append("invalid sha256 (64 lowercase hex)")
+    return p
+
+
+def manifest_structure_problems(man) -> list[str]:
+    """Mirror of sec_snapshot.validate_manifest_structure (a1a86d7), plus this checker's completeness rule:
+    only a complete stored snapshot (status OK, files present, no input without a stored file) is accepted."""
+    if not isinstance(man, dict): return ["manifest is not an object"]
+    e = []
+    keys = set(man)
+    if MANIFEST_KEYS - keys: e.append(f"missing manifest fields: {sorted(MANIFEST_KEYS - keys)}")
+    if keys - MANIFEST_KEYS: e.append(f"unexpected manifest fields: {sorted(keys - MANIFEST_KEYS)}")
+    if man.get("manifest_version") != MANIFEST_VERSION: e.append(f"unsupported manifest_version {man.get('manifest_version')!r}")
+    status = man.get("status")
+    if status not in SNAPSHOT_STATUSES: e.append(f"invalid status {status!r}")
+    files = man.get("files")
+    if not isinstance(files, list): e.append("files is not a list"); files = []
+    cnt = man.get("file_count")
+    if not isinstance(cnt, int) or isinstance(cnt, bool) or cnt != len(files): e.append(f"file_count {cnt!r} != {len(files)} entries")
+    without = man.get("inputs_without_stored_file")
+    if not isinstance(without, list) or not all(isinstance(x, str) for x in without):
+        e.append("inputs_without_stored_file is not a list of strings"); without = []
+    if status != "OK" or not files or without:
+        e.append(f"snapshot is not complete (status={status!r}, files={len(files)}, inputs_without_stored_file={len(without)}): "
+                 "this checker accepts only a complete stored snapshot")
+    seen = set()
+    for i, f in enumerate(files):
+        if not isinstance(f, dict): e.append(f"files[{i}] is not an object"); continue
+        fk = set(f)
+        if MANIFEST_FILE_KEYS - fk: e.append(f"files[{i}] missing fields {sorted(MANIFEST_FILE_KEYS - fk)}")
+        if fk - MANIFEST_FILE_KEYS: e.append(f"files[{i}] unexpected fields {sorted(fk - MANIFEST_FILE_KEYS)}")
+        e += [f"files[{i}] {x}" for x in raw_entry_problems(f.get("path"), f.get("ticker"), f.get("cik"), f.get("source"),
+                                                            f.get("size_bytes"), f.get("sha256"))]
+        if isinstance(f.get("path"), str):
+            if f["path"] in seen: e.append(f"files[{i}] duplicate path")
+            seen.add(f["path"])
+    paths = [f.get("path") for f in files if isinstance(f, dict)]
+    if all(isinstance(x, str) for x in paths) and paths != sorted(paths): e.append("files are not sorted by path")
+    return e
 
 
 # ---------------------------------------------------------------- checker
@@ -381,39 +510,88 @@ class Checker:
         if hashlib.sha256(mbytes).hexdigest() != snap.get("manifest_sha256"): problems.append("manifest file sha256 != summary")
         canon = json.dumps(man, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
         if canon != mbytes: problems.append("manifest file is not canonical JSON")
-        files = man.get("files") if isinstance(man.get("files"), list) else None
-        if files is None or not all(isinstance(f, dict) for f in files):
-            problems.append("manifest files malformed"); files = []
+        problems += manifest_structure_problems(man)
+        files = [f for f in (man.get("files") if isinstance(man, dict) and isinstance(man.get("files"), list) else []) if isinstance(f, dict)]
         content = [{"path": f.get("path"), "size_bytes": f.get("size_bytes"), "sha256": f.get("sha256")}
                    for f in sorted(files, key=lambda f: str(f.get("path")))]
         csha = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         if csha != snap.get("snapshot_content_sha256"): problems.append("snapshot_content_sha256 recompute mismatch")
         paths = [f.get("path") for f in files]
-        if len(paths) != len(set(paths)): problems.append("duplicate manifest path")
-        for p in paths:
-            if not isinstance(p, str) or member_problems(p) or "/" in p: problems.append(f"unsafe manifest path {p!r}")
-        if man.get("file_count") != len(files) or man.get("status") != "OK" or man.get("inputs_without_stored_file"):
-            problems.append("manifest status/file_count/inputs_without_stored_file")
-        byt = {f.get("ticker"): f for f in files}
-        for rec in run.summary["records"]:
-            ri = rec.get("raw_input")
-            if rec.get("status") != "OK" or not isinstance(ri, dict): continue
-            f = byt.get(rec["ticker"])
-            if not f or (f.get("path"), f.get("sha256"), f.get("size_bytes")) != (ri.get("path"), ri.get("sha256"), ri.get("size_bytes")):
-                problems.append(f"{rec['ticker']}: summary raw_input != manifest")
         self.add(L, "A6 manifest file hashes (independent recompute)", "PASS" if not problems else "FAIL",
                  "; ".join(problems) or f"{len(files)} entries; manifest {snap.get('manifest_sha256')}")
+        self._check_raw_inputs(run, files)
         if run.raw is None:
             self.add(L, "A7 raw files match manifest (size + sha256)", "REVIEW", "raw input not supplied"); return
         bad = []
         for f in files:
             p = f.get("path")
-            if not isinstance(p, str) or not run.raw.has(p): bad.append(f"missing {p}"); continue
+            if not isinstance(p, str) or safe_relative_posix(p) or not run.raw.has(p): bad.append(f"missing/unsafe {p}"); continue
             b = run.raw.bytes(p)
             if len(b) != f.get("size_bytes") or hashlib.sha256(b).hexdigest() != f.get("sha256"): bad.append(f"mismatch {p}")
         extra = sorted(n for n in run.raw.files if n not in set(paths))
         self.add(L, "A7 raw files match manifest (size + sha256)", "FAIL" if bad else "PASS",
                  "; ".join(bad) or f"{len(files)} files match" + (f"; extra raw files not in manifest (ignored): {extra}" if extra else ""))
+
+    def _check_raw_inputs(self, run, files):
+        """A8: summary.raw_input <-> manifest, 1:1, per the batch_runner contract (a1a86d7):
+        - OK      : companyfacts are loaded before the pipeline runs, so raw_input (non-null path/sha256/size)
+                    and a manifest entry are REQUIRED;
+        - ERROR   : raw_input present iff the failure happened after the input was loaded (then it must be in
+                    the manifest); an ERROR with neither raw_input nor raw_source (fetch failed) is the allowed
+                    exception; raw_source without raw_input is impossible (raw_input is written first) -> FAIL;
+        - EXCLUDED_NOT_IN_WATCHLIST / EXCLUDED_COMPANY_TYPE: never fetched -> no raw_input, no raw_source,
+                    no manifest entry."""
+        p, expected = [], {}
+        tickers = [r.get("ticker") for r in run.summary["records"]]
+        if len(tickers) != len(set(tickers)): p.append("duplicate ticker in summary records")
+        for rec in run.summary["records"]:
+            t, st_, ri = rec.get("ticker"), rec.get("status"), rec.get("raw_input")
+            src = rec.get("raw_source")          # None and absent are the same: "no source recorded"
+            if st_ in ("EXCLUDED_NOT_IN_WATCHLIST", "EXCLUDED_COMPANY_TYPE"):
+                if ri is not None: p.append(f"{t}: {st_} but has raw_input")
+                if src is not None: p.append(f"{t}: {st_} but has raw_source (excluded tickers are never fetched)")
+                continue
+            if st_ not in ("OK", "ERROR"): p.append(f"{t}: unknown record status {st_!r}"); continue
+            if ri is None:
+                if st_ == "OK": p.append(f"{t}: OK without raw_input")
+                # batch_runner records raw_input BEFORE raw_source, so a recorded source implies a recorded input
+                elif src is not None: p.append(f"{t}: ERROR has raw_source {src!r} but no raw_input")
+                continue
+            if not isinstance(ri, dict): p.append(f"{t}: raw_input incomplete (not an object)"); continue
+            # validated on its own: two identical wrong values (e.g. cik None on both sides) must not pass
+            bad = raw_entry_problems(ri.get("path"), t, rec.get("cik"), rec.get("raw_source"), ri.get("size_bytes"), ri.get("sha256"))
+            if bad: p.append(f"{t}: raw_input incomplete/invalid ({'; '.join(bad)})")
+            expected[t] = (ri.get("path"), ri.get("sha256"), ri.get("size_bytes"), rec.get("cik"), rec.get("raw_source"))
+        for f in files:
+            bad = raw_entry_problems(f.get("path"), f.get("ticker"), f.get("cik"), f.get("source"), f.get("size_bytes"), f.get("sha256"))
+            if bad: p.append(f"manifest {f.get('ticker')!r}: invalid ({'; '.join(bad)})")
+        mt = [f.get("ticker") for f in files]
+        if len(mt) != len(set(mt)): p.append(f"duplicate ticker in manifest: {sorted({x for x in mt if mt.count(x) > 1})}")
+        got = {f.get("ticker"): (f.get("path"), f.get("sha256"), f.get("size_bytes"), f.get("cik"), f.get("source")) for f in files}
+        missing, extra = sorted(set(expected) - set(got)), sorted(set(got) - set(expected), key=str)
+        if missing: p.append(f"raw_input tickers missing from manifest: {missing}")
+        if extra: p.append(f"manifest tickers without a summary raw_input: {extra}")
+        for t in sorted(set(expected) & set(got)):
+            if expected[t] != got[t]: p.append(f"{t}: summary raw_input/cik/raw_source != manifest entry")
+        n_ok = sum(r.get("status") == "OK" for r in run.summary["records"])
+        n_err_no_raw = sum(r.get("status") == "ERROR" and r.get("raw_input") is None and r.get("raw_source") is None
+                           for r in run.summary["records"])
+        self.add(run.label, "A8 summary.raw_input <-> manifest 1:1 (OK requires raw input)", "PASS" if not p else "FAIL",
+                 "; ".join(p[:10]) or f"{len(expected)} raw inputs = {len(got)} manifest entries; OK={n_ok}; ERROR without raw_input (allowed)={n_err_no_raw}")
+
+    def check_stages(self):
+        """S1: orchestrator a1a86d7 sets derived_metrics / growth / data_sufficiency unconditionally (status OK)
+        for every result it returns, and a batch OK ticker is a returned result -> all three are required."""
+        for run in (self.new, self.base):
+            bad = []
+            for t, r in sorted(run.results.items()):
+                s_ = stages(r)
+                if (s_.get("derived_metrics") or {}).get("status") != "OK" or stage_items(r, "derived") is None: bad.append(f"{t}.derived_metrics")
+                g = (s_.get("growth") or {})
+                if g.get("status") != "OK" or stage_items(r, "growth") is None or not isinstance(growth_agg(r), dict): bad.append(f"{t}.growth")
+                if (s_.get("data_sufficiency") or {}).get("status") != "OK" or stage_items(r, "data_sufficiency") is None: bad.append(f"{t}.data_sufficiency")
+            self.add(run.label, "S1 required stages present (derived_metrics, growth, data_sufficiency; every OK ticker)",
+                     "PASS" if not bad else "FAIL", f"missing/malformed: {bad[:12]}" if bad else f"{len(run.results)} tickers x 3 stages")
 
     # ---------- P/M: profile binding and dependency-map currency
     def check_profile(self):
@@ -526,7 +704,8 @@ class Checker:
         problems, notes = [], []
         for stage, deps in STAGE_DEPS.items():
             items = stage_items(r, stage)
-            expected = [n for n, d in deps.items() if set(d) & set(W) and items is not None and n in items]
+            if items is None: problems.append(f"{stage}: stage output missing (required)"); continue
+            expected = [n for n, d in deps.items() if set(d) & set(W) and n in items]
             got = list(rel.get(stage) or [])
             if sorted(got) != sorted(expected): problems.append(f"{stage}: relabelled {sorted(got)} expected (produced) {sorted(expected)}")
             for n in expected:
@@ -544,7 +723,8 @@ class Checker:
                 if n not in expected and isinstance(item, dict) and (is_marker(item) or item.get(STATUS_KEY[stage]) == "WITHHELD"):
                     problems.append(f"{stage}.{n}: WITHHELD/marker outside the produced dependency set")
         ag = growth_agg(r)
-        if isinstance(ag, dict) and sorted(ag.get("withheld_components") or []) != sorted(rel.get("growth") or []):
+        if not isinstance(ag, dict): problems.append("growth.growth aggregate missing (required)")
+        elif sorted(ag.get("withheld_components") or []) != sorted(rel.get("growth") or []):
             problems.append(f"growth.withheld_components {ag.get('withheld_components')} != relabelled growth")
         self.add(run.label, f"B2-B4 {t} dependents (V1 rule: produced only)", "PASS" if not problems else "FAIL",
                  "; ".join(problems) or "relabelled " + ", ".join(notes))
@@ -557,7 +737,8 @@ class Checker:
         problems, notes = [], []
         for stage, deps in STAGE_DEPS.items():
             items = stage_items(r, stage)
-            expected = [n for n, d in deps.items() if set(d) & set(W)] if items is not None else []
+            if items is None: problems.append(f"{stage}: stage output missing (required)"); continue
+            expected = [n for n, d in deps.items() if set(d) & set(W)]
             got = list(rel.get(stage) or [])
             if sorted(got) != sorted(expected): problems.append(f"{stage}: relabelled {sorted(got)} expected {sorted(expected)}")
             pexp = ((prof.get("relabelled") or {}).get(t) or {}).get(stage)
@@ -582,8 +763,9 @@ class Checker:
                 if n not in expected and (is_marker(item) or (isinstance(item, dict) and item.get(STATUS_KEY[stage]) == "WITHHELD")):
                     problems.append(f"{stage}.{n}: WITHHELD/marker outside the dependency set")
         ag = growth_agg(r)
-        gexp = sorted(n for n, d in GROWTH_DEPS.items() if set(d) & set(W)) if stage_items(r, "growth") is not None else []
-        if isinstance(ag, dict) and sorted(ag.get("withheld_components") or []) != gexp:
+        gexp = sorted(n for n, d in GROWTH_DEPS.items() if set(d) & set(W))
+        if not isinstance(ag, dict): problems.append("growth.growth aggregate missing (required)")
+        elif sorted(ag.get("withheld_components") or []) != gexp:
             problems.append(f"growth.withheld_components {ag.get('withheld_components')} expected {gexp}")
         self.add(run.label, f"B2-B4 {t} dependents (V2 rule: all listed; marker structure; vs BASE)", "PASS" if not problems else "FAIL",
                  "; ".join(problems) or "; ".join(notes))
@@ -801,19 +983,24 @@ class Checker:
         for run in (self.new, self.base):
             targets = withheld_targets(run)
             if not targets:
-                self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", "REVIEW", "no comparable WITHHELD value (>=1000) to scan for")
+                n_w = sum(len(gate(r).get("withheld") or []) for r in run.results.values())
+                self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", "PASS",
+                         "no WITHHELD originals" if not n_w else f"{n_w} withheld metric(s) carry no numeric original: nothing to leak")
                 continue
-            hits = []
+            fail, review = [], []
             for name, obj in (("coverage.json", run.coverage), ("summary.json", run.summary)):
-                hits += [name + p for p in leak_hits(numbers_json(obj), targets)]
+                f, r = scan_json(obj, targets); fail += [name + p for p in f]; review += [name + p for p in r]
             for name, txt in (("coverage.md", run.coverage_md), ("summary.md", run.summary_md)):
-                hits += [name + " " + p for p in leak_hits(numbers_text(txt), targets)]
-            self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", "PASS" if not hits else "FAIL",
-                     f"{len(targets)} value(s) scanned; hit locations={hits[:10]}")
+                f, r = scan_text(txt, targets); fail += [f"{name} {p}" for p in f]; review += [f"{name} {p}" for p in r]
+            small = sum(abs(t["value"]) < LARGE_ABS for t in targets)
+            v = "FAIL" if fail else ("REVIEW" if review else "PASS")
+            self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", v,
+                     f"{len(targets)} original amount(s) scanned, {small} small (exact match + context rules); "
+                     f"leak locations={fail[:10]}; ambiguous small-value matches={review[:10]}")
         self.targets = withheld_targets(self.new) + withheld_targets(self.base)
 
     def run(self):
-        self.check_integrity(); self.check_profile(); self.check_governance(); self.check_coverage(); self.check_diff(); self.check_pit(); self.check_leak()
+        self.check_integrity(); self.check_profile(); self.check_stages(); self.check_governance(); self.check_coverage(); self.check_diff(); self.check_pit(); self.check_leak()
         return self.res
 
 
@@ -907,15 +1094,14 @@ def main(argv=None):
               f"BASE input sha256={base.arc.zip_sha256 or 'directory'} raw={base.raw.zip_sha256 if base.raw else None}")
     text, overall = render(res, header)
     # self-check: the report itself must not contain a WITHHELD original value
-    hits = leak_hits(numbers_text(text), ck.targets)
-    if hits:
+    if report_leaks(text, ck.targets):
         print("[FAIL] report self-check: output would contain a WITHHELD original value; report suppressed"); return 1
     print(text)
     if a.json_out:
         rep = {"version": VERSION, "overall": overall, "results": [dict(zip(("layer", "check", "verdict", "detail"), r)) for r in res],
                "diff_paths": ck.diff_report}
         blob = json.dumps(rep, indent=1, sort_keys=True)
-        if leak_hits(numbers_text(blob), ck.targets):
+        if report_leaks(blob, ck.targets):
             print("[FAIL] json report self-check failed; not written"); return 1
         with open(a.json_out, "w", encoding="utf-8") as fh: fh.write(blob)
     return {"PASS": 0, "FAIL": 1, "REVIEW": 2}[overall]
