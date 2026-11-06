@@ -1,0 +1,33 @@
+{
+ "profile_version": 1,
+ "name": "STEP23_PR15_CUTOVER_2026-11-03",
+ "description": "Expectations for one pair only: BASE = last batch before PR #15 (DEC055 gate V1), NEW = first batch after PR #15 (V2). Same evaluation date. Not valid for any other run.",
+ "applies_to": {
+  "evaluation_date": "2026-11-03",
+  "base": {"github_run_id": "41635418135", "github_sha": "83276c5a1e18f3c7406bc4fa2a7a937ad87221fe", "governance_policy_version": "DEC055_GATE_V1_RELABEL_PRODUCED_DEPENDENTS"},
+  "new": {"github_run_id": "41643336129", "github_sha": "a1a86d70a9745eb0be1299587b6151d85bf1116d", "governance_policy_version": "DEC055_GATE_V2_RELABEL_ALL_DEPENDENTS"}
+ },
+ "mapping_source": {"file": "src/fundamentals/metric_eligibility_registry.py", "commit": "a1a86d70a9745eb0be1299587b6151d85bf1116d",
+                    "file_sha256_at_commit": "a1178eba0af6fb3d8d5ed72d10a9cb44945e12d8d1609f34ca129c5008ea335b"},
+ "gate": {"GE": {"withheld": ["operating_income", "cfo", "capex"], "scoped": ["current_debt", "noncurrent_debt", "total_debt"],
+                 "not_yet_available": [], "no_record": []}},
+ "relabelled": {"GE": {"derived": ["fcf", "fcf_margin", "cfo_yoy", "capex_yoy", "operating_margin", "operating_income_yoy"],
+                       "growth": ["fcf_yoy", "operating_income_yoy"], "data_sufficiency": ["fcf_yoy", "operating_income_yoy"]}},
+ "materialization": {"GE": {
+  "derived": {"cfo_yoy": [false, null], "capex_yoy": [false, null], "operating_income_yoy": [false, null],
+              "fcf": [true, "MISSING"], "fcf_margin": [true, "MISSING"], "operating_margin": [true, "MISSING"]},
+  "growth": {"fcf_yoy": [true, "MISSING"], "operating_income_yoy": [true, "MISSING"]},
+  "data_sufficiency": {"fcf_yoy": [true, "MISSING"], "operating_income_yoy": [true, "MISSING"]}}},
+ "derived_totals": {"cfo_yoy": [17, 18], "capex_yoy": [17, 18], "operating_income_yoy": [16, 17]},
+ "derived_status_new": {"cfo_yoy": {"OK": 16, "MISSING": 1, "WITHHELD": 1},
+                        "capex_yoy": {"OK": 16, "MISSING": 1, "WITHHELD": 1},
+                        "operating_income_yoy": {"OK": 15, "MISSING": 1, "WITHHELD": 1}},
+ "non_governance_gaps": {
+  "LLY": {"derived": {"operating_income_yoy": "ABSENT"}, "growth": {"operating_income_yoy": "MISSING"},
+          "data_sufficiency": {"operating_income_yoy": "MISSING/CONCEPT_NOT_FOUND"}},
+  "CRWV": {"derived": {"cfo_yoy": "MISSING", "capex_yoy": "MISSING", "operating_income_yoy": "MISSING"}}},
+ "diff_classes": {"GE": ["RUN_METADATA", "GOVERNANCE_MARKER"], "AAPL": ["RUN_METADATA", "FRAME_METADATA_ONLY"], "*": ["RUN_METADATA"]},
+ "raw_changed": ["AAPL"],
+ "post_cutoff_cases": [{"ticker": "AAPL", "accession": "0000320193-26-000026", "form": "10-K"},
+                       {"ticker": "PLTR", "accession": "0001321655-26-000048", "form": "10-Q", "metric": "cash"}]
+}
