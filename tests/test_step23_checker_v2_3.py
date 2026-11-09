@@ -43,6 +43,12 @@ def metric(name, value, accn="0000000001-26-000010", frame=None, **kw):
     m.update(kw); return m
 
 
+def total_debt_composite(status="OK"):
+    """Production shape (sec_normalizer.calculate_total_debt): parent without SEC identity, exactly two components."""
+    return {"metric": "total_debt", "status": status, "value": 20_000 if status == "OK" else None, "unit": "USD",
+            "components": {"current_debt": metric("current_debt", 5_000), "noncurrent_debt": metric("noncurrent_debt", 15_000)}}
+
+
 def v1_marker(inputs, orig="MISSING"):
     return {"status": "WITHHELD", "value": None, "withheld_inputs": inputs, "original_status": orig, "reason": "dep"}
 
@@ -61,10 +67,10 @@ def ok(v=0.1): return {"status": "OK", "value": v}
 def ticker(t, policy, frame="CY2025"):
     v2 = policy == "V2"
     metrics = {"revenue": metric("revenue", 100_000 + len(t), frame=frame if t == "AAPL" else None),
-               "cash": metric("cash", 50_000), "total_debt": metric("total_debt", 20_000),
+               "cash": metric("cash", 50_000), "total_debt": total_debt_composite(),
                "cfo": metric("cfo", 30_000), "capex": metric("capex", -5_000), "operating_income": metric("operating_income", 40_000)}
     gate = {"status": "OK", "withheld": [], "scoped": [], "not_yet_available": [], "no_record": ["cfo"],
-            "relabelled": {"derived": [], "growth": [], "data_sufficiency": []}}
+            "unmasked_originals": {}, "relabelled": {"derived": [], "growth": [], "data_sufficiency": []}}
     derived = {"fcf": ok(), "fcf_margin": ok(), "cfo_yoy": ok(), "capex_yoy": ok(), "operating_margin": ok(),
                "operating_income_yoy": ok(), "net_debt": ok(), "debt_to_cash": ok()}
     comps = {"fcf_yoy": ok(), "operating_income_yoy": ok()}
@@ -140,7 +146,7 @@ class Pair:
         man = {"manifest_version": "SEC_SNAPSHOT_MANIFEST_V1", "status": "OK", "file_count": len(entries), "files": entries,
                "inputs_without_stored_file": []}
         mb = canon(man)
-        content = hashlib.sha256(canon([{k: e[k] for k in ("path", "size_bytes", "sha256")} for e in entries])).hexdigest()
+        content = hashlib.sha256(canon([{k: e.get(k) for k in ("path", "size_bytes", "sha256")} for e in entries if isinstance(e, dict)])).hexdigest()
         msha = hashlib.sha256(mb).hexdigest()
         sha = SHA_N if lab == "NEW" else SHA_B
         records = [{"ticker": t, "cik": "0000000001", "status": "OK", "company_type": "NON_FINANCIAL", "raw_source": "FETCHED",
@@ -1090,6 +1096,687 @@ class RawSourceWithoutInput(unittest.TestCase):
         code, out = self._run({"ticker": "ERRL", "cik": "0000000001", "status": "ERROR", "company_type": "NON_FINANCIAL", "raw_source": "FETCHED",
                                "raw_input": {"path": "ERRL_companyfacts.json", "sha256": "0" * 64, "size_bytes": 10}})
         self.assertEqual(verdict(out, "A8", "NEW"), "FAIL"); self.assertIn("missing from manifest", out)
+
+
+
+class MalformedTypesNeverCrash(unittest.TestCase):
+    """Final hardening: malformed JSON types produce a FAIL report, never a traceback (and never hash a bad value)."""
+
+    def _assert_fail_report(self, code, out):
+        self.assertEqual(code, 1, out)
+        self.assertIn("OVERALL FAIL", out); self.assertNotIn("Traceback", out)
+
+    def test_manifest_ticker_non_string(self):
+        for label, bad in (("list", ["AAPL"]), ("dict", {"t": "AAPL"}), ("null", None), ("int", 7), ("bool", True), ("float", 1.5)):
+            with self.subTest(ticker=label):
+                p = Pair(); p.manifest_mut["NEW"] = lambda es, b=bad: es[0].update(ticker=copy.deepcopy(b))
+                code, out = run_pair(p, profile=None)
+                self._assert_fail_report(code, out)
+                self.assertEqual(verdict(out, "A6", "NEW"), "FAIL"); self.assertEqual(verdict(out, "A8", "NEW"), "FAIL")
+                self.assertIn("non-string ticker", out); self.assertNotIn(" X0 ", out)
+
+    def test_string_ticker_normal_and_duplicate(self):
+        code, out = run_pair(Pair(), profile=None); self.assertEqual(code, 0, out)
+        def dup(es):
+            e = dict(es[0]); e["path"] = "AAPL_dup.json"; es.append(e); es.sort(key=lambda x: x["path"])
+        p = Pair(); p.manifest_mut["NEW"] = dup
+        code, out = run_pair(p, profile=None)
+        self._assert_fail_report(code, out); self.assertIn("duplicate ticker in manifest: ['AAPL']", out)
+
+    def test_other_manifest_fields_unhashable(self):
+        for field in ("path", "source", "cik", "sha256", "size_bytes"):
+            for bad in (["x"], {"x": 1}):
+                with self.subTest(field=field, bad=type(bad).__name__):
+                    p = Pair(); p.manifest_mut["NEW"] = lambda es, f=field, b=bad: es[0].update({f: copy.deepcopy(b)})
+                    code, out = run_pair(p, profile=None)
+                    self._assert_fail_report(code, out); self.assertEqual(verdict(out, "A6", "NEW"), "FAIL")
+                    self.assertNotIn(" X0 ", out)          # handled by the owning checks, not by group isolation
+
+    def test_manifest_entry_not_an_object(self):
+        for bad in (["AAPL"], "AAPL", None, 3):
+            with self.subTest(entry=type(bad).__name__):
+                p = Pair(); p.manifest_mut["NEW"] = lambda es, b=bad: es.__setitem__(0, copy.deepcopy(b))
+                code, out = run_pair(p, profile=None)
+                self._assert_fail_report(code, out); self.assertEqual(verdict(out, "A6", "NEW"), "FAIL")
+
+    def test_summary_raw_source_unhashable(self):
+        for bad in (["FETCHED"], {"s": "FETCHED"}):
+            with self.subTest(bad=type(bad).__name__):
+                p = Pair(); p.summary_mut["NEW"] = lambda s, b=bad: s["records"][0].update(raw_source=copy.deepcopy(b))
+                code, out = run_pair(p, profile=None)
+                self._assert_fail_report(code, out); self.assertEqual(verdict(out, "A8", "NEW"), "FAIL")
+
+    def test_gate_and_stage_values_malformed(self):
+        cases = {
+            "withheld item list": lambda p: ge_gate(p)["withheld"].append(["cfo"]),
+            "scoped not a list": lambda p: ge_gate(p).update(scoped=3),
+            "relabelled item dict": lambda p: ge_gate(p)["relabelled"]["derived"].append({"x": 1}),
+            "unmasked_originals not an object": lambda p: ge_gate(p).update(unmasked_originals=[1]),
+            "derived status list": lambda p: ge(p)["fcf"].update(status=["WITHHELD"]),
+            "sufficiency status dict": lambda p: ge(p, stage="data_sufficiency")["fcf_yoy"].update(calculation_status={"s": 1}),
+            "withheld_components int": lambda p: p.res["NEW"]["GE"]["stages"]["growth"]["growth"]["growth"].update(withheld_components=5),
+            "stages is a list": lambda p: p.res["NEW"]["LLY"].update(stages=[1]),
+            "pit_gating is a list": lambda p: p.res["NEW"]["LLY"]["stages"].update(pit_gating=[1]),
+        }
+        for label, fn in cases.items():
+            with self.subTest(case=label):
+                p = Pair(); fn(p)
+                code, out = run_pair(p, profile=None); self._assert_fail_report(code, out)
+
+    def test_unhashable_status_counted_not_crashed(self):
+        p = Pair(); ge(p)["fcf"].update(status=["WITHHELD"])
+        code, out = run_pair(p, profile=None)
+        self.assertIsNotNone(verdict(out, "C1", "NEW")); self.assertNotIn("X0 coverage", out)
+
+    def test_gate_malformed_is_named_by_b0(self):
+        p = Pair(); ge_gate(p)["withheld"].append(["cfo"])
+        code, out = run_pair(p, profile=None)
+        self.assertEqual(verdict(out, "B0", "NEW"), "FAIL"); self.assertIn("gate structure malformed (withheld is a list with non-string items", out)
+
+    def test_check_group_isolation(self):
+        """An unexpected exception in one group is FAIL for that group only; the others still report."""
+        orig = ck.Checker.check_diff
+        def boom(self): raise KeyError(SECRET["cfo"])
+        ck.Checker.check_diff = boom
+        try:
+            code, out = run_pair(Pair(), profile=None)
+        finally:
+            ck.Checker.check_diff = orig
+        self._assert_fail_report(code, out)
+        self.assertIn("X0 run comparison (D) checks aborted on malformed input", out); self.assertIn("KeyError in boom", out)
+        for cid in ("A1", "B2-B4", "C1", "E1", "F1"): self.assertEqual(verdict(out, cid), "PASS", cid)
+        self.assertNotIn(str(SECRET["cfo"]), out)              # exception text (here: a WITHHELD value) is never printed
+
+    def test_targets_collected_before_any_group(self):
+        orig = ck.Checker.check_integrity
+        seen = {}
+        def probe(self): seen["targets"] = list(self.targets); raise RuntimeError("x")
+        ck.Checker.check_integrity = probe
+        try:
+            run_pair(Pair(), profile=None)
+        finally:
+            ck.Checker.check_integrity = orig
+        self.assertEqual(sorted(t["value"] for t in seen["targets"]) , sorted(float(v) for v in list(SECRET.values()) * 2))
+
+    def test_main_last_line_of_defence(self):
+        orig = ck.Checker.run
+        def boom(self): raise ValueError(SECRET["capex"])
+        ck.Checker.run = boom
+        try:
+            code, out = run_pair(Pair(), profile=None)
+        finally:
+            ck.Checker.run = orig
+        self.assertEqual(code, 1); self.assertIn("[FAIL] checker could not complete: ValueError", out)
+        self.assertNotIn(str(SECRET["capex"]), out); self.assertNotIn("Traceback", out)
+
+
+def ge_gate(p, lab="NEW"):
+    return p.res[lab]["GE"]["stages"]["eligibility_gate"]
+
+
+
+def stg(p, lab, t="AAPL"):
+    return p.res[lab][t]["stages"]
+
+
+class SymmetricSchema(unittest.TestCase):
+    """Round 5: identical damage in BASE and NEW must still FAIL, in the owning per-run check (T0/B0/B5), not X0."""
+
+    def _sym(self, fn, labs=("NEW", "BASE")):
+        p = Pair()
+        for lab in labs: fn(p, lab)
+        return run_pair(p, profile=None)
+
+    def _owner_fail(self, out, code, check, labs=("NEW", "BASE"), text=None):
+        self.assertEqual(code, 1, out); self.assertIn("OVERALL FAIL", out); self.assertNotIn(" X0 ", out)
+        for lab in labs: self.assertEqual(verdict(out, check, lab), "FAIL", f"{check}[{lab}]\n{out}")
+        if text: self.assertIn(text, out)
+
+    def test_gpt_case_a_status_list_both_runs(self):
+        """GPT repro: fcf.status = ["MALFORMED_STATUS"] in both runs, coverage consistent with it -> was PASS."""
+        code, out = self._sym(lambda p, lab: stg(p, lab)["derived_metrics"]["derived"]["derived_metrics"]["fcf"].update(status=["MALFORMED_STATUS"]))
+        self._owner_fail(out, code, "T0", text="derived_metrics.fcf.status is list, not a string")
+
+    def test_containers_not_objects(self):
+        """normalized.metrics has no other owner than T0 (S1 covers only the three computed stages)."""
+        for label, fn in (("normalized.metrics", lambda p, lab: stg(p, lab)["normalization"]["normalized"].update(metrics=[{"metric": "cash"}])),
+                          ("eligibility_gate.unmasked_originals.cfo", lambda p, lab: stg(p, lab, "GE")["eligibility_gate"]["unmasked_originals"].update(cfo=["x"]))):
+            with self.subTest(container=label):
+                code, out = self._sym(fn)
+                self._owner_fail(out, code, "T0", text=label)
+
+    def test_derived_item_not_object(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab)["derived_metrics"]["derived"]["derived_metrics"].update(fcf=["x"]))
+        self._owner_fail(out, code, "T0", text="derived_metrics.fcf is list, not an object")
+
+    def test_derived_status_list_or_dict(self):
+        for bad in (["OK"], {"s": "OK"}):
+            with self.subTest(bad=type(bad).__name__):
+                code, out = self._sym(lambda p, lab, b=bad: stg(p, lab)["derived_metrics"]["derived"]["derived_metrics"]["fcf"].update(status=copy.deepcopy(b)))
+                self._owner_fail(out, code, "T0")
+
+    def test_normalized_status_list_or_dict(self):
+        for bad in (["OK"], {"s": "OK"}):
+            with self.subTest(bad=type(bad).__name__):
+                code, out = self._sym(lambda p, lab, b=bad: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(status=copy.deepcopy(b)))
+                self._owner_fail(out, code, "T0", text="normalized.metrics.revenue.status is")
+
+    def test_growth_component_not_object(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab)["growth"]["growth"]["components"].update(fcf_yoy=["x"]))
+        self._owner_fail(out, code, "T0", text="growth.components.fcf_yoy is list")
+
+    def test_growth_aggregate_status_not_string(self):
+        for bad in (1, ["OK"], None):
+            with self.subTest(bad=repr(bad)):
+                code, out = self._sym(lambda p, lab, b=bad: stg(p, lab)["growth"]["growth"]["growth"].update(status=copy.deepcopy(b)))
+                self._owner_fail(out, code, "T0", text="growth aggregate status is")
+
+    def test_withheld_components_dict_or_int(self):
+        """GPT Case B: {"bad": 1} was silently treated as an empty list -> PASS."""
+        for t in ("AAPL", "GE"):
+            for bad in ({"bad": 1}, 5):
+                with self.subTest(ticker=t, bad=repr(bad)):
+                    code, out = self._sym(lambda p, lab, b=bad, t=t: stg(p, lab, t)["growth"]["growth"]["growth"].update(withheld_components=copy.deepcopy(b)))
+                    self._owner_fail(out, code, "T0", text="withheld_components is")
+                    if t == "GE":                       # the dependent rule says it cannot evaluate, rather than passing
+                        line = [l for l in out.splitlines() if "] NEW  B2-B4 GE" in l][0]
+                        self.assertIn("FAIL", line); self.assertIn("growth.withheld_components malformed (see T0)", line)
+
+    def test_sufficiency_item_not_object(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab)["data_sufficiency"]["sufficiency"].update(fcf_yoy=["x"]))
+        self._owner_fail(out, code, "T0", text="data_sufficiency.sufficiency.fcf_yoy is list")
+
+    def test_calculation_status_dict_or_list(self):
+        for bad in ({"s": "OK"}, ["OK"]):
+            with self.subTest(bad=type(bad).__name__):
+                code, out = self._sym(lambda p, lab, b=bad: stg(p, lab)["data_sufficiency"]["sufficiency"]["fcf_yoy"].update(calculation_status=copy.deepcopy(b)))
+                self._owner_fail(out, code, "T0", text="calculation_status is")
+
+    def test_frame_bad_types_new_only(self):
+        """GPT Case C (frame = []) plus non-empty containers, which a flattened scan would miss."""
+        for bad in ([], ["CY2025"], {}, {"a": 1}, 2025, True):
+            with self.subTest(bad=repr(bad)):
+                code, out = self._sym(lambda p, lab, b=bad: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(frame=copy.deepcopy(b)), labs=("NEW",))
+                self._owner_fail(out, code, "T0", labs=("NEW",), text="/frame is")
+                self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+
+    def test_frame_bad_type_both_runs(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(frame=["CY2025"]))
+        self._owner_fail(out, code, "T0")
+
+    def test_frame_string_or_null_change_still_allowed(self):
+        for val in ("CY2024", None):
+            with self.subTest(val=val):
+                code, out = self._sym(lambda p, lab, v=val: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(frame=v), labs=("NEW",))
+                self.assertEqual(code, 0, out); self.assertEqual(verdict(out, "T0", "NEW"), "PASS"); self.assertIn("FRAME_METADATA_ONLY", out)
+
+    def test_identity_field_types_both_runs(self):
+        for field, bad in (("filing_date", []), ("accession", {"a": 1}), ("period_end", 20251231), ("fy", "2025"), ("value", "100"), ("unit", True)):
+            with self.subTest(field=field):
+                code, out = self._sym(lambda p, lab, f=field, b=bad: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update({f: copy.deepcopy(b)}))
+                self._owner_fail(out, code, "T0", text=f"normalized.metrics.revenue.{field} is")
+
+    def test_ok_observation_without_source_identity(self):
+        """An OK value with no filing date could never be PIT-checked (E1 only compares strings)."""
+        for field in ("filing_date", "accession", "period_end", "value"):
+            with self.subTest(field=field):
+                code, out = self._sym(lambda p, lab, f=field: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update({f: None}))
+                self._owner_fail(out, code, "T0", text="status OK without valid source identity")
+
+    def test_non_ok_observation_may_lack_identity(self):
+        def fn(p, lab):
+            m = stg(p, lab)["normalization"]["normalized"]["metrics"]["cash"]
+            m.update(status="MISSING", value=None, filing_date=None, accession=None, period_end=None)
+        code, out = self._sym(fn)
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS"); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+
+    def test_composite_components_checked(self):
+        def comp(p, lab, bad):
+            m = stg(p, lab)["normalization"]["normalized"]["metrics"]["total_debt"]
+            m["components"] = {"current_debt": dict(metric("current_debt", 5_000)), "noncurrent_debt": bad}
+            for k in ("filing_date", "accession", "period_end"): m.pop(k, None)
+        code, out = self._sym(lambda p, lab: comp(p, lab, dict(metric("noncurrent_debt", 15_000))))
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out)          # composite without top-level identity is valid
+        code, out = self._sym(lambda p, lab: comp(p, lab, ["x"]))
+        self._owner_fail(out, code, "T0", text="components.noncurrent_debt is list")
+        code, out = self._sym(lambda p, lab: comp(p, lab, dict(metric("noncurrent_debt", 15_000), filing_date=None)))
+        self._owner_fail(out, code, "T0", text="components.noncurrent_debt: status OK without valid source identity")
+
+    def test_non_governed_withheld_components_both_runs(self):
+        """Well-typed but impossible: a ticker with no withheld input lists withheld growth components."""
+        code, out = self._sym(lambda p, lab: stg(p, lab)["growth"]["growth"]["growth"].update(withheld_components=["fcf_yoy"]))
+        self._owner_fail(out, code, "B5", text="AAPL: growth.withheld_components non-empty")
+
+    def test_gate_malformed_both_runs_named_not_isolated(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab, "GE")["eligibility_gate"]["withheld"].append(["cfo"]))
+        self._owner_fail(out, code, "B0", text="gate structure malformed (withheld is a list with non-string items")
+        self.assertIn("not evaluated: gate fields malformed (see B0)", out)
+
+    def test_t0_is_independent_of_comparison(self):
+        """Same damage on both sides: D2 sees no change and C1 agrees with itself; only T0 can fail it."""
+        code, out = self._sym(lambda p, lab: stg(p, lab)["derived_metrics"]["derived"]["derived_metrics"]["fcf"].update(status=["X"]))
+        self.assertEqual(verdict(out, "D2"), "PASS"); self.assertEqual(verdict(out, "C1", "NEW"), "PASS")
+        self.assertEqual(verdict(out, "T0", "NEW"), "FAIL")
+
+
+
+class PitIdentityAndGateClosure(unittest.TestCase):
+    """Round 6: PIT source identity is validated semantically, composite components need a status, and an applied
+    gate has its exact production structure. Symmetric damage must FAIL in the owning check (T0 / B0), not X0."""
+
+    def _sym(self, fn, labs=("NEW", "BASE")):
+        p = Pair()
+        for lab in labs: fn(p, lab)
+        return run_pair(p, profile=None)
+
+    def _owner_fail(self, out, code, check, labs=("NEW", "BASE"), text=None):
+        self.assertEqual(code, 1, out); self.assertIn("OVERALL FAIL", out); self.assertNotIn(" X0 ", out)
+        for lab in labs: self.assertEqual(verdict(out, check, lab), "FAIL", f"{check}[{lab}]\n{out}")
+        if text: self.assertIn(text, out)
+
+    def _rev(self, p, lab): return stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"]
+
+    # ---- PIT identity: normalized OK observation
+    def test_gpt_f1_filing_date_and_accession(self):
+        for upd in ({"filing_date": "0000"}, {"accession": "bad"}, {"filing_date": "0000", "accession": "bad"}):
+            with self.subTest(upd=upd):
+                code, out = self._sym(lambda p, lab, u=upd: self._rev(p, lab).update(u))
+                self._owner_fail(out, code, "T0", text="status OK without valid source identity")
+
+    def test_invalid_dates_semantic_not_lexicographic(self):
+        """'2025-13-01', '2025-02-30', '20251231', '2025-1-01' would all survive a string comparison."""
+        for field in ("filing_date", "period_end", "period_start"):
+            for bad in ("2025-13-01", "2025-02-30", "20251231", "2025-1-01", "2025-12-31T00:00", "0000"):
+                with self.subTest(field=field, bad=bad):
+                    code, out = self._sym(lambda p, lab, f=field, b=bad: self._rev(p, lab).update({f: b}))
+                    self._owner_fail(out, code, "T0", text=field)
+
+    def test_accession_format(self):
+        for bad in ("bad", "0000000001-26-00001", "000000001-26-000010", "0000000001_26_000010", "0000000001-26-0000100", " 0000000001-26-000010"):
+            with self.subTest(bad=bad):
+                code, out = self._sym(lambda p, lab, b=bad: self._rev(p, lab).update(accession=b))
+                self._owner_fail(out, code, "T0", text="accession")
+
+    def test_value_bool_nan_infinity(self):
+        for bad in (True, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=repr(bad)):
+                code, out = self._sym(lambda p, lab, b=bad: self._rev(p, lab).update(value=b))
+                self._owner_fail(out, code, "T0")
+
+    def test_valid_identity_passes(self):
+        def fn(p, lab):
+            self._rev(p, lab).update(filing_date="2024-02-29", period_end="2023-12-31", period_start="2023-01-01",
+                                     accession="0000320193-24-000123", value=-1.5)
+        code, out = self._sym(fn)
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+
+    def test_null_period_start_allowed_for_instant(self):
+        code, out = self._sym(lambda p, lab: self._rev(p, lab).update(period_start=None))
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out)
+
+    def test_non_ok_statuses_still_allowed(self):
+        for status in ("MISSING", "NOT_APPLICABLE", "INCOMPLETE"):
+            with self.subTest(status=status):
+                def fn(p, lab, st_=status):
+                    stg(p, lab)["normalization"]["normalized"]["metrics"]["cash"].update(
+                        status=st_, value=None, filing_date=None, accession=None, period_end=None, period_start=None, frame=None)
+                code, out = self._sym(fn)
+                self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+        code, out = run_pair(Pair(), profile=None)          # GE's masked WITHHELD metrics (value null) are valid
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out)
+
+    def test_identity_keys_validated_anywhere(self):
+        """E1/E2 read every filing_date / accession in the result, so T0 checks them wherever they occur."""
+        def fn(p, lab):
+            stg(p, lab).setdefault("debt_tiers", {})["total_debt_including_finance_leases"] = {"status": "INCOMPLETE", "accession": "bad", "period_end": "2025-99-99"}
+        code, out = self._sym(fn)
+        self._owner_fail(out, code, "T0", text="debt_tiers/total_debt_including_finance_leases/accession is not an SEC accession")
+
+    def test_identity_dates_validated_anywhere_alone(self):
+        """A malformed date on its own, outside normalized metrics and history (where only the walk sees it)."""
+        for where, fn in (("debt_tiers", lambda p, lab: stg(p, lab).__setitem__("debt_tiers", {"tier2": {"status": "INCOMPLETE", "period_end": "2025-99-99"}})),
+                          ("derived", lambda p, lab: stg(p, lab)["derived_metrics"]["derived"]["derived_metrics"]["fcf"].update(filing_date="0000"))):
+            with self.subTest(where=where):
+                code, out = self._sym(fn)
+                self._owner_fail(out, code, "T0", text="is not an ISO date (YYYY-MM-DD) or null")
+
+    def test_unmasked_original_identity_checked(self):
+        code, out = self._sym(lambda p, lab: stg(p, lab, "GE")["eligibility_gate"]["unmasked_originals"]["cfo"].update(filing_date="0000"))
+        self._owner_fail(out, code, "T0", text="eligibility_gate.unmasked_originals.cfo: status OK without valid source identity")
+        self.assertNotIn(str(SECRET["cfo"]), out)
+
+    # ---- annual history rows
+    def _hist_rows(self, p, lab):
+        rows = [{"accn": "0000000001-25-000010", "end": "2024-12-31", "filed": "2025-02-01", "form": "10-K", "fp": "FY",
+                 "fy": 2024, "start": "2024-01-01", "val": 90_000, "_unit": "USD"}]
+        stg(p, lab)["annual_history"] = {"status": "OK", "history": {"revenue": rows}}
+        return rows
+
+    def test_history_valid_rows_pass(self):
+        code, out = self._sym(lambda p, lab: self._hist_rows(p, lab))
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out)
+
+    def test_history_invalid_identity(self):
+        for field, bad in (("filed", "2025-02-30"), ("filed", None), ("accn", "bad"), ("accn", None), ("end", "2024-12-32"),
+                           ("start", "x"), ("val", float("nan")), ("val", True)):
+            with self.subTest(field=field, bad=repr(bad)):
+                code, out = self._sym(lambda p, lab, f=field, b=bad: self._hist_rows(p, lab)[0].update({f: b}))
+                self._owner_fail(out, code, "T0", text="annual_history.revenue[0]")
+
+    def test_history_required_fields_absent(self):
+        for field in ("filed", "accn"):
+            with self.subTest(field=field):
+                code, out = self._sym(lambda p, lab, f=field: self._hist_rows(p, lab)[0].pop(f))
+                self._owner_fail(out, code, "T0", text=f"invalid source identity ['{field}']")
+
+    # ---- composite components
+    def _composite(self, p, lab, comps, status="OK"):
+        m = stg(p, lab)["normalization"]["normalized"]["metrics"]["total_debt"]
+        for k in ("filing_date", "accession", "period_end", "period_start", "form", "concept", "namespace", "fy", "fp", "frame"): m.pop(k, None)
+        m["status"] = status; m["components"] = comps
+
+    def test_gpt_f2_component_status_missing(self):
+        comp = {"value": 100, "filing_date": "2026-02-01", "accession": "0000000001-26-000010", "period_end": "2025-12-31"}
+        code, out = self._sym(lambda p, lab: self._composite(p, lab, {"component_1": dict(comp)}))
+        self._owner_fail(out, code, "T0", text="components.component_1.status is absent, not a string")
+
+    def test_component_status_null_dict_list(self):
+        for bad in (None, {"s": "OK"}, ["OK"]):
+            with self.subTest(bad=repr(bad)):
+                code, out = self._sym(lambda p, lab, b=bad: self._composite(p, lab, {"c": dict(metric("current_debt", 5), status=copy.deepcopy(b))}))
+                self._owner_fail(out, code, "T0", text="components.c.status is")
+
+    def test_component_ok_without_identity(self):
+        for field in ("filing_date", "accession", "period_end", "value"):
+            with self.subTest(field=field):
+                code, out = self._sym(lambda p, lab, f=field: self._composite(p, lab, {"c": dict(metric("current_debt", 5), **{f: None})}))
+                self._owner_fail(out, code, "T0", text="components.c: status OK without valid source identity")
+
+    def test_valid_composite_without_parent_identity_passes(self):
+        def fn(p, lab):
+            self._composite(p, lab, {"current_debt": dict(metric("current_debt", 5_000)),
+                                     "noncurrent_debt": dict(metric("noncurrent_debt", 15_000), accession="0000000002-26-000011")})
+        code, out = self._sym(fn)
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+
+    def test_ok_composite_with_no_components(self):
+        code, out = self._sym(lambda p, lab: self._composite(p, lab, {}))
+        self._owner_fail(out, code, "T0", text="total_debt.components keys [] != ['current_debt', 'noncurrent_debt']")
+        # calculate_total_debt() builds both components for every status, so an empty set is never valid
+        code, out = self._sym(lambda p, lab: self._composite(p, lab, {}, status="INCOMPLETE"))
+        self._owner_fail(out, code, "T0", text="components keys [] !=")
+
+    # ---- governance gate exact structure
+    def test_gpt_f3_each_gate_field_removed(self):
+        for field in ("withheld", "scoped", "not_yet_available", "no_record", "unmasked_originals", "relabelled"):
+            for t in ("AAPL", "GE"):
+                with self.subTest(field=field, ticker=t):
+                    code, out = self._sym(lambda p, lab, f=field, t=t: stg(p, lab, t)["eligibility_gate"].pop(f))
+                    self._owner_fail(out, code, "B0", text=f"{t}: gate structure malformed ({field} is absent")
+
+    def test_gate_fields_null(self):
+        for field in ("withheld", "no_record", "unmasked_originals", "relabelled"):
+            with self.subTest(field=field):
+                code, out = self._sym(lambda p, lab, f=field: stg(p, lab)["eligibility_gate"].update({f: None}))
+                self._owner_fail(out, code, "B0", text=f"{field} is NoneType")
+
+    def test_relabelled_stage_missing_or_extra_or_nonstring(self):
+        cases = {"stage missing": lambda r: r.pop("growth"), "extra stage": lambda r: r.update(other=[]),
+                 "non-string item": lambda r: r["derived"].append(3), "stage not a list": lambda r: r.update(derived="fcf")}
+        for label, fn in cases.items():
+            with self.subTest(case=label):
+                code, out = self._sym(lambda p, lab, f=fn: f(stg(p, lab)["eligibility_gate"]["relabelled"]))
+                self._owner_fail(out, code, "B0", text="relabelled")
+
+    def test_empty_lists_and_objects_are_valid(self):
+        code, out = run_pair(Pair(), profile=None)          # AAPL/LLY: empty lists, {} originals, empty relabelled lists
+        self.assertEqual(code, 0, out); self.assertEqual(verdict(out, "B0", "NEW"), "PASS")
+
+    def test_gate_skipped_rule(self):
+        """SKIPPED is the production record when no eligibility rows were supplied: allowed only under that policy."""
+        skipped = {"status": "SKIPPED", "reason": "No metric_eligibility_rows provided."}
+        code, out = self._sym(lambda p, lab: stg(p, lab)["eligibility_gate"].clear() or stg(p, lab)["eligibility_gate"].update(skipped))
+        self._owner_fail(out, code, "B0", text="AAPL: gate status 'SKIPPED' under policy")
+        p = Pair()
+        for lab in ("NEW", "BASE"):
+            p.policy[lab] = ck.POLICY_NOT_APPLIED
+            for t in p.tickers:
+                stg(p, lab, t)["eligibility_gate"] = dict(skipped)
+                for k in ("cfo", "capex", "operating_income"):
+                    if stg(p, lab, t)["normalization"]["normalized"]["metrics"].get(k, {}).get("status") == "WITHHELD":
+                        stg(p, lab, t)["normalization"]["normalized"]["metrics"][k] = metric(k, 1_000)
+        code, out = run_pair(p, profile=None)
+        self.assertEqual(verdict(out, "B0", "NEW"), "PASS", out); self.assertIn("3 SKIPPED under NO_METRIC_ELIGIBILITY_GATE", out)
+        self.assertNotIn(" X0 ", out)
+
+
+
+class Round61CompositeSkippedFinite(unittest.TestCase):
+    """Round 6.1: exact total_debt composite contract, exact SKIPPED gate record, overflow-safe numbers.
+    Every damage case is run NEW only, BASE only and symmetric; the owner (T0/B0) must FAIL directly, no X0."""
+    MODES = (("NEW",), ("BASE",), ("NEW", "BASE"))
+
+    def _run(self, fn, labs):
+        p = Pair()
+        for lab in labs: fn(p, lab)
+        return run_pair(p, profile=None)
+
+    def _all_modes_fail(self, fn, check, text=None):
+        for labs in self.MODES:
+            with self.subTest(mode="+".join(labs)):
+                code, out = self._run(fn, labs)
+                self.assertEqual(code, 1, out); self.assertIn("OVERALL FAIL", out); self.assertNotIn(" X0 ", out)
+                for lab in labs: self.assertEqual(verdict(out, check, lab), "FAIL", f"{check}[{lab}]\n{out}")
+                for lab in {"NEW", "BASE"} - set(labs): self.assertEqual(verdict(out, check, lab), "PASS", f"{check}[{lab}] untouched")
+                if text: self.assertIn(text, out)
+
+    def _td(self, p, lab, t="AAPL"): return stg(p, lab, t)["normalization"]["normalized"]["metrics"]["total_debt"]
+
+    # ---- A. composite completeness
+    def test_component_deleted(self):
+        for comp in ("current_debt", "noncurrent_debt"):
+            with self.subTest(component=comp):
+                self._all_modes_fail(lambda p, lab, c=comp: self._td(p, lab)["components"].pop(c), "T0", text="total_debt.components keys")
+
+    def test_components_key_deleted_even_with_parent_identity(self):
+        def fn(p, lab):
+            m = self._td(p, lab); m.pop("components")
+            m.update(filing_date="2026-02-01", accession="0000000001-26-000010", period_end="2025-12-31", value=20_000)
+        self._all_modes_fail(fn, "T0", text="total_debt: components missing")
+
+    def test_components_empty_or_extra(self):
+        self._all_modes_fail(lambda p, lab: self._td(p, lab).update(components={}), "T0", text="components keys [] !=")
+        self._all_modes_fail(lambda p, lab: self._td(p, lab)["components"].update(lease=metric("lease", 1)), "T0", text="components keys ['current_debt', 'lease', 'noncurrent_debt']")
+
+    def test_components_wrong_type(self):
+        for bad in ([], None, "current_debt,noncurrent_debt", 3):
+            with self.subTest(bad=repr(bad)):
+                self._all_modes_fail(lambda p, lab, b=bad: self._td(p, lab).update(components=copy.deepcopy(b)), "T0", text="total_debt.components is")
+
+    def test_components_on_other_metric(self):
+        """Claude: an OK value with "components" used to skip its own identity check."""
+        def fn(p, lab):
+            stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"] = {"metric": "revenue", "status": "OK", "value": 1,
+                                                                               "components": {"x": metric("x", 1)}}
+        self._all_modes_fail(fn, "T0", text="components are not allowed on 'revenue'")
+
+    def test_ok_composite_value_must_be_finite(self):
+        for bad in (None, True, float("nan")):
+            with self.subTest(bad=repr(bad)):
+                self._all_modes_fail(lambda p, lab, b=bad: self._td(p, lab).update(value=b), "T0", text="status OK composite without a finite value")
+
+    def test_component_status_and_identity_rules_kept(self):
+        self._all_modes_fail(lambda p, lab: self._td(p, lab)["components"]["current_debt"].pop("status"), "T0", text="current_debt.status is absent")
+        self._all_modes_fail(lambda p, lab: self._td(p, lab)["components"]["current_debt"].update(accession="bad"), "T0",
+                             text="current_debt: status OK without valid source identity")
+
+    def test_valid_composites_pass(self):
+        def incomplete(p, lab):
+            m = self._td(p, lab); m.update(status="INCOMPLETE", value=None)
+            m["components"]["noncurrent_debt"] = {"metric": "noncurrent_debt", "status": "MISSING", "value": None}
+        def missing_both(p, lab):
+            m = self._td(p, lab); m.update(status="INCOMPLETE", value=None)
+            m["components"]["current_debt"] = {"metric": "current_debt", "status": "INCOMPLETE", "value": None}
+            m["components"]["noncurrent_debt"] = {"metric": "noncurrent_debt", "status": "MISSING", "value": None}
+        for label, fn in (("both OK", lambda p, lab: None), ("one MISSING", incomplete), ("INCOMPLETE+MISSING", missing_both)):
+            with self.subTest(case=label):
+                code, out = self._run(fn, ("NEW", "BASE"))
+                self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+
+    def test_gate_masked_total_debt_is_not_a_composite(self):
+        """apply_metric_eligibility_gate() replaces a WITHHELD metric with a mask that has no components; the
+        original composite moves to unmasked_originals and is checked there."""
+        def withhold(p, lab, original):
+            g = stg(p, lab, "GE")["eligibility_gate"]; m = stg(p, lab, "GE")["normalization"]["normalized"]["metrics"]
+            g["scoped"] = []; g["withheld"].append("total_debt"); g["unmasked_originals"]["total_debt"] = original
+            m["total_debt"] = {"status": "WITHHELD", "value": None, "unit": "USD", "reason": "Governance eligibility WITHHELD.",
+                               "eligibility": {"governance_status": "WITHHELD"}, "original_status": "OK"}
+        code, out = self._run(lambda p, lab: withhold(p, lab, total_debt_composite()), ("NEW", "BASE"))
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "T0", "BASE"), "PASS")
+        bad = total_debt_composite(); bad["components"].pop("noncurrent_debt")
+        code, out = self._run(lambda p, lab: withhold(p, lab, copy.deepcopy(bad)), ("NEW", "BASE"))
+        self.assertEqual(verdict(out, "T0", "NEW"), "FAIL", out); self.assertIn("unmasked_originals.total_debt.components keys", out)
+        self.assertNotIn(" X0 ", out)
+        # a WITHHELD record without the gate's eligibility signature is not a mask
+        self._all_modes_fail(lambda p, lab: self._td(p, lab).__setitem__("total_debt", None) or self._td(p, lab).clear() or
+                             self._td(p, lab).update(status="WITHHELD", value=None), "T0", text="total_debt: components missing")
+
+    # ---- B. SKIPPED gate record
+    def _skipped_pair(self, labs, record):
+        p = Pair()
+        for lab in ("NEW", "BASE"):
+            p.policy[lab] = ck.POLICY_NOT_APPLIED
+            for t in p.tickers:
+                stg(p, lab, t)["eligibility_gate"] = copy.deepcopy(record if (lab in labs and t == "AAPL") else
+                                                                   {"status": "SKIPPED", "reason": "No metric_eligibility_rows provided."})
+                for k in ("cfo", "capex", "operating_income"):
+                    if stg(p, lab, t)["normalization"]["normalized"]["metrics"].get(k, {}).get("status") == "WITHHELD":
+                        stg(p, lab, t)["normalization"]["normalized"]["metrics"][k] = metric(k, 1_000)
+        return run_pair(p, profile=None)
+
+    def test_skipped_reason_required(self):
+        for label, rec in (("reason deleted", {"status": "SKIPPED"}), ("reason null", {"status": "SKIPPED", "reason": None}),
+                           ("reason number", {"status": "SKIPPED", "reason": 3}), ("reason object", {"status": "SKIPPED", "reason": {"x": 1}}),
+                           ("reason empty", {"status": "SKIPPED", "reason": "  "}), ("extra key", {"status": "SKIPPED", "reason": "x", "withheld": []})):
+            for labs in self.MODES:
+                with self.subTest(case=label, mode="+".join(labs)):
+                    code, out = self._skipped_pair(labs, rec)
+                    self.assertNotIn(" X0 ", out)
+                    for lab in labs: self.assertEqual(verdict(out, "B0", lab), "FAIL", out)
+                    self.assertIn("AAPL: SKIPPED gate malformed", out)
+
+    def test_skipped_valid_reason_passes(self):
+        code, out = self._skipped_pair((), {})
+        self.assertEqual(verdict(out, "B0", "NEW"), "PASS", out); self.assertEqual(verdict(out, "B0", "BASE"), "PASS")
+        self.assertIn("3 SKIPPED under NO_METRIC_ELIGIBILITY_GATE", out)
+
+    def test_skipped_under_applied_policy_still_fails(self):
+        self._all_modes_fail(lambda p, lab: stg(p, lab)["eligibility_gate"].clear() or
+                             stg(p, lab)["eligibility_gate"].update(status="SKIPPED", reason="No metric_eligibility_rows provided."),
+                             "B0", text="AAPL: gate status 'SKIPPED' under policy")
+
+    # ---- C. finite numbers without OverflowError (round 7: production contract = float()-representable and finite)
+    def test_is_finite_number_unit(self):
+        f = ck.is_finite_number
+        for v in (0, 7, -3, 10**308, -(10**308), 1.5, -0.0, 1e308):
+            with self.subTest(v=repr(v)[:20]): self.assertTrue(f(v))
+        for v in (True, False, float("nan"), float("inf"), float("-inf"), 10**309, -(10**309), 10**400, "1", None, [1], {"v": 1}):
+            with self.subTest(v=repr(v)[:20]): self.assertFalse(f(v))      # never raises
+
+    def test_huge_int_never_crashes(self):
+        """10**400 is beyond what production can use: T0 FAILs it directly; no OverflowError anywhere (T0, leak scan,
+        self-check), no X0, no abort."""
+        cases = {"revenue": lambda p, lab: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(value=10**400),
+                 "history val": lambda p, lab: stg(p, lab).update(annual_history={"status": "OK", "history": {"revenue": [
+                     {"accn": "0000000001-25-000010", "end": "2024-12-31", "filed": "2025-02-01", "val": 10**400}]}}),
+                 "GE original (leak target)": lambda p, lab: stg(p, lab, "GE")["eligibility_gate"]["unmasked_originals"]["cfo"].update(value=10**400)}
+        for label, fn in cases.items():
+            for labs in self.MODES:
+                with self.subTest(case=label, mode="+".join(labs)):
+                    code, out = self._run(fn, labs)
+                    self.assertNotIn(" X0 ", out); self.assertNotIn("could not complete", out); self.assertNotIn("Traceback", out)
+                    self.assertEqual(code, 1, out)
+                    for lab in labs: self.assertEqual(verdict(out, "T0", lab), "FAIL", out)
+
+    def test_huge_int_leak_still_detected_exactly(self):
+        p = Pair()
+        for lab in ("NEW", "BASE"): stg(p, lab, "GE")["eligibility_gate"]["unmasked_originals"]["cfo"]["value"] = 10**400
+        p.summary_mut["NEW"] = lambda s: s.update(debug=10**400)
+        code, out = run_pair(p, profile=None)
+        self.assertEqual(verdict(out, "F1", "NEW"), "FAIL", out); self.assertNotIn(" X0 ", out)
+        self.assertNotIn(str(10**400), out)
+
+    def test_nan_inf_bool_value_still_fail(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), True, False):
+            with self.subTest(bad=repr(bad)):
+                self._all_modes_fail(lambda p, lab, b=bad: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(value=b),
+                                     "T0", text="status OK without valid source identity")
+
+
+
+class Round7ExtremeInteger(unittest.TestCase):
+    """Round 7: is_finite_number() follows production derived_metrics._is_number() (finite float()), never raises,
+    and an extreme integer in an artifact is a direct T0 FAIL (no X0, no traceback)."""
+    MODES = (("NEW",), ("BASE",), ("NEW", "BASE"))
+
+    def test_unit_cases(self):
+        f = ck.is_finite_number
+        accepted = {"positive int": 12_345, "negative int": -12_345, "float": 3.25, "negative float": -0.5, "zero": 0, "zero float": 0.0,
+                    "large finite float-representable int": 10**308}
+        rejected = {"True": True, "False": False, "NaN": float("nan"), "+Infinity": float("inf"), "-Infinity": float("-inf"),
+                    "10**309": 10**309, "-(10**309)": -(10**309), "string": "100", "null": None}
+        for name, v in accepted.items():
+            with self.subTest(accepted=name): self.assertIs(f(v), True)
+        for name, v in rejected.items():
+            with self.subTest(rejected=name): self.assertIs(f(v), False)
+
+    def _run(self, fn, labs, zip_new=False):
+        p = Pair()
+        for lab in labs: fn(p, lab)
+        return run_pair(p, profile=None, zip_new_members=(lambda f: sorted(f.items())) if zip_new else None)
+
+    def _direct_t0_fail(self, code, out, labs):
+        self.assertEqual(code, 1, out); self.assertIn("OVERALL FAIL", out)
+        self.assertNotIn(" X0 ", out); self.assertNotIn("Traceback", out); self.assertNotIn("could not complete", out)
+        for lab in labs: self.assertEqual(verdict(out, "T0", lab), "FAIL", f"T0[{lab}]\n{out}")
+        for lab in {"NEW", "BASE"} - set(labs): self.assertEqual(verdict(out, "T0", lab), "PASS")
+        self.assertIn("status OK without valid source identity ['value']", out)
+
+    def test_extreme_integers_in_a_checker_run(self):
+        for v in (10**309, -(10**309)):
+            for labs in self.MODES:
+                with self.subTest(v="10**309" if v > 0 else "-(10**309)", mode="+".join(labs)):
+                    code, out = self._run(lambda p, lab, v=v: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(value=v), labs)
+                    self._direct_t0_fail(code, out, labs)
+                    self.assertNotIn(str(abs(v))[:40], out)          # the value itself is never printed
+
+    def test_extreme_integer_serialized_in_json_artifact(self):
+        """The fixture writes real JSON files (and a real ZIP for NEW): the 310-digit literal is parsed back as an int."""
+        v = 10**309
+        literal = json.dumps({"value": v})
+        self.assertIn("1" + "0" * 309, literal); self.assertEqual(json.loads(literal)["value"], v)
+        for zip_new in (False, True):
+            with self.subTest(input="zip" if zip_new else "directory"):
+                code, out = self._run(lambda p, lab: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(value=v),
+                                      ("NEW", "BASE"), zip_new=zip_new)
+                self._direct_t0_fail(code, out, ("NEW", "BASE"))
+
+    def test_large_finite_float_representable_integer_passes(self):
+        code, out = self._run(lambda p, lab: stg(p, lab)["normalization"]["normalized"]["metrics"]["revenue"].update(value=10**308), ("NEW", "BASE"))
+        self.assertEqual(verdict(out, "T0", "NEW"), "PASS", out); self.assertNotIn(" X0 ", out)
+
+    def test_extreme_integer_in_history_and_composite(self):
+        def hist(p, lab):
+            stg(p, lab)["annual_history"] = {"status": "OK", "history": {"revenue": [
+                {"accn": "0000000001-25-000010", "end": "2024-12-31", "filed": "2025-02-01", "val": -(10**309)}]}}
+        def comp(p, lab):
+            stg(p, lab)["normalization"]["normalized"]["metrics"]["total_debt"]["value"] = 10**309
+        for label, fn, text in (("history val", hist, "invalid source identity ['val']"),
+                                ("composite value", comp, "status OK composite without a finite value")):
+            with self.subTest(case=label):
+                code, out = self._run(fn, ("NEW", "BASE"))
+                self.assertEqual(code, 1); self.assertNotIn(" X0 ", out); self.assertIn(text, out)
+                self.assertEqual(verdict(out, "T0", "NEW"), "FAIL"); self.assertEqual(verdict(out, "T0", "BASE"), "FAIL")
 
 
 if __name__ == "__main__":

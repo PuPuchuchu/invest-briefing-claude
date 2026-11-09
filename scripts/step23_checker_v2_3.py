@@ -29,7 +29,7 @@ Guarantees:
 """
 from __future__ import annotations
 
-import argparse, ast, hashlib, json, os, re, stat, sys, zipfile
+import argparse, ast, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
 VERSION = "checker_v2.3"
@@ -187,27 +187,29 @@ class Run:
 
 
 # ---------------------------------------------------------------- accessors
-def stages(r): return (r or {}).get("stages") or {}
-def metrics(r): return ((stages(r).get("normalization") or {}).get("normalized") or {}).get("metrics") or {}
-def gate(r): return stages(r).get("eligibility_gate") or {}
+def _d(x): return x if isinstance(x, dict) else {}       # malformed JSON never reaches .get() on a non-dict
+def _l(x): return x if isinstance(x, list) else []
+def stages(r): return _d(_d(r).get("stages"))
+def metrics(r): return _d(_d(_d(stages(r).get("normalization")).get("normalized")).get("metrics"))
+def gate(r): return _d(stages(r).get("eligibility_gate"))
 def stage_items(r, stage):
     s = stages(r)
-    if stage == "derived": c = ((s.get("derived_metrics") or {}).get("derived") or {}).get("derived_metrics")
-    elif stage == "growth": c = ((s.get("growth") or {}).get("growth") or {}).get("components")
-    else: c = (s.get("data_sufficiency") or {}).get("sufficiency")
+    if stage == "derived": c = _d(_d(s.get("derived_metrics")).get("derived")).get("derived_metrics")
+    elif stage == "growth": c = _d(_d(s.get("growth")).get("growth")).get("components")
+    else: c = _d(s.get("data_sufficiency")).get("sufficiency")
     return c if isinstance(c, dict) else None
-def growth_agg(r): return (((stages(r).get("growth") or {}).get("growth") or {}).get("growth"))
+def growth_agg(r): return _d(_d(stages(r).get("growth")).get("growth")).get("growth")
 def data_view(r, m):
     cur = metrics(r).get(m)
     if isinstance(cur, dict) and cur.get("status") == "WITHHELD":
-        o = (gate(r).get("unmasked_originals") or {}).get(m)
+        o = _d(gate(r).get("unmasked_originals")).get(m)
         return o if isinstance(o, dict) else {"status": KEY_ABSENT}
     return cur if isinstance(cur, dict) else {"status": KEY_ABSENT}
 def gov(r, m):
     g = gate(r)
     if g.get("status") != "OK": return "GATE_NOT_APPLIED"
     for k, lab in (("withheld", "WITHHELD"), ("not_yet_available", "NOT_YET_AVAILABLE"), ("no_record", "NO_RECORD")):
-        if m in (g.get(k) or []): return lab
+        if m in _l(g.get(k)): return lab
     return "ELIGIBLE"
 def is_marker(item): return isinstance(item, dict) and item.get("set_by") == GATE_SET_BY
 
@@ -239,8 +241,195 @@ def parent_and_key(path):
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
+# ---------------------------------------------------------------- per-run schema (T0)
+GATE_LIST_KEYS = ("withheld", "scoped", "not_yet_available", "no_record")
+RELABEL_STAGES = ("derived", "growth", "data_sufficiency")
+# sec_normalizer.calculate_total_debt() is the only composite: it always returns exactly these two components
+# (observed: 90/90 total_debt records in 5 batches; no other metric ever carries "components").
+COMPOSITE_COMPONENTS = {"total_debt": ("current_debt", "noncurrent_debt")}
+GATE_SKIPPED_KEYS = {"status", "reason"}         # orchestrator: {"status": SKIPPED, "reason": "..."}
+POLICY_NOT_APPLIED = "NO_METRIC_ELIGIBILITY_GATE"     # batch_runner: the gate did not run (eligibility rows not supplied)
+SEC_ACCESSION_RE = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
+# Every key E1/E2 read anywhere in a ticker result: dates must be real ISO dates and accessions SEC-formatted,
+# or null (observed: 25,000+ such values in 5 batches, all valid). "end"/"start" are generic words, so they are
+# only date-checked inside annual history rows.
+DATE_KEYS = ("filing_date", "filed", "period_end", "period_start")
+ACCESSION_KEYS = ("accession", "accn")
+
+
+def is_iso_date(x) -> bool:
+    """A real calendar date written exactly as YYYY-MM-DD (round trip; never a lexicographic stand-in)."""
+    if not isinstance(x, str) or len(x) != 10:
+        return False
+    try:
+        return date.fromisoformat(x).isoformat() == x
+    except ValueError:
+        return False
+
+
+def is_finite_number(x) -> bool:
+    """Same contract as production derived_metrics._is_number(): an int/float (never bool) whose float() is finite.
+    Production can only use a value that converts to a finite float, so an int beyond the float range (10**309)
+    is not a valid amount. Never raises: an OverflowError (or any conversion error) means "not a valid number"."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(x))
+    except (OverflowError, ValueError):
+        return False
+
+
+_STR = (str, type(None))
+_NUM = (int, float, type(None))
+# Source-identity fields of a normalized metric / unmasked original (when present). Every observed artifact has
+# strings (unit sometimes null), int fy and numeric-or-null value; null is accepted for "not available".
+IDENTITY_FIELD_TYPES = {"accession": _STR, "concept": _STR, "filing_date": _STR, "form": _STR, "fp": _STR,
+                        "namespace": _STR, "period_end": _STR, "period_start": _STR, "unit": _STR,
+                        "fy": (int, type(None)), "value": _NUM}
+HISTORY_FIELD_TYPES = {"filed": _STR, "form": _STR, "fp": _STR, "fy": (int, type(None))}
+# An OK observation must carry its source identity, or PIT (E1/E2) could not verify it. Observed in every artifact:
+# all 907 non-composite OK metrics and all 135 OK components have them; composites (with "components") are
+# checked through their components.
+OK_IDENTITY_REQUIRED = ("filing_date", "accession", "period_end")
+
+
+def _type_ok(v, allowed) -> bool:
+    return isinstance(v, allowed) and not isinstance(v, bool)
+
+
+def gate_structure_problems(g) -> list[str]:
+    """Exact structure of an applied gate (status OK): apply_metric_eligibility_gate() returns the four lists and
+    unmasked_originals (an object, {} when nothing is withheld) and the orchestrator adds relabelled with exactly
+    derived / growth / data_sufficiency. A missing or null field is never read as an empty one."""
+    p = []
+    for k in GATE_LIST_KEYS:
+        v = g.get(k, "<absent>")
+        if not (isinstance(v, list) and all(isinstance(m, str) for m in v)):
+            p.append(f"{k} is {'absent' if k not in g else type(v).__name__ if not isinstance(v, list) else 'a list with non-string items'}, not a list of metric names")
+    uo = g.get("unmasked_originals", "<absent>")
+    if not isinstance(uo, dict): p.append(f"unmasked_originals is {'absent' if 'unmasked_originals' not in g else type(uo).__name__}, not an object")
+    rel = g.get("relabelled", "<absent>")
+    if not isinstance(rel, dict):
+        p.append(f"relabelled is {'absent' if 'relabelled' not in g else type(rel).__name__}, not an object")
+    else:
+        if set(rel) != set(RELABEL_STAGES): p.append(f"relabelled stages {sorted(rel)} != {list(RELABEL_STAGES)}")
+        for k, v in rel.items():
+            if not (isinstance(v, list) and all(isinstance(x, str) for x in v)): p.append(f"relabelled.{k} is not a list of metric names")
+    return p
+
+
+def gate_wellformed(r) -> bool:
+    """The gate fields B2-B7 rely on have the production structure (validated and reported by B0)."""
+    g = gate(r)
+    return g.get("status") == "OK" and not gate_structure_problems(g)
+
+
+def schema_problems(r) -> list[str]:
+    """T0: structural types of one result, validated on its own (never by comparison with the other run).
+    Contract (production a1a86d7 + every observed artifact): normalized / derived / growth / sufficiency
+    containers are objects of objects; every item carries a string status (calculation_status for
+    sufficiency); the growth aggregate is an object with a string status and, if present, a list of strings
+    in withheld_components; every "frame" is a string or null (sec_normalizer/sec_historical copy the SEC
+    observation's frame, which is a string or absent). Status VALUES are not restricted here.
+    Returns paths and type names only."""
+    p, st = [], stages(r)
+    def tn(x): return type(x).__name__
+    def items(label, container, key, fields=None):
+        if not isinstance(container, dict): p.append(f"{label} is {tn(container)}, not an object"); return
+        for name, item in container.items():
+            if not isinstance(item, dict): p.append(f"{label}.{name} is {tn(item)}, not an object"); continue
+            if not isinstance(item.get(key), str): p.append(f"{label}.{name}.{key} is {tn(item.get(key)) if key in item else 'absent'}, not a string")
+            if fields: observation(f"{label}.{name}", item, fields, name)
+    def observation(label, item, fields, metric_name):
+        for f, allowed in fields.items():
+            if f in item and not _type_ok(item[f], allowed): p.append(f"{label}.{f} is {tn(item[f])}")
+        expected = COMPOSITE_COMPONENTS.get(metric_name)
+        gate_mask = (item.get("status") == "WITHHELD" and isinstance(item.get("eligibility"), dict)
+                     and item["eligibility"].get("governance_status") == "WITHHELD")
+        if expected is None and "components" in item:
+            # only calculate_total_debt() builds components; elsewhere they would exempt an OK value from identity checks
+            p.append(f"{label}: components are not allowed on {metric_name!r} (only on {sorted(COMPOSITE_COMPONENTS)})"); return
+        if expected is not None and "components" not in item and not gate_mask:
+            # the gate's WITHHELD mask replaces the metric (its original, with components, is in unmasked_originals)
+            p.append(f"{label}: components missing (calculate_total_debt() always builds {list(expected)})"); return
+        if "components" in item:
+            comps = item["components"]
+            if not isinstance(comps, dict): p.append(f"{label}.components is {tn(comps)}, not an object"); return
+            if set(comps) != set(expected):
+                p.append(f"{label}.components keys {sorted(comps)} != {sorted(expected)}")
+            if item.get("status") == "OK" and not is_finite_number(item.get("value")):
+                p.append(f"{label}: status OK composite without a finite value")
+            for cn, cv in comps.items():
+                if not isinstance(cv, dict): p.append(f"{label}.components.{cn} is {tn(cv)}, not an object"); continue
+                if not isinstance(cv.get("status"), str):
+                    p.append(f"{label}.components.{cn}.status is {tn(cv.get('status')) if 'status' in cv else 'absent'}, not a string")
+                observation(f"{label}.components.{cn}", cv, fields, cn)
+        elif item.get("status") == "OK":
+            # build_metric_result()/build_instant_result() copy filed/accn/end/start/val of one SEC observation
+            bad = [f for f in ("filing_date", "period_end") if not is_iso_date(item.get(f))]
+            if item.get("period_start") is not None and not is_iso_date(item.get("period_start")): bad.append("period_start")
+            if not (isinstance(item.get("accession"), str) and SEC_ACCESSION_RE.match(item["accession"])): bad.append("accession")
+            if not is_finite_number(item.get("value")): bad.append("value")
+            if bad: p.append(f"{label}: status OK without valid source identity {bad}")
+    norm = _d(st.get("normalization")).get("normalized")
+    items("normalized.metrics", _d(norm).get("metrics") if isinstance(norm, dict) else norm, "status", IDENTITY_FIELD_TYPES)
+    uo = gate(r).get("unmasked_originals")
+    if isinstance(uo, dict): items("eligibility_gate.unmasked_originals", uo, "status", IDENTITY_FIELD_TYPES)
+    hist = _d(st.get("annual_history")).get("history")
+    if isinstance(hist, dict):
+        for m, rows in hist.items():
+            if not isinstance(rows, list): p.append(f"annual_history.{m} is {tn(rows)}, not a list"); continue
+            for i, row in enumerate(rows):
+                if not isinstance(row, dict): p.append(f"annual_history.{m}[{i}] is {tn(row)}, not an object"); continue
+                for f, allowed in HISTORY_FIELD_TYPES.items():
+                    if f in row and not _type_ok(row[f], allowed): p.append(f"annual_history.{m}[{i}].{f} is {tn(row[f])}")
+                # point_in_time history rows are SEC observations: filed + accn always, end/start/val when present
+                bad = [] if is_iso_date(row.get("filed")) else ["filed"]
+                if not (isinstance(row.get("accn"), str) and SEC_ACCESSION_RE.match(row["accn"])): bad.append("accn")
+                bad += [f for f in ("end", "start") if f in row and row[f] is not None and not is_iso_date(row[f])]
+                if "val" in row and not is_finite_number(row["val"]): bad.append("val")
+                if bad: p.append(f"annual_history.{m}[{i}]: invalid source identity {bad}")
+    dm = st.get("derived_metrics")
+    if isinstance(dm, dict) and "derived" in dm:
+        items("derived_metrics", _d(dm.get("derived")).get("derived_metrics") if isinstance(dm.get("derived"), dict) else dm.get("derived"), "status")
+    g = st.get("growth")
+    if isinstance(g, dict) and "growth" in g:
+        gg = g.get("growth")
+        if not isinstance(gg, dict): p.append(f"growth.growth is {tn(gg)}, not an object")
+        else:
+            items("growth.components", gg.get("components"), "status")
+            agg = gg.get("growth")
+            if not isinstance(agg, dict): p.append(f"growth aggregate is {tn(agg)}, not an object")
+            else:
+                if not isinstance(agg.get("status"), str): p.append(f"growth aggregate status is {tn(agg.get('status')) if 'status' in agg else 'absent'}, not a string")
+                if "withheld_components" in agg and not (isinstance(agg["withheld_components"], list) and all(isinstance(x, str) for x in agg["withheld_components"])):
+                    p.append(f"growth aggregate withheld_components is {tn(agg['withheld_components'])}, not a list of strings")
+    ds = st.get("data_sufficiency")
+    if isinstance(ds, dict) and "sufficiency" in ds:
+        items("data_sufficiency.sufficiency", ds.get("sufficiency"), "calculation_status")
+    def walk(o, path=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == "frame" and not (v is None or isinstance(v, str)):
+                    p.append(f"{path}/frame is {tn(v)}, not a string or null")
+                elif k in DATE_KEYS and v is not None and not is_iso_date(v):
+                    p.append(f"{path}/{k} is not an ISO date (YYYY-MM-DD) or null")
+                elif k in ACCESSION_KEYS and v is not None and not (isinstance(v, str) and SEC_ACCESSION_RE.match(v)):
+                    p.append(f"{path}/{k} is not an SEC accession (##########-##-######) or null")
+                walk(v, f"{path}/{k}")
+        elif isinstance(o, list):
+            for i, v in enumerate(o): walk(v, f"{path}[{i}]")
+    walk(r)
+    return p
+
+
 # ---------------------------------------------------------------- recomputation (mirrors batch_coverage a1a86d7)
-def _inc(d, k): d[k] = d.get(k, 0) + 1
+def _inc(d, k):
+    try:
+        hash(k)
+    except TypeError:                      # a list/dict status is malformed: count it under its type, never crash
+        k = f"<{type(k).__name__}>"
+    d[k] = d.get(k, 0) + 1
 def recompute_stage_coverage(run: Run) -> dict:
     derived, comps, agg, wcomp, suff = {}, {}, {}, {}, {}
     def block(target, entries):
@@ -261,14 +450,14 @@ def recompute_stage_coverage(run: Run) -> dict:
             a = g.get("growth")
             if isinstance(a, dict):
                 _inc(agg, a.get("status") or KEY_ABSENT)
-                for c in a.get("withheld_components") or []: _inc(wcomp, c)
+                for c in _l(a.get("withheld_components")): _inc(wcomp, c)
         s = stage_items(r, "data_sufficiency")
         if s is not None:
             for name, item in s.items():
                 b = suff.setdefault(name, {"by_calculation_status": {}, "by_reason_code": {}})
-                cs = (item or {}).get("calculation_status")
+                cs = _d(item).get("calculation_status")
                 _inc(b["by_calculation_status"], cs or KEY_ABSENT)
-                if cs != "OK": _inc(b["by_reason_code"], (item or {}).get("reason_code") or NO_REASON_CODE)
+                if cs != "OK": _inc(b["by_reason_code"], _d(item).get("reason_code") or NO_REASON_CODE)
     return {"derived_metrics": derived, "growth": {"components": comps, "aggregate_status_counts": agg,
             "withheld_component_counts": wcomp}, "data_sufficiency": suff}
 
@@ -300,17 +489,21 @@ def withheld_targets(run: Run) -> list[dict]:
     Magnitude is not filtered: small values and 0 are targets too."""
     out = []
     for t, r in run.results.items():
-        for m, o in (gate(r).get("unmasked_originals") or {}).items():
+        for m, o in _d(gate(r).get("unmasked_originals")).items():
             names = {m} | {n for deps in (DERIVED_DEPS, GROWTH_DEPS) for n, d in deps.items() if m in d}
             for p, v in flat(o).items():
                 if parent_and_key(p)[1] in VALUE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
-                    out.append({"ticker": t, "metric": m, "value": float(v), "names": names})
+                    out.append({"ticker": t, "metric": m, "value": v if isinstance(v, int) else float(v), "names": names})
     return out
 
 
-def same_amount(x: float, t: float) -> bool:
-    if abs(t) >= LARGE_ABS: return abs(x - t) <= 0.5
-    return abs(x - t) <= 1e-9 * max(1.0, abs(t))       # small values: exact (no rounding slack)
+def same_amount(x, t) -> bool:
+    """x, t: int or float (ints are kept exact, so 10**400 never goes through float())."""
+    try:
+        if abs(t) >= LARGE_ABS: return abs(x - t) <= 0.5
+        return abs(x - t) <= 1e-9 * max(1.0, abs(t))   # small values: exact (no rounding slack)
+    except OverflowError:                              # e.g. a float token against an int beyond float range
+        return x == t
 
 
 def _json_leaves(o, path="", ticker=None, out=None):
@@ -325,7 +518,7 @@ def _json_leaves(o, path="", ticker=None, out=None):
     elif isinstance(o, list):
         for i, v in enumerate(o): _json_leaves(v, f"{path}[{i}]", ticker, out)
     elif isinstance(o, (int, float)) and not isinstance(o, bool):
-        out.append((path, parent_and_key(path)[1], float(o), ticker, "num"))
+        out.append((path, parent_and_key(path)[1], o if isinstance(o, int) else float(o), ticker, "num"))
     elif isinstance(o, str):
         toks = NUM_RE.findall(o)
         kind = "numstr" if len(toks) == 1 and o.strip() == toks[0] else "embedded"
@@ -393,7 +586,7 @@ def raw_entry_problems(path, ticker, cik, source, size, sha) -> list[str]:
     p = [f"path {x}" for x in safe_relative_posix(path)]
     if not isinstance(ticker, str) or not TICKER_RE.match(ticker): p.append("invalid ticker")
     if not isinstance(cik, str) or not CIK_RE.match(cik): p.append("invalid cik (10-digit string)")
-    if source not in RAW_SOURCES: p.append("invalid source (CACHE/FETCHED)")
+    if not (isinstance(source, str) and source in RAW_SOURCES): p.append("invalid source (CACHE/FETCHED)")
     if not isinstance(size, int) or isinstance(size, bool) or size < 0: p.append("invalid size_bytes")
     if not isinstance(sha, str) or not SHA256_RE.match(sha): p.append("invalid sha256 (64 lowercase hex)")
     return p
@@ -455,7 +648,7 @@ class Checker:
         self.cutoff = cutoff
         for run in (self.new, self.base):
             L, s, rp = run.label, run.summary, run.repro
-            per = {t: (r.get("evaluation_date"), r.get("sec_filed_cutoff_date"), (stages(r).get("pit_gating") or {}).get("sec_filed_cutoff_date"))
+            per = {t: (r.get("evaluation_date"), r.get("sec_filed_cutoff_date"), _d(stages(r).get("pit_gating")).get("sec_filed_cutoff_date"))
                    for t, r in run.results.items()}
             bad = sorted(t for t, v in per.items() if v != (self.date, cutoff, cutoff))
             ok = (s.get("evaluation_date") == self.date and run.coverage.get("evaluation_date") == self.date
@@ -528,7 +721,8 @@ class Checker:
             if not isinstance(p, str) or safe_relative_posix(p) or not run.raw.has(p): bad.append(f"missing/unsafe {p}"); continue
             b = run.raw.bytes(p)
             if len(b) != f.get("size_bytes") or hashlib.sha256(b).hexdigest() != f.get("sha256"): bad.append(f"mismatch {p}")
-        extra = sorted(n for n in run.raw.files if n not in set(paths))
+        str_paths = {x for x in paths if isinstance(x, str)}
+        extra = sorted(n for n in run.raw.files if n not in str_paths)
         self.add(L, "A7 raw files match manifest (size + sha256)", "FAIL" if bad else "PASS",
                  "; ".join(bad) or f"{len(files)} files match" + (f"; extra raw files not in manifest (ignored): {extra}" if extra else ""))
 
@@ -565,9 +759,13 @@ class Checker:
         for f in files:
             bad = raw_entry_problems(f.get("path"), f.get("ticker"), f.get("cik"), f.get("source"), f.get("size_bytes"), f.get("sha256"))
             if bad: p.append(f"manifest {f.get('ticker')!r}: invalid ({'; '.join(bad)})")
-        mt = [f.get("ticker") for f in files]
+        # only string tickers can be keys or set members; anything else is recorded as FAIL, never hashed
+        odd = [type(f.get("ticker")).__name__ for f in files if not isinstance(f.get("ticker"), str)]
+        if odd: p.append(f"manifest entries with a non-string ticker: {len(odd)} ({', '.join(sorted(set(odd)))})")
+        mt = [f.get("ticker") for f in files if isinstance(f.get("ticker"), str)]
         if len(mt) != len(set(mt)): p.append(f"duplicate ticker in manifest: {sorted({x for x in mt if mt.count(x) > 1})}")
-        got = {f.get("ticker"): (f.get("path"), f.get("sha256"), f.get("size_bytes"), f.get("cik"), f.get("source")) for f in files}
+        got = {f["ticker"]: (f.get("path"), f.get("sha256"), f.get("size_bytes"), f.get("cik"), f.get("source"))
+               for f in files if isinstance(f.get("ticker"), str)}
         missing, extra = sorted(set(expected) - set(got)), sorted(set(got) - set(expected), key=str)
         if missing: p.append(f"raw_input tickers missing from manifest: {missing}")
         if extra: p.append(f"manifest tickers without a summary raw_input: {extra}")
@@ -592,6 +790,16 @@ class Checker:
                 if (s_.get("data_sufficiency") or {}).get("status") != "OK" or stage_items(r, "data_sufficiency") is None: bad.append(f"{t}.data_sufficiency")
             self.add(run.label, "S1 required stages present (derived_metrics, growth, data_sufficiency; every OK ticker)",
                      "PASS" if not bad else "FAIL", f"missing/malformed: {bad[:12]}" if bad else f"{len(run.results)} tickers x 3 stages")
+
+    def check_schema(self):
+        """T0: every OK ticker of each run is type-checked on its own, so identical damage in BASE and NEW
+        cannot pass by agreeing with itself. Missing stages are S1's; malformed gate fields are B0's."""
+        for run in (self.new, self.base):
+            bad = []
+            for t, r in sorted(run.results.items()):
+                bad += [f"{t}: {x}" for x in schema_problems(r)]
+            self.add(run.label, "T0 per-run schema: item objects, string statuses, identity-field and frame types", "PASS" if not bad else "FAIL",
+                     f"{len(bad)} problem(s): {bad[:12]}" if bad else f"{len(run.results)} tickers")
 
     # ---------- P/M: profile binding and dependency-map currency
     def check_profile(self):
@@ -618,17 +826,27 @@ class Checker:
         prof = self.profile or {}
         for run in (self.new, self.base):
             # B0 gate internal consistency, every ticker
-            bad = []
+            bad, skipped = [], 0
+            policy = run.repro.get("governance_policy_version")
             for t, r in sorted(run.results.items()):
                 g = gate(r)
-                if g.get("status") != "OK": bad.append(f"{t}: gate status {g.get('status')}"); continue
-                lists = {k: g.get(k) or [] for k in ("withheld", "scoped", "not_yet_available", "no_record")}
-                if any(not isinstance(v, list) for v in lists.values()): bad.append(f"{t}: gate lists malformed"); continue
+                if g.get("status") == "SKIPPED" and policy == POLICY_NOT_APPLIED:
+                    # explicit rule: no gate expected when the run did not apply one; the record itself is exact
+                    if set(g) != GATE_SKIPPED_KEYS or not (isinstance(g.get("reason"), str) and g["reason"].strip()):
+                        bad.append(f"{t}: SKIPPED gate malformed (needs exactly {sorted(GATE_SKIPPED_KEYS)}, reason a non-empty string)")
+                    else:
+                        skipped += 1
+                    continue
+                if g.get("status") != "OK":
+                    bad.append(f"{t}: gate status {g.get('status')!r} under policy {policy!r}"); continue
+                sp = gate_structure_problems(g)
+                if sp: bad.append(f"{t}: gate structure malformed ({'; '.join(sp)})"); continue
+                lists = {k: g[k] for k in GATE_LIST_KEYS}
                 flat_l = [m for v in lists.values() for m in v]
                 if len(flat_l) != len(set(flat_l)): bad.append(f"{t}: a metric is in more than one gate list")
-                if sorted(g.get("unmasked_originals") or {}) != sorted(lists["withheld"]): bad.append(f"{t}: unmasked_originals keys != withheld")
-            self.add(run.label, "B0 gate lists disjoint, unmasked_originals = withheld (every ticker)", "PASS" if not bad else "FAIL",
-                     "; ".join(bad[:10]) or f"{len(run.results)} tickers")
+                if sorted(g["unmasked_originals"]) != sorted(lists["withheld"]): bad.append(f"{t}: unmasked_originals keys != withheld")
+            self.add(run.label, "B0 gate exact structure, lists disjoint, unmasked_originals = withheld (every ticker)", "PASS" if not bad else "FAIL",
+                     "; ".join(bad[:10]) or f"{len(run.results)} tickers" + (f" ({skipped} SKIPPED under {POLICY_NOT_APPLIED})" if skipped else ""))
         # B1 exact gate sets (profile)
         for t, exp in (prof.get("gate") or {}).items():
             g = gate(self.new.results.get(t))
@@ -639,6 +857,8 @@ class Checker:
         for run in (self.new, self.base):
             policy = run.repro.get("governance_policy_version")
             for t in sorted(t for t, r in run.results.items() if gate(r).get("withheld")):
+                if not gate_wellformed(run.results[t]):
+                    self.add(run.label, f"B2-B4 {t} dependents", "FAIL", "not evaluated: gate fields malformed (see B0)"); continue
                 if policy == POLICY_V2:
                     self._v2_dependents(run, t, prof if run is self.new else {})
                 elif policy == POLICY_V1:
@@ -646,14 +866,15 @@ class Checker:
                 else:
                     self.add(run.label, f"B2-B4 {t} dependents", "REVIEW", f"unknown governance policy {policy!r}: no rule to check against")
         new, base = self.new, self.base
-        gov_tickers = sorted(t for t, r in new.results.items() if gate(r).get("withheld"))
+        gov_tickers = sorted(t for t, r in new.results.items() if gate(r).get("withheld") and gate_wellformed(r))
         # B5 no governance artefacts outside governed tickers (both runs)
         for run in (new, base):
             gt = {t for t, r in run.results.items() if gate(r).get("withheld")}
             stray = []
             for t, r in run.results.items():
                 if t in gt: continue
-                if any((gate(r).get("relabelled") or {}).get(s_) for s_ in STAGE_DEPS): stray.append(f"{t}: relabelled non-empty")
+                if any(_d(gate(r).get("relabelled")).get(s_) for s_ in STAGE_DEPS): stray.append(f"{t}: relabelled non-empty")
+                if _d(growth_agg(r)).get("withheld_components"): stray.append(f"{t}: growth.withheld_components non-empty")
                 for stage in STAGE_DEPS:
                     for n, item in (stage_items(r, stage) or {}).items():
                         if isinstance(item, dict) and (is_marker(item) or item.get(STATUS_KEY[stage]) == "WITHHELD" or item.get("reason_code") == GOV_REASON):
@@ -680,22 +901,22 @@ class Checker:
                           "; ".join(bad) or "; ".join(seen))
         # B7 GE masking / originals / debt / controls (carried over from v2.2 C5/C6/C8)
         for t in gov_tickers:
-            r = new.results[t]; g = gate(r); W = g.get("withheld") or []; nm = metrics(r); uo = g.get("unmasked_originals") or {}
+            r = new.results[t]; g = gate(r); W = g.get("withheld") or []; nm = metrics(r); uo = _d(g.get("unmasked_originals"))
             p = []
             if sorted(uo) != sorted(W): p.append(f"unmasked_originals keys {sorted(uo)} != withheld")
             for m in W:
-                if (nm.get(m) or {}).get("status") != "WITHHELD" or (nm.get(m) or {}).get("value") is not None: p.append(f"{m} not masked")
+                if _d(nm.get(m)).get("status") != "WITHHELD" or _d(nm.get(m)).get("value") is not None: p.append(f"{m} not masked")
             for m in g.get("scoped") or []:
-                e = (nm.get(m) or {}).get("eligibility") or {}
-                if e.get("governance_status") != "ELIGIBLE" or (nm.get(m) or {}).get("status") == "WITHHELD": p.append(f"{m} scoped but not ELIGIBLE/unmasked")
+                e = _d(_d(nm.get(m)).get("eligibility"))
+                if e.get("governance_status") != "ELIGIBLE" or _d(nm.get(m)).get("status") == "WITHHELD": p.append(f"{m} scoped but not ELIGIBLE/unmasked")
             dm = stage_items(r, "derived") or {}
             for c in ("net_debt", "debt_to_cash"):
                 if "total_debt" in W: continue
                 if c not in dm: p.append(f"{c} absent")
-                elif dm[c].get("status") == "WITHHELD" or dm[c].get("reason_code") == GOV_REASON or is_marker(dm[c]):
+                elif _d(dm[c]).get("status") == "WITHHELD" or _d(dm[c]).get("reason_code") == GOV_REASON or is_marker(dm[c]):
                     p.append(f"{c} carries governance WITHHELD")
             self.add("NEW", f"B7 {t} normalized masked, originals kept, scoped debt ELIGIBLE, net_debt/debt_to_cash not governance",
-                     "PASS" if not p else "FAIL", "; ".join(p) or ", ".join(f"{c}={(dm.get(c) or {}).get('status')}" for c in ("net_debt", "debt_to_cash")))
+                     "PASS" if not p else "FAIL", "; ".join(p) or ", ".join(f"{c}={_d(dm.get(c)).get('status')}" for c in ("net_debt", "debt_to_cash")))
 
 
     def _v1_dependents(self, run, t):
@@ -724,6 +945,8 @@ class Checker:
                     problems.append(f"{stage}.{n}: WITHHELD/marker outside the produced dependency set")
         ag = growth_agg(r)
         if not isinstance(ag, dict): problems.append("growth.growth aggregate missing (required)")
+        elif not isinstance(ag.get("withheld_components") or [], list) or not all(isinstance(x, str) for x in ag.get("withheld_components") or []):
+            problems.append("growth.withheld_components malformed (see T0)")
         elif sorted(ag.get("withheld_components") or []) != sorted(rel.get("growth") or []):
             problems.append(f"growth.withheld_components {ag.get('withheld_components')} != relabelled growth")
         self.add(run.label, f"B2-B4 {t} dependents (V1 rule: produced only)", "PASS" if not problems else "FAIL",
@@ -765,6 +988,8 @@ class Checker:
         ag = growth_agg(r)
         gexp = sorted(n for n, d in GROWTH_DEPS.items() if set(d) & set(W))
         if not isinstance(ag, dict): problems.append("growth.growth aggregate missing (required)")
+        elif not isinstance(ag.get("withheld_components") or [], list) or not all(isinstance(x, str) for x in ag.get("withheld_components") or []):
+            problems.append("growth.withheld_components malformed (see T0)")
         elif sorted(ag.get("withheld_components") or []) != gexp:
             problems.append(f"growth.withheld_components {ag.get('withheld_components')} expected {gexp}")
         self.add(run.label, f"B2-B4 {t} dependents (V2 rule: all listed; marker structure; vs BASE)", "PASS" if not problems else "FAIL",
@@ -916,7 +1141,8 @@ class Checker:
         bad = [p for p in sorted(set(fa) | set(fb)) if fa.get(p) != fb.get(p) and not allowed_summary.match(p)]
         self.add("CMP", "D7 summary.json differs only in run metadata / provenance / raw_input hashes", "PASS" if not bad else "FAIL", f"other changes: {bad[:10]}")
         # D8 source snapshot drift
-        def man_map(run): return {f.get("ticker"): (f.get("sha256"), f.get("size_bytes")) for f in ((run.manifest or {}).get("files") or []) if isinstance(f, dict)}
+        def man_map(run): return {f["ticker"]: (f.get("sha256"), f.get("size_bytes")) for f in _l(_d(run.manifest).get("files"))
+                                  if isinstance(f, dict) and isinstance(f.get("ticker"), str)}
         mn, mb = man_map(new), man_map(base)
         changed = sorted(t for t in set(mn) | set(mb) if mn.get(t) != mb.get(t))
         detail = ", ".join(f"{t} {(mb.get(t) or (None, None))[1]}->{(mn.get(t) or (None, None))[1]} bytes" for t in changed)
@@ -938,9 +1164,10 @@ class Checker:
         if new.raw is None:
             self.add("PIT", "E2 post-cutoff accessions in raw never reach results", "REVIEW", "raw input not supplied"); return
         post, leaked = {}, []
-        for f in ((new.manifest or {}).get("files") or []):
+        for f in _l(_d(new.manifest).get("files")):
+            if not isinstance(f, dict): continue                 # malformed entries are FAIL in A6/A8
             t, p = f.get("ticker"), f.get("path")
-            if t not in new.results or not new.raw.has(p): continue
+            if not isinstance(t, str) or not isinstance(p, str) or t not in new.results or not new.raw.has(p): continue
             try:
                 facts = json.loads(new.raw.bytes(p).decode("utf-8")).get("facts") or {}
             except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
@@ -997,10 +1224,29 @@ class Checker:
             self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", v,
                      f"{len(targets)} original amount(s) scanned, {small} small (exact match + context rules); "
                      f"leak locations={fail[:10]}; ambiguous small-value matches={review[:10]}")
-        self.targets = withheld_targets(self.new) + withheld_targets(self.base)
 
     def run(self):
-        self.check_integrity(); self.check_profile(); self.check_stages(); self.check_governance(); self.check_coverage(); self.check_diff(); self.check_pit(); self.check_leak()
+        """Every check group runs in isolation: an unexpected exception on malformed input becomes a FAIL for that
+        group (exception type and code location only, never values) and the remaining groups still run.
+        The WITHHELD targets are collected first, so the output self-check always has them."""
+        try:
+            self.cutoff = (date.fromisoformat(self.date) - timedelta(days=1)).isoformat()
+        except (TypeError, ValueError):
+            raise InputError(f"--expect-date {self.date!r} is not YYYY-MM-DD")
+        self.targets = withheld_targets(self.new) + withheld_targets(self.base)
+        for name, fn in (("integrity (A)", self.check_integrity), ("profile/mapping (P0/M1)", self.check_profile),
+                         ("stages (S1)", self.check_stages), ("schema (T0)", self.check_schema),
+                         ("governance (B)", self.check_governance),
+                         ("coverage (C)", self.check_coverage), ("run comparison (D)", self.check_diff),
+                         ("PIT (E)", self.check_pit), ("leak (F)", self.check_leak)):
+            try:
+                fn()
+            except InputError:
+                raise
+            except Exception as e:              # noqa: BLE001 -- fail closed, never a traceback
+                where = traceback.extract_tb(e.__traceback__)[-1]
+                self.add("ERR", f"X0 {name} checks aborted on malformed input", "FAIL",
+                         f"{type(e).__name__} in {where.name} (line {where.lineno}); other check groups still ran")
         return self.res
 
 
@@ -1089,6 +1335,10 @@ def main(argv=None):
         res = ck.run()
     except InputError as e:
         print(f"[INPUT ERROR] {e}"); return 3
+    except Exception as e:                       # noqa: BLE001 -- last line of defence: FAIL, never a traceback
+        where = traceback.extract_tb(e.__traceback__)[-1]
+        print(f"[FAIL] checker could not complete: {type(e).__name__} in {where.name} (line {where.lineno})")
+        print("\nOVERALL FAIL: checker aborted"); return 1
     header = (f"{VERSION}  profile={(prof or {}).get('name', 'none')}  expect-date={a.expect_date}\n"
               f"NEW  input sha256={new.arc.zip_sha256 or 'directory'} raw={new.raw.zip_sha256 if new.raw else None}\n"
               f"BASE input sha256={base.arc.zip_sha256 or 'directory'} raw={base.raw.zip_sha256 if base.raw else None}")
