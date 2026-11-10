@@ -28,6 +28,20 @@ GROWTH_WEIGHTS = {
 
 MIN_VALID_COMPONENTS = 3
 
+# STEP 24.3 A-1: structured codes for every INVALID result built in this
+# module. Each code is fixed at its branch; it is never derived from the
+# human-readable "reason" text (which stays unchanged). Kept separate from
+# data_sufficiency.REASON_CODES (that vocabulary never applies to INVALID).
+GROWTH_REASON_CODES = frozenset({
+    "NON_NUMERIC_INPUT",
+    "NON_FINITE_INPUT",          # registered for a future, separately approved finite-input guard; not emitted today
+    "NONPOSITIVE_PRIOR_BASE",
+    "NONPOSITIVE_CURRENT",
+    "ZERO_PRIOR_BASE",
+    "NEGATIVE_END_VALUE",
+    "INVALID_PERIOD_PARAMETER",
+})
+
 
 # ============================================================
 # GENERIC HELPERS
@@ -86,12 +100,17 @@ def _build_missing_metric(
 def _build_invalid_metric(
     metric: str,
     reason: str,
+    reason_code: str,
 ) -> dict[str, Any]:
+    if reason_code not in GROWTH_REASON_CODES:
+        raise ValueError(f"unregistered growth reason_code: {reason_code!r}")
+
     return {
         "status": "INVALID",
         "metric": metric,
         "value": None,
         "reason": reason,
+        "reason_code": reason_code,
     }
 
 
@@ -235,6 +254,7 @@ def calculate_positive_yoy(
         return _build_invalid_metric(
             metric_name,
             "Current and previous values must be numeric.",
+            "NON_NUMERIC_INPUT",
         )
 
     if previous <= 0:
@@ -242,6 +262,7 @@ def calculate_positive_yoy(
             metric_name,
             "Previous value must be greater than zero "
             "for conventional YoY calculation.",
+            "NONPOSITIVE_PRIOR_BASE",
         )
 
     if current <= 0:
@@ -249,6 +270,7 @@ def calculate_positive_yoy(
             metric_name,
             "Current value must be greater than zero "
             "for conventional YoY calculation.",
+            "NONPOSITIVE_CURRENT",
         )
 
     growth = _round_growth(
@@ -280,12 +302,14 @@ def calculate_standard_yoy(
         return _build_invalid_metric(
             metric_name,
             "Current and previous values must be numeric.",
+            "NON_NUMERIC_INPUT",
         )
 
     if previous == 0:
         return _build_invalid_metric(
             metric_name,
             "Previous value cannot be zero.",
+            "ZERO_PRIOR_BASE",
         )
 
     growth = _round_growth(
@@ -312,24 +336,28 @@ def calculate_cagr_3y(
         return _build_invalid_metric(
             metric_name,
             "Start and end values must be numeric.",
+            "NON_NUMERIC_INPUT",
         )
 
     if start_value <= 0:
         return _build_invalid_metric(
             metric_name,
             "Starting value must be greater than zero.",
+            "NONPOSITIVE_PRIOR_BASE",
         )
 
     if end_value < 0:
         return _build_invalid_metric(
             metric_name,
             "Ending value cannot be negative.",
+            "NEGATIVE_END_VALUE",
         )
 
     if years <= 0:
         return _build_invalid_metric(
             metric_name,
             "Years must be greater than zero.",
+            "INVALID_PERIOD_PARAMETER",
         )
 
     cagr = (
