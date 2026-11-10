@@ -1,4 +1,7 @@
-"""STEP 23 Checker v2.3 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.4 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+
+v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
+newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
 
 usage:
   python3 -I scripts/step23_checker_v2_3.py --new NEW --base BASE --expect-date YYYY-MM-DD --profile (FILE.json|none)
@@ -29,10 +32,10 @@ Guarantees:
 """
 from __future__ import annotations
 
-import argparse, ast, hashlib, json, math, os, re, stat, sys, traceback, zipfile
+import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.3"
+VERSION = "checker_v2.4"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -72,6 +75,17 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CIK_RE = re.compile(r"^[0-9]{10}$")
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
 SHA40 = re.compile(r"[0-9a-f]{40}")
+# ---------------------------------------------------------------- v2.4 migration allowance (D2)
+# Mirror of production growth.GROWTH_REASON_CODES (STEP 24.3 A-1). The A-1 PR adds a test asserting equality.
+GROWTH_REASON_CODES = frozenset({"NON_NUMERIC_INPUT", "NON_FINITE_INPUT", "NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT",
+                                 "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER"})
+ALLOWANCE_VALUE_SETS = {"GROWTH_REASON_CODES": GROWTH_REASON_CODES}
+# exact path grammar per value set: one Growth component's reason_code leaf; no wildcard / prefix forms exist
+ALLOWANCE_PATH_RE = {"GROWTH_REASON_CODES": re.compile(
+    r"^/stages/growth/growth/components/(revenue_yoy|operating_income_yoy|eps_yoy|fcf_yoy|revenue_cagr_3y)/reason_code$")}
+ALLOWANCE_KEYS = {"migration_id", "binding", "value_set", "paths"}
+ALLOWANCE_BINDING_KEYS = {"evaluation_date", "base_github_run_id", "base_github_sha", "new_github_run_id", "new_github_sha"}
+ALLOWED_ADDITION = "ALLOWED_ADDITION"
 MAX_MEMBER = 512 * 1024 * 1024
 
 class InputError(Exception):
@@ -1052,9 +1066,19 @@ class Checker:
             class _R: pass
             v = _R(); v.summary = {"records": [r for r in run.summary["records"] if r.get("ticker") not in gov_t]}; v.results = run.results
             return recompute_stage_coverage(v)
-        same = without(self.new) == without(self.base)
+        allow, _w, accepted, _p = self.allowance()
+        base_view = self.base
+        if accepted:
+            class _B: pass
+            base_view = _B(); base_view.summary = self.base.summary
+            base_view.results = {t: copy.deepcopy(r) for t, r in self.base.results.items()}
+            for t, p in accepted:
+                parent, key = parent_and_key(p)
+                get_path(base_view.results[t], parent)[key] = get_path(self.new.results[t], p)
+        same = without(self.new) == without(base_view)
         self.add("CMP", "C3 stage coverage identical BASE vs NEW once governed tickers are excluded", "PASS" if same else "FAIL",
-                 f"governed excluded={sorted(gov_t)}")
+                 f"governed excluded={sorted(gov_t)}" + (f"; BASE compared with the {len(accepted)} accepted allowance addition(s) of "
+                                                         f"{allow['migration_id']} applied (no other change tolerated)" if accepted else ""))
         prof = self.profile or {}
         p = []
         tot = lambda run, m: sum(((recompute_stage_coverage(run)["derived_metrics"].get(m) or {}).get("by_status") or {}).values())
@@ -1066,6 +1090,38 @@ class Checker:
         if prof.get("derived_totals") or prof.get("derived_status_new"):
             self.add("PROF", "C4 derived totals / status mix vs profile", "PASS" if not p else "FAIL",
                      "; ".join(p) or ", ".join(f"{m} {b}->{n}" for m, (b, n) in prof["derived_totals"].items()))
+
+    # ---------- v2.4 migration allowance (shared by C3 and D2)
+    def allowance(self):
+        """(allowance, wanted {(ticker, path)}, accepted {(ticker, path)}, problems). Cached.
+        accepted = wanted entries that are genuine additions: absent in BASE, present in NEW, value a registered string,
+        and the owning component is INVALID in both runs. Anything else stays a data change."""
+        if hasattr(self, "_allow_cache"): return self._allow_cache
+        allow = (self.profile or {}).get("allowed_added_paths")
+        want, accepted, problems = set(), set(), []
+        if allow:
+            b, at = allow["binding"], self.profile["applies_to"]
+            actual = {"evaluation_date": self.date}
+            for run, side in ((self.base, "base"), (self.new, "new")):
+                prov = run.repro.get("provenance") or {}
+                actual[f"{side}_github_run_id"] = str(prov.get("github_run_id")); actual[f"{side}_github_sha"] = str(prov.get("github_sha"))
+            declared = {"evaluation_date": at["evaluation_date"], "base_github_run_id": at["base"]["github_run_id"], "base_github_sha": at["base"]["github_sha"],
+                        "new_github_run_id": at["new"]["github_run_id"], "new_github_sha": at["new"]["github_sha"]}
+            unbound = sorted(k for k in ALLOWANCE_BINDING_KEYS if b[k] != actual[k] or b[k] != declared[k])
+            if unbound: problems.append(f"allowance {allow['migration_id']} not bound to this BASE/NEW pair ({', '.join(unbound)})")
+            else:
+                want = {(e["ticker"], e["path"]) for e in allow["paths"]}
+                values = ALLOWANCE_VALUE_SETS[allow["value_set"]]
+                for t, p in want:
+                    rb, rn = self.base.results.get(t), self.new.results.get(t)
+                    if rb is None or rn is None: continue
+                    parent = parent_and_key(p)[0]
+                    fa, fb = flat(rb), flat(rn)
+                    if (p not in fa and p in fb and isinstance(fb[p], str) and fb[p] in values
+                            and _d(get_path(rb, parent)).get("status") == "INVALID" and _d(get_path(rn, parent)).get("status") == "INVALID"):
+                        accepted.add((t, p))
+        self._allow_cache = (allow, want, accepted, problems)
+        return self._allow_cache
 
     # ---------- D: run-to-run diff
     def classify(self, t, a, b, governed: bool):
@@ -1110,9 +1166,19 @@ class Checker:
                  f"{len(nt)} OK tickers; added={sorted(set(nt)-set(bt))} removed={sorted(set(bt)-set(nt))}")
         prof_cls = (self.profile or {}).get("diff_classes") or {}
         data_changes, frame_bad, unexpected, summary_rows = [], [], [], {}
+        # v2.4 migration allowance: exact, pair-bound, additions only (absent in BASE, present in NEW), registered values only
+        allow, want, accepted, allow_problems = self.allowance()
+        allow_problems = list(allow_problems); found = set()
         for t in sorted(set(nt) & set(bt)):
             governed = bool(gate(new.results[t]).get("withheld") or gate(base.results[t]).get("withheld"))
             c = self.classify(t, base.results[t], new.results[t], governed)
+            if accepted:
+                keep = []
+                for p in c.get("DATA_CHANGE", []):
+                    if (t, p) in accepted: c.setdefault(ALLOWED_ADDITION, []).append(p); found.add((t, p))
+                    else: keep.append(p)
+                if keep: c["DATA_CHANGE"] = keep
+                else: c.pop("DATA_CHANGE", None)
             summary_rows[t] = {k: len(v) for k, v in c.items()}
             self.diff_report[t] = {k: v for k, v in c.items()}
             data_changes += [f"{t}{p}" for p in c.get("DATA_CHANGE", [])]
@@ -1122,8 +1188,17 @@ class Checker:
                 got = set(c)
                 if got != allowed and not (got < allowed and "RUN_METADATA" in got):
                     unexpected.append(f"{t}: {sorted(got)} expected {sorted(allowed)}")
-        self.add("CMP", "D2 ticker JSON: no data change (same evaluation date)", "PASS" if not data_changes else "FAIL",
-                 f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}")
+        if want:
+            missing = sorted(f"{t}{p}" for t, p in want - found)
+            if missing: allow_problems.append(f"{len(missing)} expected addition(s) not found exactly: {missing[:12]}")
+        if allow:
+            label = f"D2 ticker JSON: no data change except allowance {allow['migration_id']} (same evaluation date)"
+            detail = (f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}; allowed additions {len(found)}/{len(want)}"
+                      + (f"; {'; '.join(allow_problems)}" if allow_problems else ""))
+            self.add("CMP", label, "PASS" if not data_changes and not allow_problems else "FAIL", detail)
+        else:
+            self.add("CMP", "D2 ticker JSON: no data change (same evaluation date)", "PASS" if not data_changes else "FAIL",
+                     f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}")
         self.add("CMP", "D3 frame drift only where source identity is unchanged", "PASS" if not frame_bad else "FAIL",
                  f"frame+identity changes: {frame_bad[:12]}")
         frames = []
@@ -1268,7 +1343,39 @@ def load_profile(arg):
             and s.get("governance_policy_version") in KNOWN_POLICIES
     if not ok:
         raise InputError(f"profile {arg}: applies_to needs evaluation_date and base/new github_run_id, full github_sha, known policy")
+    if "allowed_added_paths" in prof:
+        problems = allowance_problems(prof["allowed_added_paths"])
+        if problems: raise InputError(f"profile {arg}: allowed_added_paths invalid ({problems[0]})")
     return prof
+
+
+def allowance_problems(al) -> list[str]:
+    """Structural validation of a v2.4 migration allowance. Any deviation is an input error (fail closed)."""
+    if not isinstance(al, dict) or set(al) != ALLOWANCE_KEYS: return [f"keys must be exactly {sorted(ALLOWANCE_KEYS)}"]
+    p = []
+    if not isinstance(al["migration_id"], str) or not al["migration_id"].strip(): p.append("migration_id must be a non-empty string")
+    b = al["binding"]
+    if not isinstance(b, dict) or set(b) != ALLOWANCE_BINDING_KEYS: p.append(f"binding keys must be exactly {sorted(ALLOWANCE_BINDING_KEYS)}")
+    else:
+        if not is_iso_date(b["evaluation_date"]): p.append("binding.evaluation_date must be YYYY-MM-DD")
+        for side in ("base", "new"):
+            rid, sha = b[f"{side}_github_run_id"], b[f"{side}_github_sha"]
+            if not (isinstance(rid, str) and rid.isdigit()): p.append(f"binding.{side}_github_run_id must be a digit string")
+            if not (isinstance(sha, str) and SHA40.fullmatch(sha)): p.append(f"binding.{side}_github_sha must be a full 40-hex SHA")
+    if al["value_set"] not in ALLOWANCE_VALUE_SETS: p.append(f"value_set must be one of {sorted(ALLOWANCE_VALUE_SETS)}")
+    paths = al["paths"]
+    if not isinstance(paths, list) or not paths: p.append("paths must be a non-empty list")
+    else:
+        seen = set()
+        rx = ALLOWANCE_PATH_RE.get(al["value_set"]) if isinstance(al["value_set"], str) else None
+        for e in paths:
+            if not isinstance(e, dict) or set(e) != {"ticker", "path"}: p.append("each path entry must be exactly {ticker, path}"); continue
+            tk, pa = e["ticker"], e["path"]
+            if not (isinstance(tk, str) and TICKER_RE.fullmatch(tk)): p.append(f"bad ticker {tk!r}"); continue
+            if not (isinstance(pa, str) and rx and rx.fullmatch(pa)): p.append(f"{tk}: path not an exact allowed leaf: {pa!r}"); continue
+            if (tk, pa) in seen: p.append(f"duplicate entry {tk}{pa}")
+            seen.add((tk, pa))
+    return p
 
 
 def static_dict(path, name):
