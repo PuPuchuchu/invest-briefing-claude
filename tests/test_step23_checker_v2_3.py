@@ -1779,5 +1779,168 @@ class Round7ExtremeInteger(unittest.TestCase):
                 self.assertEqual(verdict(out, "T0", "NEW"), "FAIL"); self.assertEqual(verdict(out, "T0", "BASE"), "FAIL")
 
 
+# ---------------------------------------------------------------- v2.4: D2 migration allowance (STEP 24.3 A-0)
+INV_P = "Previous value must be greater than zero for conventional YoY calculation."
+MIG = [("AAPL", "fcf_yoy", "NONPOSITIVE_PRIOR_BASE"), ("AAPL", "operating_income_yoy", "ZERO_PRIOR_BASE"), ("LLY", "fcf_yoy", "NONPOSITIVE_CURRENT")]
+
+
+def mig_profile(entries=MIG, **binding_override):
+    prof = copy.deepcopy(PROFILE)
+    b = {"evaluation_date": DATE, "base_github_run_id": RUN_B, "base_github_sha": SHA_B, "new_github_run_id": RUN_N, "new_github_sha": SHA_N}
+    b.update(binding_override)
+    prof["allowed_added_paths"] = {"migration_id": "TEST_A1_REASON_CODE", "binding": b, "value_set": "GROWTH_REASON_CODES",
+                                   "paths": [{"ticker": t, "path": f"/stages/growth/growth/components/{m}/reason_code"} for t, m, _ in entries]}
+    prof["diff_classes"] = {"GE": ["RUN_METADATA", "GOVERNANCE_MARKER"], "AAPL": ["RUN_METADATA", "FRAME_METADATA_ONLY", "ALLOWED_ADDITION"],
+                            "LLY": ["RUN_METADATA", "ALLOWED_ADDITION"], "*": ["RUN_METADATA"]}
+    return prof
+
+
+def mig_pair(entries=MIG, add=True):
+    """INVALID components in BASE and NEW; NEW additionally carries reason_code (the A-1 change)."""
+    p = Pair()
+    for t, m, code in MIG:
+        for lab in ("BASE", "NEW"):
+            p.res[lab][t]["stages"]["growth"]["growth"]["components"][m] = {"status": "INVALID", "metric": m, "value": None, "reason": INV_P}
+    if add:
+        for t, m, code in entries:
+            p.res["NEW"][t]["stages"]["growth"]["growth"]["components"][m]["reason_code"] = code
+    return p
+
+
+def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["components"][m]
+
+
+class MigrationAllowanceV24(unittest.TestCase):
+    def test_version_is_v24(self):
+        self.assertEqual(ck.VERSION, "checker_v2.4")
+
+    def test_exact_expected_additions_pass(self):
+        code, out = run_pair(mig_pair(), profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "PASS", out)
+        self.assertIn("allowed additions 3/3", out)
+        self.assertEqual(code, 0, out)
+
+    def test_unexpected_addition_fails(self):
+        p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["extra_flag"] = "X"
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(code, 1)
+
+    def test_unexpected_reason_code_on_unlisted_component_fails(self):
+        p = mig_pair(); comp(p, "BASE", "LLY", "operating_income_yoy").update(status="INVALID")
+        comp(p, "NEW", "LLY", "operating_income_yoy").update(status="INVALID", reason_code="NONPOSITIVE_PRIOR_BASE")
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_expected_path_missing_fails(self):
+        p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy").pop("reason_code")
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("expected addition(s) not found", out)
+
+    def test_field_deletion_fails(self):
+        p = mig_pair(); comp(p, "NEW", "AAPL", "fcf_yoy").pop("reason")
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_existing_value_change_fails(self):
+        p = mig_pair(); comp(p, "NEW", "AAPL", "fcf_yoy")["reason"] = "Reworded message."
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_reason_code_value_change_is_not_an_addition(self):
+        p = mig_pair(); comp(p, "BASE", "AAPL", "fcf_yoy")["reason_code"] = "NONPOSITIVE_CURRENT"   # present in BASE already
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_unregistered_reason_code_fails(self):
+        p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["reason_code"] = "SOMETHING_NEW"
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_non_string_reason_code_fails(self):
+        p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["reason_code"] = ["NONPOSITIVE_CURRENT"]
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_addition_on_non_invalid_component_fails(self):
+        p = mig_pair()
+        for lab in ("BASE", "NEW"): comp(p, lab, "LLY", "fcf_yoy").update(status="OK", value=0.1)
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_profile_not_bound_to_pair_fails(self):
+        for k, v in (("new_github_run_id", "999"), ("base_github_sha", "c" * 40), ("evaluation_date", "2026-11-04")):
+            with self.subTest(k=k):
+                code, out = run_pair(mig_pair(), profile=mig_profile(**{k: v}))
+                self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("not bound to this BASE/NEW pair", out)
+
+    def test_no_profile_keeps_v23_d2(self):
+        code, out = run_pair(mig_pair(), profile=None)
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("D2 ticker JSON: no data change (same evaluation date)", out)
+
+    def test_profile_without_allowance_keeps_v23_d2(self):
+        prof = mig_profile(); prof.pop("allowed_added_paths")
+        code, out = run_pair(mig_pair(), profile=prof)
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertNotIn("ALLOWED_ADDITION", out.split("D5")[0])
+
+    def test_clean_pair_with_allowance_but_no_additions_fails(self):
+        code, out = run_pair(mig_pair(add=False), profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("expected addition(s) not found", out)
+
+    def test_malformed_allowance_is_input_error(self):
+        bad_paths = ["/stages/growth/growth/components/*/reason_code", "/stages/growth/growth/components/fcf_yoy",
+                     "/stages/growth/growth/components/fcf_yoy/reason", "/stages/growth/growth/components/fcf_yoy/reason_code/x",
+                     "/stages/derived_metrics/derived/derived_metrics/fcf/reason_code", "/stages/growth/growth/components/ebitda_yoy/reason_code"]
+        for pa in bad_paths:
+            with self.subTest(path=pa):
+                prof = mig_profile(); prof["allowed_added_paths"]["paths"][0]["path"] = pa
+                code, out = run_pair(mig_pair(), profile=prof)
+                self.assertEqual(code, 3, out)
+        mutations = [lambda a: a.pop("binding"), lambda a: a.update(value_set="ANY"), lambda a: a.update(paths=[]),
+                     lambda a: a["paths"].append(dict(a["paths"][0])), lambda a: a.update(extra=1), lambda a: a.update(migration_id=""),
+                     lambda a: a["binding"].update(new_github_sha="abc"), lambda a: a["paths"].__setitem__(0, {"ticker": "AAPL"}),
+                     lambda a: a["paths"].__setitem__(0, {"ticker": "aapl", "path": "/stages/growth/growth/components/fcf_yoy/reason_code"})]
+        for i, mut in enumerate(mutations):
+            with self.subTest(mutation=i):
+                prof = mig_profile(); mut(prof["allowed_added_paths"])
+                code, out = run_pair(mig_pair(), profile=prof)
+                self.assertEqual(code, 3, out)
+
+    def test_unhashable_value_set_is_input_error_not_crash(self):
+        for bad in ([], {}):
+            with self.subTest(value_set=bad):
+                prof = mig_profile(); prof["allowed_added_paths"]["value_set"] = bad
+                code, out = run_pair(mig_pair(), profile=prof)
+                self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out); self.assertIn("value_set", out)
+                self.assertNotIn("Traceback", out); self.assertNotIn("TypeError", out); self.assertNotIn("could not complete", out)
+                with self.assertRaises(ck.InputError):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        fn = os.path.join(tmp, "profile.json")
+                        with open(fn, "w", encoding="utf-8") as fh: json.dump(prof, fh)
+                        ck.load_profile(fn)
+
+    def test_allowance_values_are_the_registered_set(self):
+        self.assertEqual(ck.ALLOWANCE_VALUE_SETS["GROWTH_REASON_CODES"], ck.GROWTH_REASON_CODES)
+        self.assertEqual(len(ck.GROWTH_REASON_CODES), 7)
+
+    def test_c3_accepts_only_the_allowed_coverage_shift(self):
+        code, out = run_pair(mig_pair(), profile=mig_profile())
+        self.assertEqual(verdict(out, "C3"), "PASS", out); self.assertIn("3 accepted allowance addition(s)", out)
+        p = mig_pair(); comp(p, "NEW", "AAPL", "fcf_yoy")["status"] = "MISSING"          # extra coverage shift
+        code, out = run_pair(p, profile=mig_profile())
+        self.assertEqual(verdict(out, "C3"), "FAIL"); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_without_allowance_c3_still_fails_on_reason_code_shift(self):
+        prof = mig_profile(); prof.pop("allowed_added_paths")
+        code, out = run_pair(mig_pair(), profile=prof)
+        self.assertEqual(verdict(out, "C3"), "FAIL")
+
+    def test_empty_container_reason_code_fails_without_crash(self):
+        for bad in ([], {}, None, 7, True):
+            with self.subTest(value=bad):
+                p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["reason_code"] = bad
+                code, out = run_pair(p, profile=mig_profile())
+                self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertNotIn(" X0 ", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
