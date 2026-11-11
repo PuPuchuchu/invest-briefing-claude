@@ -1779,10 +1779,6 @@ class Round7ExtremeInteger(unittest.TestCase):
                 self.assertEqual(verdict(out, "T0", "NEW"), "FAIL"); self.assertEqual(verdict(out, "T0", "BASE"), "FAIL")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 # ---------------------------------------------------------------- v2.4: D2 migration allowance (STEP 24.3 A-0)
 INV_P = "Previous value must be greater than zero for conventional YoY calculation."
 MIG = [("AAPL", "fcf_yoy", "NONPOSITIVE_PRIOR_BASE"), ("AAPL", "operating_income_yoy", "ZERO_PRIOR_BASE"), ("LLY", "fcf_yoy", "NONPOSITIVE_CURRENT")]
@@ -1909,6 +1905,19 @@ class MigrationAllowanceV24(unittest.TestCase):
                 code, out = run_pair(mig_pair(), profile=prof)
                 self.assertEqual(code, 3, out)
 
+    def test_unhashable_value_set_is_input_error_not_crash(self):
+        for bad in ([], {}):
+            with self.subTest(value_set=bad):
+                prof = mig_profile(); prof["allowed_added_paths"]["value_set"] = bad
+                code, out = run_pair(mig_pair(), profile=prof)
+                self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out); self.assertIn("value_set", out)
+                self.assertNotIn("Traceback", out); self.assertNotIn("TypeError", out); self.assertNotIn("could not complete", out)
+                with self.assertRaises(ck.InputError):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        fn = os.path.join(tmp, "profile.json")
+                        with open(fn, "w", encoding="utf-8") as fh: json.dump(prof, fh)
+                        ck.load_profile(fn)
+
     def test_allowance_values_are_the_registered_set(self):
         self.assertEqual(ck.ALLOWANCE_VALUE_SETS["GROWTH_REASON_CODES"], ck.GROWTH_REASON_CODES)
         self.assertEqual(len(ck.GROWTH_REASON_CODES), 7)
@@ -1931,3 +1940,7 @@ class MigrationAllowanceV24(unittest.TestCase):
                 p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["reason_code"] = bad
                 code, out = run_pair(p, profile=mig_profile())
                 self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertNotIn(" X0 ", out)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

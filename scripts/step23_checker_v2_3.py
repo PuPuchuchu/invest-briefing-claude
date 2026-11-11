@@ -1362,12 +1362,14 @@ def allowance_problems(al) -> list[str]:
             rid, sha = b[f"{side}_github_run_id"], b[f"{side}_github_sha"]
             if not (isinstance(rid, str) and rid.isdigit()): p.append(f"binding.{side}_github_run_id must be a digit string")
             if not (isinstance(sha, str) and SHA40.fullmatch(sha)): p.append(f"binding.{side}_github_sha must be a full 40-hex SHA")
-    if al["value_set"] not in ALLOWANCE_VALUE_SETS: p.append(f"value_set must be one of {sorted(ALLOWANCE_VALUE_SETS)}")
+    value_set = al["value_set"]
+    if not isinstance(value_set, str) or value_set not in ALLOWANCE_VALUE_SETS:   # type first: [] / {} are unhashable
+        p.append(f"value_set must be one of the registered string value sets {sorted(ALLOWANCE_VALUE_SETS)}")
     paths = al["paths"]
     if not isinstance(paths, list) or not paths: p.append("paths must be a non-empty list")
     else:
         seen = set()
-        rx = ALLOWANCE_PATH_RE.get(al["value_set"]) if isinstance(al["value_set"], str) else None
+        rx = ALLOWANCE_PATH_RE.get(value_set) if isinstance(value_set, str) else None
         for e in paths:
             if not isinstance(e, dict) or set(e) != {"ticker", "path"}: p.append("each path entry must be exactly {ticker, path}"); continue
             tk, pa = e["ticker"], e["path"]
