@@ -1811,8 +1811,8 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 
 class MigrationAllowanceV24(unittest.TestCase):
-    def test_version_is_v24(self):
-        self.assertEqual(ck.VERSION, "checker_v2.4")
+    def test_version_is_current(self):
+        self.assertEqual(ck.VERSION, "checker_v2.5")
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -1940,6 +1940,327 @@ class MigrationAllowanceV24(unittest.TestCase):
                 p = mig_pair(); comp(p, "NEW", "LLY", "fcf_yoy")["reason_code"] = bad
                 code, out = run_pair(p, profile=mig_profile())
                 self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertNotIn(" X0 ", out)
+
+
+
+# ---------------------------------------------------------------- v2.5: expected_patch (STEP 24.4 P0)
+P25_MIG = "STEP24_4_NEGATIVE_PRIOR_BASE"
+P25_PROFILE = {"profile_version": 1, "name": "P25",
+               "applies_to": {"evaluation_date": DATE,
+                              "base": {"github_run_id": RUN_B, "github_sha": SHA_B, "governance_policy_version": ck.POLICY_V1},
+                              "new": {"github_run_id": RUN_N, "github_sha": SHA_N, "governance_policy_version": ck.POLICY_V1}}}
+P25_BIND = {"evaluation_date": DATE, "base_github_run_id": RUN_B, "base_github_sha": SHA_B, "new_github_run_id": RUN_N, "new_github_sha": SHA_N}
+INV_TEXT = "Previous value must be greater than zero for conventional YoY calculation."
+LIM_TEXT = "YoY growth is not defined when the prior-year comparable-quarter value is not positive."
+ABS = {"$absent": True}
+G = "/stages/growth/growth"
+OPI = f"{G}/components/operating_income_yoy"
+
+
+def p25_pair(change=True):
+    """Same-policy BASE/NEW pair; AAPL carries a realistic Growth block. With change=True NEW applies the STEP 24.4
+    policy to AAPL operating_income_yoy (OK -> INVALID) together with its full cascade."""
+    p = Pair()
+    for lab in ("BASE",):
+        g = p.res[lab]["AAPL"]["stages"]["growth"]["growth"]
+        g["components"]["operating_income_yoy"] = {"status": "OK", "metric": "operating_income_yoy", "value": -0.067742147,
+                                                   "source": ["historical", "quarterly"], "current_period_end": "2026-09-30",
+                                                   "previous_period_end": "2025-09-30", "stars": 1}
+        g["components"]["revenue_yoy"] = {"status": "OK", "metric": "revenue_yoy", "value": 0.2314, "stars": 5}
+        g["growth"] = {"status": "OK", "score": 3.0, "stars": 3, "available_components": 3, "valid_components": 3,
+                       "total_components": 5, "coverage": 0.6}
+        g["warnings"] = ["revenue_operating_income_divergence"]
+        g["limitations"] = {}
+        p.res[lab]["AAPL"]["stages"]["data_sufficiency"]["sufficiency"]["operating_income_yoy"] = {
+            "metric": "operating_income_yoy", "calculation_status": "OK", "reason_code": None, "detail": None}
+    p.res["NEW"] = copy.deepcopy(p.res["BASE"]); p.policy["NEW"] = ck.POLICY_V1; p.raw["NEW"] = copy.deepcopy(p.raw["BASE"])
+    if change:
+        g = p.res["NEW"]["AAPL"]["stages"]["growth"]["growth"]
+        g["components"]["operating_income_yoy"] = {"status": "INVALID", "metric": "operating_income_yoy", "value": None,
+                                                   "reason": INV_TEXT, "reason_code": "NONPOSITIVE_PRIOR_BASE", "stars": None}
+        g["growth"] = {"status": "MISSING", "score": None, "stars": None, "available_components": 2, "valid_components": 2,
+                       "total_components": 5, "coverage": 0.4}
+        g["warnings"] = []
+        g["limitations"] = {"operating_income_yoy": LIM_TEXT}
+        p.res["NEW"]["AAPL"]["stages"]["data_sufficiency"]["sufficiency"]["operating_income_yoy"].update(
+            calculation_status="INVALID", detail=INV_TEXT)
+    return p
+
+
+def p25_entries(p):
+    """Every leaf difference of the pair as patch entries (test oracle; the real generator never reads NEW)."""
+    out = []
+    docs = [(f"{t}.json", p.res["BASE"][t], p.res["NEW"][t]) for t in p.tickers]
+    docs.append(("coverage.json", json.loads(p.files("BASE")["coverage.json"]), json.loads(p.files("NEW")["coverage.json"])))
+    for f, a, b in docs:
+        fa, fb = ck.flat(a), ck.flat(b)
+        for path in sorted(set(fa) | set(fb)):
+            if path.rsplit("/", 1)[-1] in ck.RUN_TS_KEYS: continue
+            va, vb = fa.get(path, ABS), fb.get(path, ABS)
+            if ck.same_leaf(va, vb): continue
+            op = "add" if va is ABS else ("remove" if vb is ABS else "replace")
+            out.append({"file": f, "path": path, "op": op, "base": copy.deepcopy(va), "new": copy.deepcopy(vb)})
+    return out
+
+
+def p25_profile(entries, **bind):
+    prof = copy.deepcopy(P25_PROFILE)
+    prof["expected_patch"] = {"migration_id": P25_MIG, "binding": dict(P25_BIND, **bind), "entries": copy.deepcopy(entries)}
+    return prof
+
+
+class ExpectedPatchV25(unittest.TestCase):
+    def setUp(self):
+        self.p = p25_pair(); self.E = p25_entries(self.p)
+
+    def _run(self, entries=None, p=None, **bind):
+        return run_pair(p or self.p, profile=p25_profile(self.E if entries is None else entries, **bind))
+
+    # -- positive path
+    def test_oracle_covers_the_full_cascade(self):
+        paths = {(e["file"], e["path"]) for e in self.E}
+        for leaf in (f"{OPI}/status", f"{OPI}/value", f"{OPI}/stars", f"{OPI}/reason", f"{OPI}/reason_code", f"{OPI}/source[0]",
+                     f"{OPI}/current_period_end", f"{G}/growth/score", f"{G}/growth/valid_components", f"{G}/warnings[0]", f"{G}/warnings",
+                     f"{G}/limitations", f"{G}/limitations/operating_income_yoy",
+                     "/stages/data_sufficiency/sufficiency/operating_income_yoy/calculation_status"):
+            self.assertIn(("AAPL.json", leaf), paths)
+        self.assertTrue(any(f == "coverage.json" for f, _ in paths))
+
+    def test_exact_patch_passes_d2_d9_c3(self):
+        code, out = self._run()
+        self.assertEqual(code, 0, out)
+        for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
+        self.assertIn(f"expected_patch {P25_MIG}", out); self.assertIn("EXPECTED_PATCH", out)
+
+    def test_diff_classes_profile_accepts_expected_patch_class(self):
+        prof = p25_profile(self.E); prof["diff_classes"] = {"AAPL": ["EXPECTED_PATCH"], "*": []}
+        code, out = run_pair(self.p, profile=prof)
+        self.assertEqual(verdict(out, "D6"), "PASS", out)
+
+    # -- regression: no expected_patch -> v2.3 / v2.4 behaviour
+    def test_without_patch_the_change_fails_like_v23(self):
+        code, out = run_pair(self.p, profile=P25_PROFILE)
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(verdict(out, "C3"), "FAIL")
+        self.assertIn("D2 ticker JSON: no data change (same evaluation date)", out); self.assertIsNone(verdict(out, "D9"))
+        code, out = run_pair(self.p, profile=None)
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIsNone(verdict(out, "D9"))
+
+    def test_without_patch_clean_pair_output_has_no_v25_lines(self):
+        code, out = run_pair(p25_pair(change=False), profile=P25_PROFILE)
+        self.assertEqual(code, 0, out); self.assertNotIn("expected_patch", out); self.assertNotIn("D9", out)
+
+    def test_v24_allowance_untouched(self):
+        code, out = run_pair(mig_pair(), profile=mig_profile())
+        self.assertEqual(verdict(out, "D2"), "PASS", out); self.assertIsNone(verdict(out, "D9"))
+
+    # -- binding
+    def test_binding_mismatch_fails(self):
+        for k, v in (("evaluation_date", "2026-11-04"), ("base_github_run_id", "999"), ("new_github_run_id", "998"),
+                     ("base_github_sha", "c" * 40), ("new_github_sha", "d" * 40)):
+            with self.subTest(binding=k):
+                code, out = self._run(**{k: v})
+                self.assertEqual(code, 1, out); self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(verdict(out, "D9"), "FAIL")
+                self.assertIn("not bound to this BASE/NEW pair", out)
+
+    # -- value mismatches
+    def _mut(self, path, f="AAPL.json", **kv):
+        E = copy.deepcopy(self.E)
+        e = next(x for x in E if x["file"] == f and x["path"] == path); e.update(kv)
+        return E
+
+    def test_base_value_mismatch_fails(self):
+        code, out = self._run(self._mut(f"{OPI}/value", base=-0.5))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("BASE leaf differs", out)
+
+    def test_new_value_mismatch_fails(self):
+        code, out = self._run(self._mut(f"{G}/growth/valid_components", new=1))
+        self.assertEqual(code, 1); self.assertIn("NEW leaf differs", out); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_coverage_value_mismatch_fails_d9(self):
+        cov = next(e for e in self.E if e["file"] == "coverage.json" and e["op"] == "replace")
+        code, out = self._run(self._mut(cov["path"], f="coverage.json", new=cov["new"] + 5))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D9"), "FAIL")
+
+    def test_type_strict_values(self):
+        for path, field, val in ((f"{G}/growth/valid_components", "new", 2.0), (f"{G}/growth/score", "base", 3),
+                                 (f"{G}/growth/stars", "base", True), (f"{OPI}/reason_code", "new", None)):
+            with self.subTest(path=path, val=val):
+                code, out = self._run(self._mut(path, **{field: val}))
+                self.assertEqual(code, 1, out); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    # -- unregistered / unrealized changes
+    def test_unregistered_ticker_change_fails(self):
+        p = p25_pair(); p.res["NEW"]["AAPL"]["stages"]["growth"]["growth"]["components"]["revenue_yoy"]["value"] = 0.3
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIn("revenue_yoy/value", out)
+
+    def test_unregistered_other_ticker_change_fails(self):
+        p = p25_pair(); p.res["NEW"]["LLY"]["stages"]["growth"]["growth"]["components"]["fcf_yoy"]["value"] = 0.9
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_omitted_entry_fails(self):
+        for drop in (f"{OPI}/reason_code", f"{G}/warnings[0]", "/stages/data_sufficiency/sufficiency/operating_income_yoy/detail"):
+            with self.subTest(drop=drop):
+                code, out = self._run([e for e in self.E if e["path"] != drop])
+                self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_omitted_coverage_entry_fails_d9(self):
+        cov = [e for e in self.E if e["file"] == "coverage.json"]
+        code, out = self._run([e for e in self.E if e is not cov[0]])
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D9"), "FAIL"); self.assertIn("unregistered coverage", out)
+
+    def test_registered_change_that_did_not_happen_fails(self):
+        code, out = run_pair(p25_pair(change=False), profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(verdict(out, "D9"), "FAIL")
+
+    def test_partial_implementation_fails(self):
+        p = p25_pair(); p.res["NEW"]["AAPL"]["stages"]["growth"]["growth"]["warnings"] = ["revenue_operating_income_divergence"]
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    # -- ABSENT vs null
+    def test_absent_is_not_null(self):
+        code, out = self._run(self._mut(f"{OPI}/reason_code", base=None, op="replace"))
+        self.assertEqual(code, 1, out); self.assertIn("BASE leaf differs", out)
+        p = p25_pair(); p.res["NEW"]["AAPL"]["stages"]["growth"]["growth"]["components"]["operating_income_yoy"]["source"] = None
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_add_declared_but_leaf_already_in_base_fails(self):
+        p = p25_pair()
+        p.res["BASE"]["AAPL"]["stages"]["growth"]["growth"]["components"]["operating_income_yoy"]["reason_code"] = "NONPOSITIVE_PRIOR_BASE"
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(code, 1); self.assertIn("BASE leaf differs", out)
+
+    # -- governance / scope at runtime
+    def test_governed_ticker_cannot_be_patched(self):
+        E = copy.deepcopy(self.E) + [{"file": "GE.json", "path": f"{G}/growth/score", "op": "replace", "base": 1.0, "new": 2.0}]
+        p = p25_pair()
+        p.res["BASE"]["GE"]["stages"]["growth"]["growth"]["growth"]["score"] = 1.0
+        p.res["NEW"]["GE"]["stages"]["growth"]["growth"]["growth"]["score"] = 2.0
+        code, out = run_pair(p, profile=p25_profile(E))
+        self.assertEqual(code, 1); self.assertIn("governed ticker", out)
+
+    def test_unknown_ticker_entry_fails(self):
+        E = copy.deepcopy(self.E) + [{"file": "ZZZ.json", "path": f"{G}/growth/score", "op": "replace", "base": 1.0, "new": 2.0}]
+        code, out = self._run(E)
+        self.assertEqual(code, 1); self.assertIn("ZZZ: not an OK ticker", out)
+
+    # -- structural input errors (exit 3)
+    def _exit3(self, entries=None, mutate=None):
+        prof = p25_profile(self.E if entries is None else entries)
+        if mutate: mutate(prof)
+        code, out = run_pair(self.p, profile=prof)
+        self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out)
+        self.assertNotIn("Traceback", out); self.assertNotIn("could not complete", out)
+
+    def test_paths_outside_the_migration_allowlist_are_input_errors(self):
+        bad = [("AAPL.json", f"{G}/components/eps_yoy/status"), ("AAPL.json", f"{G}/components/fcf_yoy/value"),
+               ("AAPL.json", f"{G}/components/revenue_cagr_3y/status"), ("AAPL.json", OPI),
+               ("AAPL.json", f"{G}/components"), ("AAPL.json", f"{G}/growth"), ("AAPL.json", f"{OPI}/*"),
+               ("AAPL.json", f"{G}/components/*/status"), ("AAPL.json", "/stages/derived_metrics/derived/derived_metrics/fcf/value"),
+               ("AAPL.json", "/stages/data_sufficiency/sufficiency/operating_income_yoy/reason_code"),
+               ("AAPL.json", "/stages/data_sufficiency/sufficiency/eps_yoy/calculation_status"), ("AAPL.json", f"{G}/warnings[3]"),
+               ("AAPL.json", f"{OPI}/status/x"), ("AAPL.json", f"{OPI}/status "), ("AAPL.json", f"{OPI}/status\n"), ("AAPL.json", f"{OPI}/source[2]"),
+               ("AAPL.json", "/stages/growth/status"), ("summary.json", "/generated_at_utc"), ("aapl.json", f"{OPI}/status"),
+               ("AAPL", f"{OPI}/status"), ("../AAPL.json", f"{OPI}/status"),
+               ("coverage.json", "/growth/components/eps_yoy/by_status/OK"), ("coverage.json", "/normalized_metrics/revenue"),
+               ("coverage.json", "/growth/components/operating_income_yoy/by_reason_code/ZERO_PRIOR_BASE"),
+               ("coverage.json", "/growth/components/operating_income_yoy/by_status"), ("coverage.json", f"{OPI}/status"),
+               ("AAPL.json", "/growth/aggregate_status_counts/OK")]
+        for f, pa in bad:
+            with self.subTest(file=f, path=pa):
+                self._exit3([{"file": f, "path": pa, "op": "replace", "base": 1, "new": 2}])
+
+    def test_malformed_structure_is_input_error(self):
+        e0 = {"file": "AAPL.json", "path": f"{OPI}/stars", "op": "replace", "base": 1, "new": 2}
+        cases = {
+            "unknown migration": lambda pr: pr["expected_patch"].update(migration_id="OTHER"),
+            "migration list": lambda pr: pr["expected_patch"].update(migration_id=[]),
+            "migration dict": lambda pr: pr["expected_patch"].update(migration_id={}),
+            "extra key": lambda pr: pr["expected_patch"].update(extra=1),
+            "missing key": lambda pr: pr["expected_patch"].pop("entries"),
+            "not a dict": lambda pr: pr.update(expected_patch=[]),
+            "entries empty": lambda pr: pr["expected_patch"].update(entries=[]),
+            "entries dict": lambda pr: pr["expected_patch"].update(entries={}),
+            "binding missing key": lambda pr: pr["expected_patch"]["binding"].pop("new_github_sha"),
+            "binding short sha": lambda pr: pr["expected_patch"]["binding"].update(base_github_sha="abc"),
+            "binding bad date": lambda pr: pr["expected_patch"]["binding"].update(evaluation_date="2026-13-01"),
+            "binding run id": lambda pr: pr["expected_patch"]["binding"].update(new_github_run_id=5),
+            "combined with v2.4": lambda pr: pr.update(allowed_added_paths=mig_profile()["allowed_added_paths"]),
+            "entry extra key": lambda pr: pr["expected_patch"].update(entries=[dict(e0, extra=1)]),
+            "entry missing new": lambda pr: pr["expected_patch"].update(entries=[{k: v for k, v in e0.items() if k != "new"}]),
+            "entry not dict": lambda pr: pr["expected_patch"].update(entries=["x"]),
+            "file list": lambda pr: pr["expected_patch"].update(entries=[dict(e0, file=[])]),
+            "path dict": lambda pr: pr["expected_patch"].update(entries=[dict(e0, path={})]),
+            "bad op": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="move")]),
+            "op list": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op=[])]),
+            "add with base present": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="add")]),
+            "add with new absent": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="add", base=ABS, new=ABS)]),
+            "remove with new present": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="remove")]),
+            "remove with base absent": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="remove", base=ABS, new=ABS)]),
+            "replace with absent": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new=ABS)]),
+            "replace identical": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new=1)]),
+            "non-empty object value": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new={"status": "INVALID"})]),
+            "non-empty list value": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new=[1])]),
+            "empty container at scalar path": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new={})]),
+            "scalar at container path": lambda pr: pr["expected_patch"].update(entries=[dict(e0, path=f"{G}/warnings", op="replace", base=[], new="x")]),
+            "wrong container type": lambda pr: pr["expected_patch"].update(entries=[dict(e0, path=f"{G}/warnings", op="add", base=ABS, new={})]),
+            "non-finite": lambda pr: pr["expected_patch"].update(entries=[dict(e0, new=float("nan"))]),
+            "absent tag int": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="add", base={"$absent": 1})]),
+            "absent tag extra": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="add", base={"$absent": True, "x": 1})]),
+            "absent tag false": lambda pr: pr["expected_patch"].update(entries=[dict(e0, op="add", base={"$absent": False})]),
+            "duplicate": lambda pr: pr["expected_patch"].update(entries=[e0, dict(e0)]),
+            "nested parent/child (scalar parent)": lambda pr: pr["expected_patch"].update(entries=[
+                dict(e0, path=f"{G}/limitations", op="replace", base={}, new={}),
+                {"file": "AAPL.json", "path": f"{G}/limitations/operating_income_yoy", "op": "add", "base": ABS, "new": "t"}]),
+            "container add with child add": lambda pr: pr["expected_patch"].update(entries=[
+                {"file": "AAPL.json", "path": f"{G}/warnings", "op": "add", "base": ABS, "new": []},
+                {"file": "AAPL.json", "path": f"{G}/warnings[0]", "op": "add", "base": ABS, "new": "w"}]),
+            "container replace with child": lambda pr: pr["expected_patch"].update(entries=[
+                {"file": "AAPL.json", "path": f"{G}/limitations", "op": "remove", "base": {}, "new": ABS},
+                {"file": "AAPL.json", "path": f"{G}/limitations/operating_income_yoy", "op": "remove", "base": "t", "new": ABS}]),
+        }
+        for name, mut in cases.items():
+            with self.subTest(case=name):
+                self._exit3(mutate=mut)
+
+    def test_emptiness_pairs_are_the_only_allowed_overlap(self):
+        names = {(e["path"], e["op"]) for e in self.E if e["file"] == "AAPL.json"}
+        self.assertIn((f"{G}/warnings", "add"), names); self.assertIn((f"{G}/warnings[0]", "remove"), names)
+        self.assertIn((f"{G}/limitations", "remove"), names); self.assertIn((f"{G}/limitations/operating_income_yoy", "add"), names)
+        self.assertEqual(ck.patch_problems({"migration_id": P25_MIG, "binding": P25_BIND, "entries": self.E}), [])
+
+    def test_random_garbage_never_crashes(self):
+        import random
+        rnd = random.Random(24)
+        pool = [None, True, 0, 1.5, "x", [], {}, [1], {"a": 1}, ABS, {"$absent": "yes"}, float("inf"), "AAPL.json", "add", P25_MIG]
+        for i in range(300):
+            entry = {k: rnd.choice(pool) for k in ("file", "path", "op", "base", "new")}
+            pt = {"migration_id": rnd.choice(pool + [P25_MIG] * 3), "binding": rnd.choice([P25_BIND, pool[i % len(pool)]]),
+                  "entries": rnd.choice([[entry], entry, [], [entry, entry]])}
+            with self.subTest(i=i):
+                probs = ck.patch_problems(pt)          # never raises
+                self.assertTrue(probs, pt)
+
+    # -- unflatten (C3 support)
+    def test_unflatten_round_trips_and_rejects_inconsistency(self):
+        for doc in (self.p.res["BASE"]["AAPL"], self.p.res["NEW"]["GE"], {"a": [], "b": {}, "c": [{"d": [1, {"e": None}]}]}):
+            self.assertEqual(ck.unflatten(ck.flat(doc)), doc)
+        for bad in ({"/a[1]": 1}, {"/a": {}, "/a/b": 1}, {"/a": 1, "/a/b": 2}, {"/a[0]": 1, "/a/b": 2}, {"": 1}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ck.unflatten(bad)
+
+    def test_c3_uses_patched_base_only(self):
+        p = p25_pair()
+        p.res["NEW"]["LLY"]["stages"]["data_sufficiency"]["sufficiency"]["fcf_yoy"]["calculation_status"] = "INVALID"
+        code, out = run_pair(p, profile=p25_profile(self.E))
+        self.assertEqual(verdict(out, "C3"), "FAIL"); self.assertEqual(verdict(out, "D2"), "FAIL")
+
+    def test_output_never_prints_patch_values(self):
+        code, out = self._run(self._mut(f"{OPI}/reason", new="SECRET-VALUE-123"))
+        self.assertNotIn("SECRET-VALUE-123", out)
 
 
 if __name__ == "__main__":

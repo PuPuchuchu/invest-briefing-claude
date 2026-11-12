@@ -1,7 +1,10 @@
-"""STEP 23 Checker v2.4 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.5 (read-only): DEC055 gate materialization + same-date batch pair comparison.
 
 v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
 newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
+v2.5 (STEP 24.4 P0): optional profile field "expected_patch" lets D2/C3 (and a new D9 for coverage.json) accept an
+EXACT, pair-bound list of leaf changes {file, path, op, base, new} whose paths come from a per-migration_id leaf
+allowlist; BASE and NEW must both equal the registered values. Without that field the output is exactly v2.4's.
 
 usage:
   python3 -I scripts/step23_checker_v2_3.py --new NEW --base BASE --expect-date YYYY-MM-DD --profile (FILE.json|none)
@@ -35,7 +38,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.4"
+VERSION = "checker_v2.5"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -86,6 +89,38 @@ ALLOWANCE_PATH_RE = {"GROWTH_REASON_CODES": re.compile(
 ALLOWANCE_KEYS = {"migration_id", "binding", "value_set", "paths"}
 ALLOWANCE_BINDING_KEYS = {"evaluation_date", "base_github_run_id", "base_github_sha", "new_github_run_id", "new_github_sha"}
 ALLOWED_ADDITION = "ALLOWED_ADDITION"
+# ---------------------------------------------------------------- v2.5 expected patch (D2 / C3 / D9)
+# Leaf grammar = this checker's flat() paths: "/key" for object members, "[i]" for list items; a leaf is a scalar or an
+# EMPTY container. Patch values are therefore scalars, or [] / {} at the few container paths below; a non-empty object
+# or list can never be a patch value (no parent replacement). ABSENT is a tagged object, never JSON null.
+ABSENT_TAG = {"$absent": True}
+PATCH_KEYS = {"migration_id", "binding", "entries"}
+PATCH_ENTRY_KEYS = {"file", "path", "op", "base", "new"}
+PATCH_OPS = ("add", "remove", "replace")
+COVERAGE_FILE = "coverage.json"
+PATCH_TICKER_FILE_RE = re.compile(r"^([A-Z0-9][A-Z0-9.\-]{0,9})\.json$")
+_SY = "(revenue_yoy|operating_income_yoy)"          # the two metrics calculate_standard_yoy() serves
+PATCH_MIGRATIONS = {
+    # STEP 24.4 P1: calculate_standard_yoy() previous < 0 -> INVALID / NONPOSITIVE_PRIOR_BASE (and its cascade)
+    "STEP24_4_NEGATIVE_PRIOR_BASE": {
+        "ticker": re.compile(
+            r"^/stages/growth/growth/components/" + _SY + r"/(status|value|stars|reason|reason_code|current_period_end"
+            r"|previous_period_end|source\[[01]\])$"
+            r"|^/stages/growth/growth/growth/(status|score|stars|available_components|valid_components|coverage)$"
+            r"|^/stages/growth/growth/warnings(\[[0-2]\])?$"
+            r"|^/stages/growth/growth/limitations(/" + _SY + r")?$"
+            r"|^/stages/data_sufficiency/sufficiency/" + _SY + r"/(calculation_status|detail)$"),
+        "coverage": re.compile(
+            r"^/growth/components/" + _SY + r"/by_status/(OK|INVALID)$"
+            r"|^/growth/components/" + _SY + r"/by_reason_code(/NONPOSITIVE_PRIOR_BASE)?$"
+            r"|^/growth/aggregate_status_counts/(OK|MISSING)$"
+            r"|^/data_sufficiency/" + _SY + r"/by_calculation_status/(OK|INVALID)$"
+            r"|^/data_sufficiency/" + _SY + r"/by_reason_code(/NO_REASON_CODE)?$"),
+    },
+}
+# container paths (flat leaf only while empty): the only places [] / {} may appear as a patch value
+PATCH_CONTAINER_LEAF = {"warnings": [], "by_reason_code": {}, "limitations": {}}
+EXPECTED_PATCH = "EXPECTED_PATCH"
 MAX_MEMBER = 512 * 1024 * 1024
 
 class InputError(Exception):
@@ -250,6 +285,58 @@ def get_path(o, path):
             if not isinstance(o, list) or i >= len(o): return None
             o = o[i]
     return o
+_ABS = object()
+
+
+def flat_get(fl, path):
+    """Leaf value at a flat() path, or ABSENT_TAG when that leaf does not exist."""
+    return fl[path] if path in fl else dict(ABSENT_TAG)
+
+
+def unflatten(fl):
+    """Inverse of flat(). Raises ValueError when the leaves do not form one consistent JSON document
+    (e.g. a list with a missing index, or a path that is both a leaf and a container)."""
+    root = _ABS
+    def tokens(path): return [(k, int(i) if i else None) for k, i in re.findall(r"/([^/\[]+)|\[(\d+)\]", path)]
+    def ensure(container, tok, nxt):
+        k, i = tok
+        if k:
+            if not isinstance(container, dict): raise ValueError("object/list conflict")
+            if k not in container: container[k] = _ABS if nxt is None else ({} if nxt[0] else [])
+            return container[k]
+        if not isinstance(container, list): raise ValueError("object/list conflict")
+        while len(container) <= i: container.append(_ABS)
+        if container[i] is _ABS and nxt is not None: container[i] = {} if nxt[0] else []
+        return container[i]
+    for path in sorted(fl):
+        toks = tokens(path)
+        if not toks: raise ValueError("root leaf")
+        if root is _ABS: root = {} if toks[0][0] else []
+        cur = root
+        for j, tok in enumerate(toks[:-1]):
+            cur = ensure(cur, tok, toks[j + 1])
+            if not isinstance(cur, (dict, list)): raise ValueError("leaf/container conflict")
+        k, i = toks[-1]
+        v = copy.deepcopy(fl[path])
+        if k:
+            if not isinstance(cur, dict) or (k in cur and cur[k] is not _ABS): raise ValueError("leaf/container conflict")
+            cur[k] = v
+        else:
+            if not isinstance(cur, list): raise ValueError("object/list conflict")
+            while len(cur) <= i: cur.append(_ABS)
+            if cur[i] is not _ABS: raise ValueError("leaf/container conflict")
+            cur[i] = v
+    def check(o):
+        if o is _ABS: raise ValueError("list with a missing index")
+        if isinstance(o, dict): [check(v) for v in o.values()]
+        elif isinstance(o, list): [check(v) for v in o]
+    check(root)
+    rt = flat(root)
+    if set(rt) != set(fl) or any(not same_leaf(rt[k], fl[k]) for k in fl):
+        raise ValueError("leaves do not round-trip (a path is both a leaf and a container)")
+    return root
+
+
 def parent_and_key(path):
     m = re.match(r"^(.*)/([^/\[]+)$", path)
     return (m.group(1), m.group(2)) if m else (None, None)
@@ -1067,18 +1154,37 @@ class Checker:
             v = _R(); v.summary = {"records": [r for r in run.summary["records"] if r.get("ticker") not in gov_t]}; v.results = run.results
             return recompute_stage_coverage(v)
         allow, _w, accepted, _p = self.allowance()
+        pt, _pe, realized, _pp = self.patch()
         base_view = self.base
-        if accepted:
+        if pt and realized:
+            class _P: pass
+            base_view = _P(); base_view.summary = self.base.summary
+            try:
+                base_view.results = {t: self.patched_base(t) for t in self.base.results}
+            except ValueError:
+                base_view = None
+        if base_view is None:
+            self.add("CMP", "C3 stage coverage identical BASE vs NEW once governed tickers are excluded", "FAIL",
+                     f"expected_patch {pt['migration_id']} leaves an inconsistent document when applied to BASE")
+        elif accepted:
             class _B: pass
             base_view = _B(); base_view.summary = self.base.summary
             base_view.results = {t: copy.deepcopy(r) for t, r in self.base.results.items()}
             for t, p in accepted:
                 parent, key = parent_and_key(p)
                 get_path(base_view.results[t], parent)[key] = get_path(self.new.results[t], p)
-        same = without(self.new) == without(base_view)
-        self.add("CMP", "C3 stage coverage identical BASE vs NEW once governed tickers are excluded", "PASS" if same else "FAIL",
-                 f"governed excluded={sorted(gov_t)}" + (f"; BASE compared with the {len(accepted)} accepted allowance addition(s) of "
-                                                         f"{allow['migration_id']} applied (no other change tolerated)" if accepted else ""))
+        if base_view is not None:
+            same = without(self.new) == without(base_view)
+            note = ""
+            if accepted:
+                note = (f"; BASE compared with the {len(accepted)} accepted allowance addition(s) of "
+                        f"{allow['migration_id']} applied (no other change tolerated)")
+            elif pt:
+                n_t = sum(1 for f, _ in realized if f != COVERAGE_FILE)
+                note = (f"; BASE compared with the {n_t} realized ticker leaf change(s) of expected_patch "
+                        f"{pt['migration_id']} applied (no other change tolerated)")
+            self.add("CMP", "C3 stage coverage identical BASE vs NEW once governed tickers are excluded", "PASS" if same else "FAIL",
+                     f"governed excluded={sorted(gov_t)}" + note)
         prof = self.profile or {}
         p = []
         tot = lambda run, m: sum(((recompute_stage_coverage(run)["derived_metrics"].get(m) or {}).get("by_status") or {}).values())
@@ -1122,6 +1228,63 @@ class Checker:
                         accepted.add((t, p))
         self._allow_cache = (allow, want, accepted, problems)
         return self._allow_cache
+
+    # ---------- v2.5 expected patch (shared by C3, D2 and D9)
+    def patch(self):
+        """(patch, entries, realized, problems). Cached. realized = entries whose BASE leaf equals `base` AND whose NEW
+        leaf equals `new` (type-strict; ABSENT = leaf does not exist). A ticker entry also needs the ticker in both runs
+        and outside governance (no withheld metric in either run). Every unrealized entry is a problem (FAIL)."""
+        if hasattr(self, "_patch_cache"): return self._patch_cache
+        pt = (self.profile or {}).get("expected_patch")
+        entries, realized, problems = [], set(), []
+        if pt:
+            b, at = pt["binding"], self.profile["applies_to"]
+            actual = {"evaluation_date": self.date}
+            for run, side in ((self.base, "base"), (self.new, "new")):
+                prov = run.repro.get("provenance") or {}
+                actual[f"{side}_github_run_id"] = str(prov.get("github_run_id")); actual[f"{side}_github_sha"] = str(prov.get("github_sha"))
+            declared = {"evaluation_date": at["evaluation_date"], "base_github_run_id": at["base"]["github_run_id"], "base_github_sha": at["base"]["github_sha"],
+                        "new_github_run_id": at["new"]["github_run_id"], "new_github_sha": at["new"]["github_sha"]}
+            unbound = sorted(k for k in ALLOWANCE_BINDING_KEYS if b[k] != actual[k] or b[k] != declared[k])
+            if unbound: problems.append(f"expected_patch {pt['migration_id']} not bound to this BASE/NEW pair ({', '.join(unbound)})")
+            else:
+                entries = pt["entries"]
+                flats = {}
+                def fl(run, f):
+                    key = (run.label, f)
+                    if key not in flats:
+                        doc = run.coverage if f == COVERAGE_FILE else run.results.get(f[:-5])
+                        flats[key] = None if doc is None else flat(doc)
+                    return flats[key]
+                for e in entries:
+                    f, pa = e["file"], e["path"]
+                    if f != COVERAGE_FILE:
+                        t = f[:-5]
+                        if t not in self.base.results or t not in self.new.results:
+                            problems.append(f"{t}: not an OK ticker in both runs"); continue
+                        if gate(self.base.results[t]).get("withheld") or gate(self.new.results[t]).get("withheld"):
+                            problems.append(f"{t}: governed ticker (withheld metrics) cannot carry expected_patch entries"); continue
+                    fb, fn = fl(self.base, f), fl(self.new, f)
+                    where = f"{f[:-5] if f != COVERAGE_FILE else f}{pa}"
+                    if fb is None or fn is None: problems.append(f"{where}: document missing"); continue
+                    ok_b, ok_n = same_leaf(flat_get(fb, pa), e["base"]), same_leaf(flat_get(fn, pa), e["new"])
+                    if not ok_b: problems.append(f"{where}: BASE leaf differs from expected_patch base")
+                    if not ok_n: problems.append(f"{where}: NEW leaf differs from expected_patch new")
+                    if ok_b and ok_n: realized.add((f, pa))
+        self._patch_cache = (pt, entries, realized, problems)
+        return self._patch_cache
+
+    def patched_base(self, t):
+        """BASE ticker document with the realized expected_patch leaves applied (C3)."""
+        _pt, entries, realized, _p = self.patch()
+        f = f"{t}.json"
+        mine = [e for e in entries if e["file"] == f and (f, e["path"]) in realized]
+        if not mine: return self.base.results[t]
+        fl = flat(self.base.results[t])
+        for e in mine:
+            if is_absent(e["new"]): fl.pop(e["path"], None)
+            else: fl[e["path"]] = copy.deepcopy(e["new"])
+        return unflatten(fl)
 
     # ---------- D: run-to-run diff
     def classify(self, t, a, b, governed: bool):
@@ -1169,6 +1332,8 @@ class Checker:
         # v2.4 migration allowance: exact, pair-bound, additions only (absent in BASE, present in NEW), registered values only
         allow, want, accepted, allow_problems = self.allowance()
         allow_problems = list(allow_problems); found = set()
+        pt, p_entries, realized, patch_problems_ = self.patch()
+        p_found = set()
         for t in sorted(set(nt) & set(bt)):
             governed = bool(gate(new.results[t]).get("withheld") or gate(base.results[t]).get("withheld"))
             c = self.classify(t, base.results[t], new.results[t], governed)
@@ -1176,6 +1341,13 @@ class Checker:
                 keep = []
                 for p in c.get("DATA_CHANGE", []):
                     if (t, p) in accepted: c.setdefault(ALLOWED_ADDITION, []).append(p); found.add((t, p))
+                    else: keep.append(p)
+                if keep: c["DATA_CHANGE"] = keep
+                else: c.pop("DATA_CHANGE", None)
+            if realized:
+                keep = []
+                for p in c.get("DATA_CHANGE", []):
+                    if (f"{t}.json", p) in realized: c.setdefault(EXPECTED_PATCH, []).append(p); p_found.add((f"{t}.json", p))
                     else: keep.append(p)
                 if keep: c["DATA_CHANGE"] = keep
                 else: c.pop("DATA_CHANGE", None)
@@ -1191,7 +1363,30 @@ class Checker:
         if want:
             missing = sorted(f"{t}{p}" for t, p in want - found)
             if missing: allow_problems.append(f"{len(missing)} expected addition(s) not found exactly: {missing[:12]}")
-        if allow:
+        if pt:
+            tick = [(f, p) for f, p in ((e["file"], e["path"]) for e in p_entries) if f != COVERAGE_FILE]
+            tprob = [x for x in patch_problems_ if not x.startswith(COVERAGE_FILE)]
+            unseen = sorted(f"{f[:-5]}{p}" for f, p in set(tick) & realized - p_found)
+            if unseen: tprob.append(f"{len(unseen)} registered change(s) not observed as a ticker diff: {unseen[:12]}")
+            label = f"D2 ticker JSON: no data change except expected_patch {pt['migration_id']} (same evaluation date)"
+            detail = (f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}; expected leaf changes {len(p_found)}/{len(tick)}"
+                      + (f"; {'; '.join(tprob[:8])}" if tprob else ""))
+            self.add("CMP", label, "PASS" if not data_changes and not tprob and len(p_found) == len(tick) else "FAIL", detail)
+            # D9 coverage.json: every leaf difference (run timestamps aside) is a realized coverage entry
+            cb, cn = flat(base.coverage), flat(new.coverage)
+            diff_cov = {p for p in set(cb) | set(cn)
+                        if not same_leaf(flat_get(cb, p), flat_get(cn, p)) and p.rsplit("/", 1)[-1] not in RUN_TS_KEYS}
+            reg_cov = {p for f, p in ((e["file"], e["path"]) for e in p_entries) if f == COVERAGE_FILE}
+            cprob = [x for x in patch_problems_ if x.startswith(COVERAGE_FILE) or x.startswith("expected_patch")]
+            unreg = sorted(diff_cov - {p for f, p in realized if f == COVERAGE_FILE})
+            missing_c = sorted(reg_cov - diff_cov)
+            if missing_c: cprob.append(f"{len(missing_c)} registered coverage change(s) not observed: {missing_c[:12]}")
+            self.add("CMP", f"D9 coverage.json: no change except expected_patch {pt['migration_id']}",
+                     "PASS" if not unreg and not cprob else "FAIL",
+                     f"{len(unreg)} unregistered coverage paths: {unreg[:12]}; expected coverage changes "
+                     f"{len(reg_cov & diff_cov & {p for f, p in realized if f == COVERAGE_FILE})}/{len(reg_cov)}"
+                     + (f"; {'; '.join(cprob[:8])}" if cprob else ""))
+        elif allow:
             label = f"D2 ticker JSON: no data change except allowance {allow['migration_id']} (same evaluation date)"
             detail = (f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}; allowed additions {len(found)}/{len(want)}"
                       + (f"; {'; '.join(allow_problems)}" if allow_problems else ""))
@@ -1346,7 +1541,91 @@ def load_profile(arg):
     if "allowed_added_paths" in prof:
         problems = allowance_problems(prof["allowed_added_paths"])
         if problems: raise InputError(f"profile {arg}: allowed_added_paths invalid ({problems[0]})")
+    if "expected_patch" in prof:
+        if "allowed_added_paths" in prof:
+            raise InputError(f"profile {arg}: allowed_added_paths and expected_patch cannot be combined (one migration per profile)")
+        problems = patch_problems(prof["expected_patch"])
+        if problems: raise InputError(f"profile {arg}: expected_patch invalid ({problems[0]})")
     return prof
+
+
+def binding_problems(b) -> list[str]:
+    if not isinstance(b, dict) or set(b) != ALLOWANCE_BINDING_KEYS: return [f"binding keys must be exactly {sorted(ALLOWANCE_BINDING_KEYS)}"]
+    p = []
+    if not is_iso_date(b["evaluation_date"]): p.append("binding.evaluation_date must be YYYY-MM-DD")
+    for side in ("base", "new"):
+        rid, sha = b[f"{side}_github_run_id"], b[f"{side}_github_sha"]
+        if not (isinstance(rid, str) and rid.isdigit()): p.append(f"binding.{side}_github_run_id must be a digit string")
+        if not (isinstance(sha, str) and SHA40.fullmatch(sha)): p.append(f"binding.{side}_github_sha must be a full 40-hex SHA")
+    return p
+
+
+def is_absent(v) -> bool:
+    return isinstance(v, dict) and len(v) == 1 and v.get("$absent") is True and type(v["$absent"]) is bool
+
+
+def same_leaf(a, b) -> bool:
+    """Type-strict leaf equality (True != 1, 1 != 1.0); ABSENT only equals ABSENT."""
+    if is_absent(a) or is_absent(b): return is_absent(a) and is_absent(b)
+    return type(a) is type(b) and a == b
+
+
+def _patch_value_problem(v, path) -> str | None:
+    if is_absent(v): return None
+    last = None if path.endswith("]") else path.rsplit("/", 1)[-1]      # "[i]" = list item, never a container path
+    if isinstance(v, (dict, list)):
+        if last in PATCH_CONTAINER_LEAF and v == PATCH_CONTAINER_LEAF[last] and type(v) is type(PATCH_CONTAINER_LEAF[last]):
+            return None
+        return "value must be a scalar (only an empty container at a container path; no parent replacement)"
+    if last in PATCH_CONTAINER_LEAF:
+        return "a container path takes only its empty container or ABSENT"
+    if isinstance(v, float) and not math.isfinite(v): return "non-finite number"
+    if v is None or isinstance(v, (str, bool, int, float)): return None
+    return "unsupported value type"
+
+
+def _is_child(parent, child) -> bool:
+    return child.startswith(parent) and len(child) > len(parent) and child[len(parent)] in "/["
+
+
+def patch_problems(pt) -> list[str]:
+    """Structural validation of a v2.5 expected_patch. Any deviation is an input error (fail closed)."""
+    if not isinstance(pt, dict) or set(pt) != PATCH_KEYS: return [f"keys must be exactly {sorted(PATCH_KEYS)}"]
+    mid = pt["migration_id"]
+    if not isinstance(mid, str) or mid not in PATCH_MIGRATIONS:          # type first: [] / {} are unhashable
+        return [f"migration_id must be one of the registered migrations {sorted(PATCH_MIGRATIONS)}"]
+    p = binding_problems(pt["binding"])
+    entries = pt["entries"]
+    if not isinstance(entries, list) or not entries: return p + ["entries must be a non-empty list"]
+    grammar, seen, by_file = PATCH_MIGRATIONS[mid], set(), {}
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict) or set(e) != PATCH_ENTRY_KEYS: p.append(f"entry {i}: keys must be exactly {sorted(PATCH_ENTRY_KEYS)}"); continue
+        f, pa, op, b, n = e["file"], e["path"], e["op"], e["base"], e["new"]
+        if not isinstance(f, str) or not (f == COVERAGE_FILE or PATCH_TICKER_FILE_RE.fullmatch(f)):
+            p.append(f"entry {i}: file must be coverage.json or <TICKER>.json"); continue
+        kind = "coverage" if f == COVERAGE_FILE else "ticker"
+        if not isinstance(pa, str) or not grammar[kind].fullmatch(pa):
+            p.append(f"entry {i}: {f}{pa!r} is not an allowed leaf of {mid}"); continue
+        if not isinstance(op, str) or op not in PATCH_OPS: p.append(f"entry {i}: op must be one of {list(PATCH_OPS)}"); continue
+        bad = _patch_value_problem(b, pa) or _patch_value_problem(n, pa)
+        if bad: p.append(f"entry {i}: {f}{pa}: {bad}"); continue
+        if op == "add" and not (is_absent(b) and not is_absent(n)): p.append(f"entry {i}: add needs base ABSENT and new present"); continue
+        if op == "remove" and not (not is_absent(b) and is_absent(n)): p.append(f"entry {i}: remove needs base present and new ABSENT"); continue
+        if op == "replace" and (is_absent(b) or is_absent(n) or same_leaf(b, n)):
+            p.append(f"entry {i}: replace needs base and new present and different"); continue
+        if (f, pa) in seen: p.append(f"entry {i}: duplicate {f}{pa}"); continue
+        seen.add((f, pa)); by_file.setdefault(f, []).append(e)
+    # parent/child overlap: forbidden, except the flat() emptiness pair -- a container leaf [] / {} exists exactly when the
+    # container has no children, so "emptied" = container add + every child remove, "filled" = container remove + every child add
+    for f, es in by_file.items():
+        for c in es:
+            kids = [k for k in es if _is_child(c["path"], k["path"])]
+            if not kids: continue
+            is_container = c["path"].rsplit("/", 1)[-1] in PATCH_CONTAINER_LEAF
+            ok = is_container and ((c["op"] == "add" and all(k["op"] == "remove" for k in kids))
+                                   or (c["op"] == "remove" and all(k["op"] == "add" for k in kids)))
+            if not ok: p.append(f"{f}: overlapping parent/child entries under {c['path']}")
+    return p
 
 
 def allowance_problems(al) -> list[str]:
@@ -1354,14 +1633,7 @@ def allowance_problems(al) -> list[str]:
     if not isinstance(al, dict) or set(al) != ALLOWANCE_KEYS: return [f"keys must be exactly {sorted(ALLOWANCE_KEYS)}"]
     p = []
     if not isinstance(al["migration_id"], str) or not al["migration_id"].strip(): p.append("migration_id must be a non-empty string")
-    b = al["binding"]
-    if not isinstance(b, dict) or set(b) != ALLOWANCE_BINDING_KEYS: p.append(f"binding keys must be exactly {sorted(ALLOWANCE_BINDING_KEYS)}")
-    else:
-        if not is_iso_date(b["evaluation_date"]): p.append("binding.evaluation_date must be YYYY-MM-DD")
-        for side in ("base", "new"):
-            rid, sha = b[f"{side}_github_run_id"], b[f"{side}_github_sha"]
-            if not (isinstance(rid, str) and rid.isdigit()): p.append(f"binding.{side}_github_run_id must be a digit string")
-            if not (isinstance(sha, str) and SHA40.fullmatch(sha)): p.append(f"binding.{side}_github_sha must be a full 40-hex SHA")
+    p += binding_problems(al["binding"])
     value_set = al["value_set"]
     if not isinstance(value_set, str) or value_set not in ALLOWANCE_VALUE_SETS:   # type first: [] / {} are unhashable
         p.append(f"value_set must be one of the registered string value sets {sorted(ALLOWANCE_VALUE_SETS)}")
