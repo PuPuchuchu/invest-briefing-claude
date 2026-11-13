@@ -8,7 +8,9 @@ Scope guarantees tested here:
     (golden file generated from that commit);
   * data_sufficiency still never puts a reason_code on INVALID;
   * the Checker v2.4 mirror of the code set equals production.
-No finite-input guard: that is a separate decision.
+A-2 (explicit revision): a numeric but non-finite input is NON_FINITE_INPUT (checked right after NON_NUMERIC_INPUT),
+a non-finite computed result is NON_FINITE_RESULT (8th registered code), and the CAGR period must be finite. Exactly
+K_A2 golden cases change expectation; 17 of them are P1 cases that are re-coded.
 STEP 24.4 P1 (explicit revision): calculate_standard_yoy() with a negative previous value is now INVALID /
 NONPOSITIVE_PRIOR_BASE. This adds a 10th call site, and exactly K_NEGATIVE_PRIOR golden cases change
 expectation; every other golden case must still match. The golden file itself is not modified.
@@ -56,7 +58,7 @@ BRANCHES = [
 def test_registered_code_set_is_closed_and_disjoint_from_sufficiency_codes():
     assert GROWTH_REASON_CODES == frozenset({
         "NON_NUMERIC_INPUT", "NON_FINITE_INPUT", "NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT",
-        "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER"})
+        "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER", "NON_FINITE_RESULT"})   # A-2: 8 codes
     from src.fundamentals.data_sufficiency import REASON_CODES
     assert not (GROWTH_REASON_CODES & set(REASON_CODES))
 
@@ -75,11 +77,12 @@ def test_years_parameter_branch():
 
 
 def test_every_invalid_call_site_passes_a_registered_literal_code():
-    """10 call sites (9 from A-1 + the STEP 24.4 P1 negative-prior branch); the third argument is a string literal
-    in the registered set (never computed)."""
+    """18 call sites: 9 from A-1, 1 STEP 24.4 P1 negative-prior branch, and 8 from A-2 (3 NON_FINITE_INPUT,
+    3 NON_FINITE_RESULT result guards, 1 CAGR period check, 1 rating-guard propagation in calculate_growth).
+    The third argument is a string literal in the registered set (never computed)."""
     tree = ast.parse(GROWTH_PY.read_text(encoding="utf-8"))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_build_invalid_metric"]
-    assert len(calls) == 10
+    assert len(calls) == 18
     for c in calls:
         assert len(c.args) == 3 and not c.keywords
         code = c.args[2]
@@ -118,10 +121,21 @@ NEGATIVE_INPUTS = {"-1", "-2.5", "-inf"}
 NUMERIC_INPUTS = {"0", "0.0", "-0.0", "1", "-1", "2.5", "-2.5", "1e12", "nan", "inf", "-inf"}
 NEG_PRIOR_REASON = "Previous value must be greater than zero for conventional YoY calculation."
 
+# A-2: golden cases whose expectation changes, fixed before implementation (design v3 §5): both inputs numeric and at
+# least one of them nan / inf / -inf -> 11*11 - 8*8 = 57 per function, 3 functions -> 171. All other cases keep their
+# previous expectation (597). 17 of the 33 P1 cases are among the 171 (re-coded), so 16 keep the P1 expectation.
+K_A2 = 171
+K_P1_REMAINING = 16
+NON_FINITE_INPUTS = {"nan", "inf", "-inf"}
+A2_REASON = {"calculate_positive_yoy": "Current and previous values must be finite numbers.",
+             "calculate_standard_yoy": "Current and previous values must be finite numbers.",
+             "calculate_cagr_3y": "Start and end values must be finite numbers."}
+
 
 def test_production_parity_with_main_64e0f1d():
     """status / value / reason / exception identical to the pre-A-1 production (golden); only reason_code is added.
-    STEP 24.4 P1: exactly K_NEGATIVE_PRIOR standard-YoY negative-previous cases take the new expectation."""
+    STEP 24.4 P1: exactly K_NEGATIVE_PRIOR standard-YoY negative-previous cases take the new expectation.
+    A-2: exactly K_A2 numeric + non-finite cases take NON_FINITE_INPUT; it is checked before the P1 branch."""
     gold = json.loads(GOLDEN.read_text(encoding="utf-8"))
     assert gold["growth_py_sha256"] == "01e05f6268c28966361eecf37334b6b7f82ac15b1403a456099fd047b8d18b15"
     inputs = {"0": 0, "0.0": 0.0, "-0.0": -0.0, "1": 1, "-1": -1, "2.5": 2.5, "-2.5": -2.5, "1e12": 10**12,
@@ -129,17 +143,28 @@ def test_production_parity_with_main_64e0f1d():
               "True": True, "False": False, "list": []}
     assert sorted(inputs) == sorted(gold["inputs"])
     assert len(gold["cases"]) == 3 * 16 * 16
-    substituted = 0
+    substituted = a2 = p1_recoded = 0
     for case in gold["cases"]:
         fn = getattr(growth, case["function"])
         exp = case["result"]
-        if (case["function"] == "calculate_standard_yoy" and case["arg2"] in NEGATIVE_INPUTS
-                and case["arg1"] in NUMERIC_INPUTS):
+        is_p1 = (case["function"] == "calculate_standard_yoy" and case["arg2"] in NEGATIVE_INPUTS
+                 and case["arg1"] in NUMERIC_INPUTS)
+        is_a2 = (case["arg1"] in NUMERIC_INPUTS and case["arg2"] in NUMERIC_INPUTS
+                 and (case["arg1"] in NON_FINITE_INPUTS or case["arg2"] in NON_FINITE_INPUTS))
+        if is_p1:
             assert exp.get("status") == "OK", case          # the golden (old) result being replaced
+            substituted += 1
+        if is_a2:
+            exp = {"status": "INVALID", "value": None, "reason": A2_REASON[case["function"]],
+                   "keys": ["metric", "reason", "status", "value"]}
+            r = fn("m", inputs[case["arg1"]], inputs[case["arg2"]])
+            assert r["reason_code"] == "NON_FINITE_INPUT", case
+            a2 += 1
+            p1_recoded += is_p1
+        elif is_p1:
             exp = {"status": "INVALID", "value": None, "reason": NEG_PRIOR_REASON, "keys": ["metric", "reason", "status", "value"]}
             r = fn("m", inputs[case["arg1"]], inputs[case["arg2"]])
             assert r["reason_code"] == "NONPOSITIVE_PRIOR_BASE", case
-            substituted += 1
         try:
             r = fn("m", inputs[case["arg1"]], inputs[case["arg2"]])
         except Exception as e:  # noqa: BLE001 - parity includes the exception type
@@ -155,12 +180,17 @@ def test_production_parity_with_main_64e0f1d():
         if r["status"] == "INVALID":
             assert r["reason_code"] in GROWTH_REASON_CODES, case
     assert substituted == K_NEGATIVE_PRIOR
+    assert a2 == K_A2
+    assert p1_recoded == K_NEGATIVE_PRIOR - K_P1_REMAINING == 17
+    assert len(gold["cases"]) - a2 - (substituted - p1_recoded) == 768 - 171 - 16   # 581 cases exactly as golden
 
 
 def test_finite_guard_not_enabled():
-    """A-2 is not approved: NaN / Infinity still behave exactly as before (OK path)."""
-    assert calculate_positive_yoy("m", float("nan"), 1.0)["status"] == "OK"
-    assert calculate_positive_yoy("m", float("inf"), 1.0)["status"] == "OK"
+    """Explicitly revised for A-2 (name kept for traceability). Until A-2 this asserted that NaN / Infinity still took
+    the OK path (NaN was then rated 5 stars). The approved policy: NON_FINITE_INPUT."""
+    for v in (float("nan"), float("inf"), float("-inf")):
+        r = calculate_positive_yoy("m", v, 1.0)
+        assert (r["status"], r["reason_code"], r["value"]) == ("INVALID", "NON_FINITE_INPUT", None)
 
 
 def test_negative_base_standard_yoy_unchanged():
