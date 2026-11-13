@@ -296,6 +296,12 @@ def calculate_standard_yoy(
         - Operating Income
 
     Negative growth is allowed.
+
+    STEP 24.4 P1: a negative previous value makes the ratio's sign the
+    opposite of the economic direction (loss -> profit reads as decline,
+    a widening loss as growth), so it is INVALID / NONPOSITIVE_PRIOR_BASE,
+    for numeric inputs that pass the existing validation, regardless of the current value's sign. Zero keeps ZERO_PRIOR_BASE; a positive
+    previous value keeps the formula (current / previous) - 1.
     """
 
     if not _is_number(current) or not _is_number(previous):
@@ -310,6 +316,14 @@ def calculate_standard_yoy(
             metric_name,
             "Previous value cannot be zero.",
             "ZERO_PRIOR_BASE",
+        )
+
+    if previous < 0:
+        return _build_invalid_metric(
+            metric_name,
+            "Previous value must be greater than zero "
+            "for conventional YoY calculation.",
+            "NONPOSITIVE_PRIOR_BASE",
         )
 
     growth = _round_growth(
@@ -1281,6 +1295,19 @@ def calculate_growth(
             "Revenue CAGR requires exact "
             "three-fiscal-year annual history."
         )
+
+    # STEP 24.4 P1: only for the negative-prior-base INVALID of the two
+    # standard-YoY metrics (MISSING / WITHHELD / other INVALID add nothing).
+    for metric_name in ("revenue_yoy", "operating_income_yoy"):
+        component = components[metric_name]
+        if (
+            component.get("status") == "INVALID"
+            and component.get("reason_code") == "NONPOSITIVE_PRIOR_BASE"
+        ):
+            limitations[metric_name] = (
+                "YoY growth is not defined when the prior-year "
+                "comparable-quarter value is not positive."
+            )
 
     result = {
         "schema_version": SCHEMA_VERSION,
