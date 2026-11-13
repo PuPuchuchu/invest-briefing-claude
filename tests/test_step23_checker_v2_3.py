@@ -1920,7 +1920,7 @@ class MigrationAllowanceV24(unittest.TestCase):
 
     def test_allowance_values_are_the_registered_set(self):
         self.assertEqual(ck.ALLOWANCE_VALUE_SETS["GROWTH_REASON_CODES"], ck.GROWTH_REASON_CODES)
-        self.assertEqual(len(ck.GROWTH_REASON_CODES), 7)
+        self.assertEqual(len(ck.GROWTH_REASON_CODES), 8)         # A-2: + NON_FINITE_RESULT (explicit revision)
 
     def test_c3_accepts_only_the_allowed_coverage_shift(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())

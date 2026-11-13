@@ -79,9 +79,10 @@ CIK_RE = re.compile(r"^[0-9]{10}$")
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 # ---------------------------------------------------------------- v2.4 migration allowance (D2)
-# Mirror of production growth.GROWTH_REASON_CODES (STEP 24.3 A-1). The A-1 PR adds a test asserting equality.
+# Mirror of production growth.GROWTH_REASON_CODES (STEP 24.3 A-1; A-2 added NON_FINITE_RESULT). A production test
+# asserts equality. Constant only: no checker decision logic depends on the individual codes.
 GROWTH_REASON_CODES = frozenset({"NON_NUMERIC_INPUT", "NON_FINITE_INPUT", "NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT",
-                                 "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER"})
+                                 "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER", "NON_FINITE_RESULT"})
 ALLOWANCE_VALUE_SETS = {"GROWTH_REASON_CODES": GROWTH_REASON_CODES}
 # exact path grammar per value set: one Growth component's reason_code leaf; no wildcard / prefix forms exist
 ALLOWANCE_PATH_RE = {"GROWTH_REASON_CODES": re.compile(

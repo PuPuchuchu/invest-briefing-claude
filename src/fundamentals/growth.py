@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
 from typing import Any
 
 
@@ -34,12 +35,13 @@ MIN_VALID_COMPONENTS = 3
 # data_sufficiency.REASON_CODES (that vocabulary never applies to INVALID).
 GROWTH_REASON_CODES = frozenset({
     "NON_NUMERIC_INPUT",
-    "NON_FINITE_INPUT",          # registered for a future, separately approved finite-input guard; not emitted today
+    "NON_FINITE_INPUT",          # A-2: a numeric input that is NaN / +-inf / an int beyond float range
     "NONPOSITIVE_PRIOR_BASE",
     "NONPOSITIVE_CURRENT",
     "ZERO_PRIOR_BASE",
     "NEGATIVE_END_VALUE",
     "INVALID_PERIOD_PARAMETER",
+    "NON_FINITE_RESULT",         # A-2: finite inputs whose computed growth is not finite (overflow)
 })
 
 
@@ -52,6 +54,19 @@ def _is_number(value: Any) -> bool:
         isinstance(value, (int, float))
         and not isinstance(value, bool)
     )
+
+
+def _is_finite_input(value: Any) -> bool:
+    """A-2: True when a numeric value is representable as a finite float.
+
+    NaN, +/-inf and ints beyond float range are not. Never raises. Used only at
+    the growth-calculation boundary and the rating guard; _is_number (which also
+    filters history records) is deliberately unchanged.
+    """
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
 
 
 def _round_growth(value: float) -> float:
@@ -257,6 +272,13 @@ def calculate_positive_yoy(
             "NON_NUMERIC_INPUT",
         )
 
+    if not _is_finite_input(current) or not _is_finite_input(previous):
+        return _build_invalid_metric(
+            metric_name,
+            "Current and previous values must be finite numbers.",
+            "NON_FINITE_INPUT",
+        )
+
     if previous <= 0:
         return _build_invalid_metric(
             metric_name,
@@ -273,9 +295,19 @@ def calculate_positive_yoy(
             "NONPOSITIVE_CURRENT",
         )
 
-    growth = _round_growth(
-        (current / previous) - 1.0
-    )
+    # A-2: finite inputs can still overflow (e.g. 1e308 / 1e-10).
+    try:
+        raw = (current / previous) - 1.0
+    except OverflowError:
+        raw = float("inf")
+    if not math.isfinite(raw):
+        return _build_invalid_metric(
+            metric_name,
+            "Computed growth is not a finite number.",
+            "NON_FINITE_RESULT",
+        )
+
+    growth = _round_growth(raw)
 
     return _build_ok_metric(
         metric_name,
@@ -302,6 +334,10 @@ def calculate_standard_yoy(
     a widening loss as growth), so it is INVALID / NONPOSITIVE_PRIOR_BASE,
     for numeric inputs that pass the existing validation, regardless of the current value's sign. Zero keeps ZERO_PRIOR_BASE; a positive
     previous value keeps the formula (current / previous) - 1.
+
+    A-2 (all three growth functions): a numeric but non-finite input
+    returns NON_FINITE_INPUT right after the NON_NUMERIC_INPUT check;
+    a non-finite computed result returns NON_FINITE_RESULT.
     """
 
     if not _is_number(current) or not _is_number(previous):
@@ -309,6 +345,13 @@ def calculate_standard_yoy(
             metric_name,
             "Current and previous values must be numeric.",
             "NON_NUMERIC_INPUT",
+        )
+
+    if not _is_finite_input(current) or not _is_finite_input(previous):
+        return _build_invalid_metric(
+            metric_name,
+            "Current and previous values must be finite numbers.",
+            "NON_FINITE_INPUT",
         )
 
     if previous == 0:
@@ -326,9 +369,19 @@ def calculate_standard_yoy(
             "NONPOSITIVE_PRIOR_BASE",
         )
 
-    growth = _round_growth(
-        (current / previous) - 1.0
-    )
+    # A-2: finite inputs can still overflow (e.g. 1e308 / 1e-10).
+    try:
+        raw = (current / previous) - 1.0
+    except OverflowError:
+        raw = float("inf")
+    if not math.isfinite(raw):
+        return _build_invalid_metric(
+            metric_name,
+            "Computed growth is not a finite number.",
+            "NON_FINITE_RESULT",
+        )
+
+    growth = _round_growth(raw)
 
     return _build_ok_metric(
         metric_name,
@@ -353,6 +406,13 @@ def calculate_cagr_3y(
             "NON_NUMERIC_INPUT",
         )
 
+    if not _is_finite_input(start_value) or not _is_finite_input(end_value):
+        return _build_invalid_metric(
+            metric_name,
+            "Start and end values must be finite numbers.",
+            "NON_FINITE_INPUT",
+        )
+
     if start_value <= 0:
         return _build_invalid_metric(
             metric_name,
@@ -367,6 +427,15 @@ def calculate_cagr_3y(
             "NEGATIVE_END_VALUE",
         )
 
+    # A-2: the period parameter itself must be a finite number (not bool / str / NaN / +-inf / ints beyond float
+    # range); otherwise 1 / years can turn into 0 and give a "normal" 0.0 CAGR (years=+inf), or raise.
+    if not _is_number(years) or not _is_finite_input(years):
+        return _build_invalid_metric(
+            metric_name,
+            "Years must be a finite number greater than zero.",
+            "INVALID_PERIOD_PARAMETER",
+        )
+
     if years <= 0:
         return _build_invalid_metric(
             metric_name,
@@ -374,13 +443,21 @@ def calculate_cagr_3y(
             "INVALID_PERIOD_PARAMETER",
         )
 
-    cagr = (
-        end_value / start_value
-    ) ** (1.0 / years) - 1.0
+    # A-2: finite inputs can still overflow (e.g. 1e300 / 1e-300).
+    try:
+        raw = (end_value / start_value) ** (1.0 / years) - 1.0
+    except OverflowError:
+        raw = float("inf")
+    if not math.isfinite(raw):
+        return _build_invalid_metric(
+            metric_name,
+            "Computed growth is not a finite number.",
+            "NON_FINITE_RESULT",
+        )
 
     return _build_ok_metric(
         metric_name,
-        _round_growth(cagr),
+        _round_growth(raw),
     )
 
 
@@ -748,6 +825,18 @@ def _rate_growth_value(
             "metric": metric_name,
             "value": None,
             "stars": None,
+        }
+
+    # A-2 rating guard (second line of defence): NaN / +inf / -inf / ints beyond float range must never be
+    # turned into a star. Unreachable through the public calculate_* functions (they stop such values first).
+    if not _is_finite_input(value):
+        return {
+            "status": "INVALID",
+            "metric": metric_name,
+            "value": None,
+            "stars": None,
+            "reason": "Computed growth is not a finite number.",
+            "reason_code": "NON_FINITE_RESULT",
         }
 
     value = _round_growth(value)
@@ -1240,6 +1329,19 @@ def calculate_growth(
             metric_name,
             component.get("value"),
         )
+
+        # A-2: a non-finite value that reached the rating guard makes the
+        # component INVALID (not "OK without stars"); it is then excluded by
+        # the unchanged weighted-score rule.
+        if rated.get("reason_code") == "NON_FINITE_RESULT":
+            component = _build_invalid_metric(
+                metric_name,
+                rated["reason"],
+                "NON_FINITE_RESULT",
+            )
+            component["stars"] = None
+            components[metric_name] = component
+            continue
 
         component["stars"] = rated.get(
             "stars"
