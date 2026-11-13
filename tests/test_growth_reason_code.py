@@ -8,7 +8,10 @@ Scope guarantees tested here:
     (golden file generated from that commit);
   * data_sufficiency still never puts a reason_code on INVALID;
   * the Checker v2.4 mirror of the code set equals production.
-No finite-input guard, no negative-base change: those are separate decisions.
+No finite-input guard: that is a separate decision.
+STEP 24.4 P1 (explicit revision): calculate_standard_yoy() with a negative previous value is now INVALID /
+NONPOSITIVE_PRIOR_BASE. This adds a 10th call site, and exactly K_NEGATIVE_PRIOR golden cases change
+expectation; every other golden case must still match. The golden file itself is not modified.
 """
 from __future__ import annotations
 
@@ -43,6 +46,7 @@ BRANCHES = [
     (calculate_positive_yoy, ("m", -1, -1), "NONPOSITIVE_PRIOR_BASE"),   # prior checked first: deterministic
     (calculate_standard_yoy, ("m", "3", 1), "NON_NUMERIC_INPUT"),
     (calculate_standard_yoy, ("m", 5, 0), "ZERO_PRIOR_BASE"),
+    (calculate_standard_yoy, ("m", 5, -1), "NONPOSITIVE_PRIOR_BASE"),        # STEP 24.4 P1
     (calculate_cagr_3y, ("m", True, 100), "NON_NUMERIC_INPUT"),
     (calculate_cagr_3y, ("m", 0, 100), "NONPOSITIVE_PRIOR_BASE"),
     (calculate_cagr_3y, ("m", 100, -1), "NEGATIVE_END_VALUE"),
@@ -71,10 +75,11 @@ def test_years_parameter_branch():
 
 
 def test_every_invalid_call_site_passes_a_registered_literal_code():
-    """9 call sites; the third argument is a string literal in the registered set (never computed)."""
+    """10 call sites (9 from A-1 + the STEP 24.4 P1 negative-prior branch); the third argument is a string literal
+    in the registered set (never computed)."""
     tree = ast.parse(GROWTH_PY.read_text(encoding="utf-8"))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_build_invalid_metric"]
-    assert len(calls) == 9
+    assert len(calls) == 10
     for c in calls:
         assert len(c.args) == 3 and not c.keywords
         code = c.args[2]
@@ -104,8 +109,19 @@ def _decode(v):
     return float(v["float"]) if isinstance(v, dict) and "float" in v else v
 
 
+# STEP 24.4 P1: golden cases whose expectation changes, fixed before implementation from the golden file:
+# calculate_standard_yoy, previous in {-1, -2.5, -inf} (the negative inputs), current any numeric input (11) -> 3 x 11.
+# All 33 were OK in the golden; they are now INVALID / NONPOSITIVE_PRIOR_BASE. 17 of them involve a non-finite input
+# (previous -inf, or current nan / inf / -inf): the rule is "previous < 0", which -inf satisfies.
+K_NEGATIVE_PRIOR = 33
+NEGATIVE_INPUTS = {"-1", "-2.5", "-inf"}
+NUMERIC_INPUTS = {"0", "0.0", "-0.0", "1", "-1", "2.5", "-2.5", "1e12", "nan", "inf", "-inf"}
+NEG_PRIOR_REASON = "Previous value must be greater than zero for conventional YoY calculation."
+
+
 def test_production_parity_with_main_64e0f1d():
-    """status / value / reason / exception identical to the pre-A-1 production (golden); only reason_code is added."""
+    """status / value / reason / exception identical to the pre-A-1 production (golden); only reason_code is added.
+    STEP 24.4 P1: exactly K_NEGATIVE_PRIOR standard-YoY negative-previous cases take the new expectation."""
     gold = json.loads(GOLDEN.read_text(encoding="utf-8"))
     assert gold["growth_py_sha256"] == "01e05f6268c28966361eecf37334b6b7f82ac15b1403a456099fd047b8d18b15"
     inputs = {"0": 0, "0.0": 0.0, "-0.0": -0.0, "1": 1, "-1": -1, "2.5": 2.5, "-2.5": -2.5, "1e12": 10**12,
@@ -113,9 +129,17 @@ def test_production_parity_with_main_64e0f1d():
               "True": True, "False": False, "list": []}
     assert sorted(inputs) == sorted(gold["inputs"])
     assert len(gold["cases"]) == 3 * 16 * 16
+    substituted = 0
     for case in gold["cases"]:
         fn = getattr(growth, case["function"])
         exp = case["result"]
+        if (case["function"] == "calculate_standard_yoy" and case["arg2"] in NEGATIVE_INPUTS
+                and case["arg1"] in NUMERIC_INPUTS):
+            assert exp.get("status") == "OK", case          # the golden (old) result being replaced
+            exp = {"status": "INVALID", "value": None, "reason": NEG_PRIOR_REASON, "keys": ["metric", "reason", "status", "value"]}
+            r = fn("m", inputs[case["arg1"]], inputs[case["arg2"]])
+            assert r["reason_code"] == "NONPOSITIVE_PRIOR_BASE", case
+            substituted += 1
         try:
             r = fn("m", inputs[case["arg1"]], inputs[case["arg2"]])
         except Exception as e:  # noqa: BLE001 - parity includes the exception type
@@ -130,6 +154,7 @@ def test_production_parity_with_main_64e0f1d():
         assert set(exp["keys"]) <= set(r), case
         if r["status"] == "INVALID":
             assert r["reason_code"] in GROWTH_REASON_CODES, case
+    assert substituted == K_NEGATIVE_PRIOR
 
 
 def test_finite_guard_not_enabled():
@@ -139,9 +164,13 @@ def test_finite_guard_not_enabled():
 
 
 def test_negative_base_standard_yoy_unchanged():
-    """STEP 24.4 is a separate policy step: negative previous values are still computed as before."""
+    """Explicitly revised for STEP 24.4 P1 (name kept for traceability). Until P1 this asserted that a negative
+    previous value was still computed (AMD-type -134 -> 1990 gave -15.85 = -1,585%). The approved policy makes
+    it INVALID / NONPOSITIVE_PRIOR_BASE; a positive previous value keeps the old formula."""
     r = calculate_standard_yoy("m", 1990, -134)
-    assert r["status"] == "OK" and r["value"] == round(1990 / -134 - 1.0, 10)
+    assert (r["status"], r["reason_code"], r["value"]) == ("INVALID", "NONPOSITIVE_PRIOR_BASE", None)
+    r = calculate_standard_yoy("m", 1990, 134)
+    assert r["status"] == "OK" and r["value"] == round(1990 / 134 - 1.0, 10)
 
 
 def test_unregistered_code_is_rejected():
