@@ -118,6 +118,24 @@ PATCH_MIGRATIONS = {
             r"|^/data_sufficiency/" + _SY + r"/by_calculation_status/(OK|INVALID)$"
             r"|^/data_sufficiency/" + _SY + r"/by_reason_code(/NO_REASON_CODE)?$"),
     },
+    # STEP 24.6-N: eps_yoy prior-year value = same-filing comparative (per-share metrics only), fail-closed when it is
+    # unavailable, plus the eps_yoy-only provenance leaf previous_value_basis. Period/source leaves are listed because an
+    # OK -> INVALID (fail-closed) transition removes them; every registered leaf still needs its exact base/new value.
+    "STEP24_6_N_SAME_FILING_COMPARATIVE": {
+        "ticker": re.compile(
+            r"^/stages/growth/growth/components/eps_yoy/(status|value|stars|reason|reason_code|previous_value_basis"
+            r"|current_period_end|previous_period_end|source\[[01]\])$"
+            r"|^/stages/growth/growth/growth/(status|score|stars|available_components|valid_components|coverage)$"
+            r"|^/stages/growth/growth/warnings(\[[0-2]\])?$"
+            r"|^/stages/growth/growth/limitations(/eps_yoy)?$"
+            r"|^/stages/data_sufficiency/sufficiency/eps_yoy/(calculation_status|detail)$"),
+        "coverage": re.compile(
+            r"^/growth/components/eps_yoy/by_status/(OK|INVALID)$"
+            r"|^/growth/components/eps_yoy/by_reason_code(/SAME_FILING_COMPARATIVE_UNAVAILABLE|/NONPOSITIVE_PRIOR_BASE)?$"
+            r"|^/growth/aggregate_status_counts/(OK|MISSING)$"
+            r"|^/data_sufficiency/eps_yoy/by_calculation_status/(OK|INVALID)$"
+            r"|^/data_sufficiency/eps_yoy/by_reason_code(/NO_REASON_CODE)?$"),
+    },
 }
 # container paths (flat leaf only while empty): the only places [] / {} may appear as a patch value
 PATCH_CONTAINER_LEAF = {"warnings": [], "by_reason_code": {}, "limitations": {}}

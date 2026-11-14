@@ -2263,5 +2263,131 @@ class ExpectedPatchV25(unittest.TestCase):
         self.assertNotIn("SECRET-VALUE-123", out)
 
 
+# ---------------------------------------------------------------- STEP 24.6-N P0: same-filing comparative allowlist
+N_MIG = "STEP24_6_N_SAME_FILING_COMPARATIVE"
+EPS = f"{G}/components/eps_yoy"
+N_UNAVAILABLE = "SAME_FILING_COMPARATIVE_UNAVAILABLE"
+
+
+def n_eps(value, stars):
+    return {"status": "OK", "metric": "eps_yoy", "value": value, "source": ["historical", "quarterly"],
+            "current_period_end": "2026-09-30", "previous_period_end": "2025-09-30", "stars": stars}
+
+
+def n_pair(mode="split"):
+    """BASE: AAPL eps_yoy computed against a pre-split prior (1 star); LLY eps_yoy normal.
+    NEW (STEP 24.6-N): every eps_yoy with a pair gains previous_value_basis.
+      mode="split":       AAPL value/stars re-computed from the same-filing comparative (OK -> OK), score cascade.
+      mode="failclosed":  AAPL comparative unavailable -> INVALID / SAME_FILING_COMPARATIVE_UNAVAILABLE (full cascade).
+      mode="basis_only":  values unchanged everywhere, only the provenance leaf is added."""
+    p = Pair()
+    for t, comp_ in (("AAPL", n_eps(-0.8517887564, 1)), ("LLY", n_eps(0.1626409018, 4))):
+        g = p.res["BASE"][t]["stages"]["growth"]["growth"]
+        g["components"]["eps_yoy"] = comp_
+        g["components"]["revenue_yoy"] = {"status": "OK", "metric": "revenue_yoy", "value": 0.1185, "stars": 4}
+        g["components"]["operating_income_yoy"] = {"status": "OK", "metric": "operating_income_yoy", "value": 0.37, "stars": 5}
+        g["growth"] = {"status": "OK", "score": 3.25, "stars": 3, "available_components": 3, "valid_components": 3,
+                       "total_components": 5, "coverage": 0.6}
+        g["warnings"] = []; g["limitations"] = {}
+        p.res["BASE"][t]["stages"]["data_sufficiency"]["sufficiency"]["eps_yoy"] = {
+            "metric": "eps_yoy", "calculation_status": "OK", "reason_code": None, "detail": None}
+    p.res["NEW"] = copy.deepcopy(p.res["BASE"]); p.policy["NEW"] = ck.POLICY_V1; p.raw["NEW"] = copy.deepcopy(p.raw["BASE"])
+    for t in ("AAPL", "LLY"):
+        comp(p, "NEW", t, "eps_yoy")["previous_value_basis"] = "same_filing_comparative"
+    a = p.res["NEW"]["AAPL"]["stages"]["growth"]["growth"]
+    if mode == "split":
+        a["components"]["eps_yoy"].update(value=0.4745762712, stars=5)
+        a["growth"].update(score=4.25, stars=4)
+    elif mode == "failclosed":
+        a["components"]["eps_yoy"] = {"status": "INVALID", "metric": "eps_yoy", "value": None, "stars": None,
+                                      "reason": "No same-filing comparative.", "reason_code": N_UNAVAILABLE,
+                                      "previous_value_basis": "same_filing_comparative_missing"}
+        a["growth"].update(status="MISSING", score=None, stars=None, available_components=2, valid_components=2, coverage=0.4)
+        a["limitations"] = {"eps_yoy": "EPS growth requires positive current and prior-year comparable-quarter values."}
+        p.res["NEW"]["AAPL"]["stages"]["data_sufficiency"]["sufficiency"]["eps_yoy"].update(
+            calculation_status="INVALID", detail="No same-filing comparative.")
+    return p
+
+
+def n_profile(entries, mig=N_MIG):
+    prof = copy.deepcopy(P25_PROFILE)
+    prof["expected_patch"] = {"migration_id": mig, "binding": dict(P25_BIND), "entries": copy.deepcopy(entries)}
+    return prof
+
+
+class ExpectedPatchStep246N(unittest.TestCase):
+    """STEP 24.6-N P0: allowlist only. The reason-code registry/mirror is deliberately unchanged here (N-P1)."""
+
+    def _run(self, p, entries):
+        return run_pair(p, profile=n_profile(entries))
+
+    def test_registered_and_mirror_unchanged(self):
+        self.assertIn(N_MIG, ck.PATCH_MIGRATIONS)
+        self.assertEqual(sorted(ck.PATCH_MIGRATIONS), [P25_MIG, N_MIG])
+        self.assertNotIn(N_UNAVAILABLE, ck.GROWTH_REASON_CODES)               # mirror moves with production in N-P1
+        self.assertEqual(len(ck.GROWTH_REASON_CODES), 8)
+
+    def test_exact_patch_passes_for_each_mode(self):
+        for mode in ("split", "failclosed", "basis_only"):
+            with self.subTest(mode=mode):
+                p = n_pair(mode); E = p25_entries(p)
+                self.assertTrue(E)
+                code, out = self._run(p, E)
+                self.assertEqual(code, 0, out)
+                for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
+                self.assertIn(f"expected_patch {N_MIG}", out)
+
+    def test_oracle_contents(self):
+        paths = {(e["file"], e["path"], e["op"]) for e in p25_entries(n_pair("split"))}
+        self.assertIn(("LLY.json", f"{EPS}/previous_value_basis", "add"), paths)
+        self.assertIn(("AAPL.json", f"{EPS}/value", "replace"), paths)
+        self.assertIn(("AAPL.json", f"{G}/growth/score", "replace"), paths)
+        fc = {(e["file"], e["path"]) for e in p25_entries(n_pair("failclosed"))}
+        for leaf in (f"{EPS}/current_period_end", f"{EPS}/source[0]", f"{EPS}/reason_code", f"{G}/limitations/eps_yoy",
+                     "/stages/data_sufficiency/sufficiency/eps_yoy/calculation_status"):
+            self.assertIn(("AAPL.json", leaf), fc)
+        self.assertIn(("coverage.json", f"/growth/components/eps_yoy/by_reason_code/{N_UNAVAILABLE}"), fc)
+
+    def test_unregistered_change_still_fails(self):
+        p = n_pair("split"); E = [e for e in p25_entries(p) if not e["path"].endswith("/score")]
+        code, out = self._run(p, E)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+        p = n_pair("split"); E = p25_entries(p)
+        comp(p, "NEW", "AAPL", "eps_yoy")["previous_period_end"] = "2025-06-30"     # period moved, not registered
+        code, out = self._run(p, E)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    def test_paths_outside_the_n_allowlist_are_input_errors(self):
+        bad = [("AAPL.json", f"{G}/components/operating_income_yoy/status"), ("AAPL.json", f"{G}/components/revenue_yoy/value"),
+               ("AAPL.json", f"{G}/components/fcf_yoy/value"), ("AAPL.json", f"{G}/components/fcf_yoy/previous_value_basis"),
+               ("AAPL.json", f"{G}/components/revenue_yoy/previous_value_basis"), ("AAPL.json", f"{EPS}/previous_value_basis/x"),
+               ("AAPL.json", f"{EPS}/basis"), ("AAPL.json", f"{EPS}/source[2]"), ("AAPL.json", EPS), ("AAPL.json", f"{G}/limitations/fcf_yoy"),
+               ("AAPL.json", "/stages/data_sufficiency/sufficiency/eps_yoy/reason_code"),
+               ("AAPL.json", "/stages/data_sufficiency/sufficiency/fcf_yoy/detail"), ("AAPL.json", f"{G}/warnings[3]"),
+               ("coverage.json", "/growth/components/operating_income_yoy/by_status/OK"),
+               ("coverage.json", "/growth/components/eps_yoy/by_reason_code/NONPOSITIVE_CURRENT"),
+               ("coverage.json", "/growth/components/eps_yoy/by_reason_code/OTHER_CODE"),
+               ("coverage.json", "/growth/components/eps_yoy/by_status/MISSING"),
+               ("coverage.json", "/data_sufficiency/fcf_yoy/by_calculation_status/OK"), ("summary.json", "/generated_at_utc")]
+        p = n_pair("split")
+        for f, pa in bad:
+            with self.subTest(file=f, path=pa):
+                code, out = self._run(p, [{"file": f, "path": pa, "op": "replace", "base": 1, "new": 2}])
+                self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out); self.assertNotIn("Traceback", out)
+
+    def test_migrations_are_isolated(self):
+        # the STEP 24.4 migration cannot register eps leaves, the N migration cannot register operating-income leaves
+        p = n_pair("split")
+        code, out = run_pair(p, profile=n_profile(p25_entries(p), mig=P25_MIG))
+        self.assertEqual(code, 3, out)
+        p4 = p25_pair()
+        code, out = run_pair(p4, profile=n_profile(p25_entries(p4)))
+        self.assertEqual(code, 3, out)
+
+    def test_without_patch_the_n_change_fails_like_v23(self):
+        code, out = run_pair(n_pair("basis_only"), profile=P25_PROFILE)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertIsNone(verdict(out, "D9"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
