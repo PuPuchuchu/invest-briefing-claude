@@ -2556,7 +2556,53 @@ class GovernedComponentPatchV26(unittest.TestCase):
         path = REPO / "src" / "fundamentals" / "orchestrator.py"
         self.assertEqual(ck.governed_scope_parity_problems(str(path)), [])
         self.assertEqual(ck.static_dict(str(path), "_GROWTH_METRIC_CONCEPT_DEPENDENCIES")["eps_yoy"], ("diluted_eps",))
-        self.assertNotIn("src.fundamentals.orchestrator", sys.modules)          # never imported by this check
+
+    # The "no production import" property is checked in a fresh interpreter: in the full suite other test
+    # files import production modules into this process, so a global sys.modules check here is not meaningful.
+    _NO_IMPORT_PROBE = r"""
+import importlib.util, json, sys
+attempts = []
+class _BlockSrc:
+    def find_spec(self, name, path=None, target=None):
+        if name == "src" or name.startswith("src."):
+            attempts.append(name)
+            raise ImportError("production import blocked: " + name)
+        return None
+sys.meta_path.insert(0, _BlockSrc())
+spec = importlib.util.spec_from_file_location("step23_checker_v2_3", sys.argv[1])
+ck = importlib.util.module_from_spec(spec); sys.modules[spec.name] = ck; spec.loader.exec_module(ck)
+problems = ck.governed_scope_parity_problems(sys.argv[2])
+print(json.dumps({"problems": problems, "attempts": attempts,
+                  "src_modules": sorted(m for m in sys.modules if m == "src" or m.startswith("src."))}))
+"""
+
+    def _no_import_probe(self, checker_path):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:                     # neutral cwd; -I: isolated, no cwd on sys.path
+            r = subprocess.run([sys.executable, "-I", "-c", self._NO_IMPORT_PROBE, str(checker_path),
+                                str(REPO / "src" / "fundamentals" / "orchestrator.py")],
+                               cwd=tmp, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_parity_check_never_imports_production(self):
+        out = self._no_import_probe(REPO / "scripts" / "step23_checker_v2_3.py")
+        self.assertEqual(out, {"problems": [], "attempts": [], "src_modules": []})
+
+    def test_no_import_probe_detects_a_production_import(self):
+        # probe self-test: a checker copy whose parity check tries to import production must be caught
+        # (the import is blocked by the probe, so no production code runs)
+        src = (REPO / "scripts" / "step23_checker_v2_3.py").read_text(encoding="utf-8")
+        hook = "def governed_scope_parity_problems(path, scope=None) -> list[str]:\n"
+        self.assertEqual(src.count(hook), 1)
+        bad = src.replace(hook, hook + "    try:\n        import src.fundamentals.orchestrator  # noqa\n"
+                                         "    except ImportError:\n        pass\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "step23_checker_v2_3.py"; f.write_text(bad, encoding="utf-8")
+            out = self._no_import_probe(f)
+        self.assertEqual(out["problems"], [])
+        self.assertIn("src", out["attempts"])
+        self.assertEqual(out["src_modules"], [])
 
     def _parity(self, source, scope=None):
         with tempfile.TemporaryDirectory() as tmp:
