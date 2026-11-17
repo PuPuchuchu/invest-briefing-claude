@@ -1,7 +1,11 @@
-"""STEP 23 Checker v2.7 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.8 (read-only): DEC055 gate materialization + same-date batch pair comparison.
 
 v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
 newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
+v2.8 (STEP 24.6 Phase A, timestamp exclusions by exact path): run-varying timestamps are no longer recognized by leaf
+NAME anywhere. Ticker JSON: only /stages/normalization/normalized/normalized_at is RUN_METADATA (D2, every mode);
+coverage.json: only /generated_at_utc is excluded, now also in expected_patch mode's D9. The same key name anywhere
+else is data.
 v2.7 (STEP 24.6 D9 patchless gap): D9 runs in every D2 mode. Without expected_patch (allowance mode and the no-change
 mode) it is the strict form: every coverage.json leaf outside the delegated stage blocks (/derived_metrics, /growth,
 /data_sufficiency: recomputed by C1, compared by C3) must be identical BASE -> NEW (type-strict, additions and removals
@@ -46,7 +50,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.7"
+VERSION = "checker_v2.8"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -68,7 +72,6 @@ NO_REASON_CODE, KEY_ABSENT = "NO_REASON_CODE", "KEY_ABSENT"
 NOT_APPLICABLE_BY_TYPE = {"FINANCIAL": {"operating_income", "cfo", "capex", "current_debt", "noncurrent_debt", "total_debt"},
                           "NON_FINANCIAL": set()}
 # run-to-run classification
-RUN_TS_KEYS = {"normalized_at", "fetched_at_utc", "loaded_at_utc", "generated_at_utc", "run_started_at_utc", "run_started_at_kst"}
 FRAME_IDENTITY = ("value", "period_start", "period_end", "filing_date", "form", "accession", "concept", "unit", "namespace",
                   "status", "fy", "fp")
 # keys of a gate marker that may change when a V1 marker becomes a V2 marker (status/value may not)
@@ -104,6 +107,9 @@ ALLOWED_ADDITION = "ALLOWED_ADDITION"
 # The only run-varying coverage.json leaf: batch_coverage.build_coverage() writes "generated_at_utc" at the top level
 # (datetime.now) and batch_runner writes the dict unchanged. Exact paths only: the same key name anywhere else is data.
 COVERAGE_RUN_TS_PATHS = frozenset({"/generated_at_utc"})
+# v2.8: the only run-varying ticker-JSON leaf: sec_normalizer writes normalized/normalized_at = datetime.now(). (The
+# identity stage's normalized_at is the evaluation date, i.e. not run-varying, so it stays data.)
+TICKER_RUN_TS_PATHS = frozenset({"/stages/normalization/normalized/normalized_at"})
 # Blocks recomputed from the ticker files by C1 (every run) and compared across runs by C3 (governed tickers excluded,
 # allowance / patch leaves applied). Matched by whole path segment, never by string prefix.
 D9_DELEGATED_BLOCKS = ("/derived_metrics", "/growth", "/data_sufficiency")
@@ -1390,7 +1396,7 @@ class Checker:
             if fa.get(path, "<<absent>>") == fb.get(path, "<<absent>>") and (path in fa) == (path in fb): continue
             parent, key = parent_and_key(path)
             cls = "DATA_CHANGE"
-            if key in RUN_TS_KEYS:
+            if path in TICKER_RUN_TS_PATHS:
                 cls = "RUN_METADATA"
             elif key == "frame":
                 pa, pb = get_path(a, parent), get_path(b, parent)
@@ -1468,7 +1474,7 @@ class Checker:
             # D9 coverage.json: every leaf difference (run timestamps aside) is a realized coverage entry
             cb, cn = flat(base.coverage), flat(new.coverage)
             diff_cov = {p for p in set(cb) | set(cn)
-                        if not same_leaf(flat_get(cb, p), flat_get(cn, p)) and p.rsplit("/", 1)[-1] not in RUN_TS_KEYS}
+                        if not same_leaf(flat_get(cb, p), flat_get(cn, p)) and p not in COVERAGE_RUN_TS_PATHS}
             reg_cov = {p for f, p in ((e["file"], e["path"]) for e in p_entries) if f == COVERAGE_FILE}
             cprob = [x for x in patch_problems_ if x.startswith(COVERAGE_FILE) or x.startswith("expected_patch")]
             unreg = sorted(diff_cov - {p for f, p in realized if f == COVERAGE_FILE})

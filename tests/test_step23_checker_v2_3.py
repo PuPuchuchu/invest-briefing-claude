@@ -1812,7 +1812,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.7")             # STEP 24.6 D9 patchless gap (explicit revision; was v2.6)
+        self.assertEqual(ck.VERSION, "checker_v2.8")             # STEP 24.6 Phase A exact-path timestamps (explicit revision; was v2.7)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -1998,7 +1998,7 @@ def p25_entries(p):
     for f, a, b in docs:
         fa, fb = ck.flat(a), ck.flat(b)
         for path in sorted(set(fa) | set(fb)):
-            if path.rsplit("/", 1)[-1] in ck.RUN_TS_KEYS: continue
+            if path in (ck.COVERAGE_RUN_TS_PATHS if f == "coverage.json" else ck.TICKER_RUN_TS_PATHS): continue   # v2.8: exact paths
             va, vb = fa.get(path, ABS), fb.get(path, ABS)
             if ck.same_leaf(va, vb): continue
             op = "add" if va is ABS else ("remove" if vb is ABS else "replace")
@@ -2833,6 +2833,80 @@ class StrictD9V27(unittest.TestCase):
         p = p25_pair(); code, out = run_pair(p, profile=p25_profile(p25_entries(p)))
         self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertNotIn(D9_STRICT, out)
         self.assertIn("D9 coverage.json: no change except expected_patch", out)
+
+
+# ---------------------------------------------------------------- v2.8 (STEP 24.6 Phase A): exact-path timestamp exclusions
+TS_NAMES = ("normalized_at", "fetched_at_utc", "loaded_at_utc", "generated_at_utc", "run_started_at_utc", "run_started_at_kst")
+
+
+class ExactPathTimestampsV28(unittest.TestCase):
+    def test_constants_are_exact_paths(self):
+        self.assertEqual(ck.TICKER_RUN_TS_PATHS, frozenset({"/stages/normalization/normalized/normalized_at"}))
+        self.assertEqual(ck.COVERAGE_RUN_TS_PATHS, frozenset({"/generated_at_utc"}))
+        self.assertFalse(hasattr(ck, "RUN_TS_KEYS"))                    # no leaf-name rule left anywhere
+
+    # -- ticker JSON (D2 classification, every mode)
+    def _ticker_tamper(self, mode, mut):
+        if mode == "patch":
+            p = p25_pair(); E = p25_entries(p)
+            mut(p.res["NEW"]["AAPL"]); return run_pair(p, profile=p25_profile(E))
+        p = mig_pair() if mode == "allowance" else p25_pair(change=False)
+        mut(p.res["NEW"]["AAPL"])
+        return run_pair(p, profile={"no_change": P25_PROFILE, "allowance": mig_profile()}[mode])
+
+    def test_real_normalized_at_change_is_run_metadata(self):
+        for mode in ("no_change", "allowance", "patch"):
+            with self.subTest(mode=mode):
+                code, out = self._ticker_tamper(mode, lambda d: d["stages"]["normalization"]["normalized"].__setitem__("normalized_at", "2099-01-01T00:00:00Z"))
+                self.assertEqual(verdict(out, "D2"), "PASS", out); self.assertEqual(code, 0, out)
+
+    def test_timestamp_named_leaf_elsewhere_in_ticker_is_data(self):
+        spots = (lambda d: d["stages"]["growth"]["growth"]["growth"],
+                 lambda d: d["stages"]["growth"]["growth"]["components"]["fcf_yoy"],
+                 lambda d: d["stages"]["normalization"],
+                 lambda d: d)
+        for mode in ("no_change", "allowance", "patch"):
+            for i, spot in enumerate(spots):
+                for name in TS_NAMES:
+                    with self.subTest(mode=mode, spot=i, name=name):
+                        code, out = self._ticker_tamper(mode, lambda d: spot(d).__setitem__(name, 7))
+                        self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertEqual(code, 1, out)
+
+    def test_identity_stage_normalized_at_is_data(self):
+        # orchestrator writes the identity stage's normalized_at from the evaluation date: not run-varying
+        def mut(d): d["stages"].setdefault("identity", {})["normalized_at"] = "2026-11-04"
+        code, out = self._ticker_tamper("no_change", mut)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    # -- coverage.json in expected_patch mode (v2.5 D9)
+    def _patch_cov(self, base_mut=None, new_mut=None):
+        p = p25_pair(); E = p25_entries(p)
+        def wrap(extra):
+            def f(c):
+                _real_blocks(c)
+                if extra: extra(c)
+            return f
+        p.cov_mut["BASE"], p.cov_mut["NEW"] = wrap(base_mut), wrap(new_mut)
+        code, out = run_pair(p, profile=p25_profile(E))
+        self.assertIn("D9 coverage.json: no change except expected_patch", out)
+        return code, out
+
+    def test_patch_mode_generated_at_utc_change_passes(self):
+        code, out = self._patch_cov(_set("/generated_at_utc", "A"), _set("/generated_at_utc", "B"))
+        self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertEqual(code, 0, out)
+
+    def test_patch_mode_timestamp_named_leaf_elsewhere_fails(self):
+        for path in ("/universe/generated_at_utc", "/debt_tiers/fetched_at_utc", "/inputs/run_started_at_kst", "/notes_meta/normalized_at"):
+            with self.subTest(path=path, how="added"):
+                code, out = self._patch_cov(new_mut=_set(path, "x"))
+                self.assertEqual(verdict(out, "D9"), "FAIL", out); self.assertIn(path, out)
+        code, out = self._patch_cov(_set("/universe/generated_at_utc", "A"), _set("/universe/generated_at_utc", "B"))
+        self.assertEqual(verdict(out, "D9"), "FAIL", out)
+
+    def test_patch_mode_still_accepts_registered_entries(self):
+        code, out = self._patch_cov()
+        for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
+        self.assertEqual(code, 0, out)
 
 
 if __name__ == "__main__":
