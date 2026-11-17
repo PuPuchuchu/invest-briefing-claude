@@ -1812,7 +1812,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.5")
+        self.assertEqual(ck.VERSION, "checker_v2.6")             # STEP 24.6-N P0b (explicit revision; was v2.5)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -2387,6 +2387,231 @@ class ExpectedPatchStep246N(unittest.TestCase):
     def test_without_patch_the_n_change_fails_like_v23(self):
         code, out = run_pair(n_pair("basis_only"), profile=P25_PROFILE)
         self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertIsNone(verdict(out, "D9"))
+
+
+
+# ---------------------------------------------------------------- v2.6 (STEP 24.6-N P0b): governed component-scoped patch
+def gov_pair(ge_change="basis"):
+    """n_pair('basis_only') plus a GE (governed: withheld operating_income/cfo/capex) eps_yoy component and eps
+    sufficiency in both runs. ge_change: 'basis' (NEW adds previous_value_basis), 'value' (value/stars move too),
+    'sufficiency' (eps sufficiency detail moves too), None (GE unchanged)."""
+    p = n_pair("basis_only")
+    for lab in ("BASE", "NEW"):
+        st = p.res[lab]["GE"]["stages"]
+        st["growth"]["growth"]["components"]["eps_yoy"] = n_eps(0.0891089109, 3)
+        st["data_sufficiency"]["sufficiency"]["eps_yoy"] = {"metric": "eps_yoy", "calculation_status": "OK",
+                                                            "reason_code": None, "detail": None}
+    ge = p.res["NEW"]["GE"]["stages"]
+    if ge_change in ("basis", "value", "sufficiency"):
+        ge["growth"]["growth"]["components"]["eps_yoy"]["previous_value_basis"] = "same_filing_comparative"
+    if ge_change == "value":
+        ge["growth"]["growth"]["components"]["eps_yoy"].update(value=0.2, stars=4)
+    if ge_change == "sufficiency":
+        ge["data_sufficiency"]["sufficiency"]["eps_yoy"]["detail"] = "changed detail"
+    return p
+
+
+def d5_classes(out):
+    line = next(l for l in out.splitlines() if " D5 change classes per ticker" in l)
+    return json.loads(line[line.index("{"):])
+
+
+class GovernedComponentPatchV26(unittest.TestCase):
+    """Governed tickers may carry ONLY component-scoped, independent-component leaves of a migration listed in
+    GOVERNED_PATCH_SCOPE; everything else on a governed ticker stays rejected (fail closed), through patch() and D2."""
+
+    def _run(self, p, entries, mig=N_MIG):
+        return run_pair(p, profile=n_profile(entries, mig=mig))
+
+    def _ge(self, e): return e["file"] == "GE.json"
+
+    # -- positive
+    def test_ge_eps_provenance_is_an_expected_patch(self):
+        p = gov_pair("basis"); E = p25_entries(p)
+        self.assertIn(("GE.json", f"{EPS}/previous_value_basis"), {(e["file"], e["path"]) for e in E})
+        code, out = self._run(p, E)
+        self.assertEqual(code, 0, out)
+        for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
+        self.assertEqual(d5_classes(out)["GE"].get("EXPECTED_PATCH"), 1, out)
+        self.assertNotIn("DATA_CHANGE", d5_classes(out)["GE"])
+
+    def test_ge_eps_value_and_stars_within_grammar(self):
+        p = gov_pair("value"); E = p25_entries(p)
+        code, out = self._run(p, E)
+        self.assertEqual((code, verdict(out, "D2")), (0, "PASS"), out)
+        self.assertEqual(d5_classes(out)["GE"].get("EXPECTED_PATCH"), 3, out)
+
+    def test_ge_eps_sufficiency_leaf_within_grammar(self):
+        p = gov_pair("sufficiency"); E = p25_entries(p)
+        self.assertIn(("GE.json", "/stages/data_sufficiency/sufficiency/eps_yoy/detail"), {(e["file"], e["path"]) for e in E})
+        code, out = self._run(p, E)
+        self.assertEqual((code, verdict(out, "D2")), (0, "PASS"), out)
+
+    def test_non_governed_behaviour_unchanged(self):
+        for mode in ("split", "failclosed", "basis_only"):
+            p = n_pair(mode); code, out = self._run(p, p25_entries(p))
+            self.assertEqual((code, verdict(out, "D2")), (0, "PASS"), (mode, out))
+
+    # -- negative: governed paths outside the component scope (grammar-valid, so the governed rule is what rejects)
+    def _governed_reject(self, path, base, new, mig=N_MIG, p=None):
+        p = p or gov_pair(None)
+        st = p.res["NEW"]["GE"]
+        fl = ck.flat(st); fl[path] = new; p.res["NEW"]["GE"] = ck.unflatten(fl)
+        fb = ck.flat(p.res["BASE"]["GE"]); fb[path] = base; p.res["BASE"]["GE"] = ck.unflatten(fb)
+        code, out = self._run(p, [{"file": "GE.json", "path": path, "op": "replace", "base": base, "new": new}], mig=mig)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+        self.assertIn("GE", out); self.assertIn("governed ticker", out)
+        return out
+
+    def test_ge_growth_aggregate_score_rejected(self):
+        self._governed_reject(f"{G}/growth/score", 3.0, 3.5)
+
+    def test_ge_growth_aggregate_stars_rejected(self):
+        self._governed_reject(f"{G}/growth/stars", 3, 4)
+
+    def test_ge_growth_aggregate_status_and_counts_rejected(self):
+        for leaf, b, n in (("status", "OK", "MISSING"), ("valid_components", 3, 2), ("available_components", 3, 2), ("coverage", 0.6, 0.4)):
+            with self.subTest(leaf=leaf):
+                self._governed_reject(f"{G}/growth/{leaf}", b, n)
+
+    def test_ge_warnings_rejected(self):
+        self._governed_reject(f"{G}/warnings[0]", "a", "b")
+
+    def test_ge_limitations_rejected(self):
+        self._governed_reject(f"{G}/limitations/eps_yoy", "a", "b")
+
+    def test_other_migration_gets_no_governed_exception(self):
+        # STEP 24.4 grammar allows operating_income_yoy leaves, but that migration has no governed scope
+        out = self._governed_reject(f"{G}/components/operating_income_yoy/value", 0.1, 0.2, mig=P25_MIG)
+        self.assertIn("cannot carry expected_patch entries for this migration", out)
+        out = self._governed_reject(f"{G}/components/revenue_yoy/value", 0.1, 0.2, mig=P25_MIG)
+
+    def test_paths_outside_grammar_stay_input_errors_on_governed_ticker(self):
+        for path in (f"{G}/components/fcf_yoy/value", f"{G}/components/operating_income_yoy/value",
+                     "/stages/derived_metrics/derived/derived_metrics/fcf/value", f"{EPS}/foo", f"{G}/components/revenue_yoy/value",
+                     "/stages/data_sufficiency/sufficiency/fcf_yoy/detail"):
+            with self.subTest(path=path):
+                code, out = self._run(gov_pair(None), [{"file": "GE.json", "path": path, "op": "replace", "base": 1, "new": 2}])
+                self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out)
+
+    def test_mixed_allowed_and_forbidden_fails_as_a_whole(self):
+        p = gov_pair("basis")
+        fb = ck.flat(p.res["BASE"]["GE"]); fb[f"{G}/growth/score"] = 3.0; p.res["BASE"]["GE"] = ck.unflatten(fb)
+        fn = ck.flat(p.res["NEW"]["GE"]); fn[f"{G}/growth/score"] = 3.5; p.res["NEW"]["GE"] = ck.unflatten(fn)
+        E = p25_entries(p)
+        self.assertTrue(any(e["path"] == f"{G}/growth/score" for e in E))
+        code, out = self._run(p, E)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)                 # the eps leaf alone does not make D2 pass
+        self.assertIn("governed ticker", out)
+
+    def test_binding_mismatch_still_fails(self):
+        p = gov_pair("basis"); prof = n_profile(p25_entries(p)); prof["expected_patch"]["binding"]["new_github_run_id"] = "999"
+        code, out = run_pair(p, profile=prof)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    def test_value_mismatch_still_fails(self):
+        p = gov_pair("basis"); E = p25_entries(p)
+        for e in E:
+            if self._ge(e): e["new"] = "same_filing_comparative_missing"
+        code, out = self._run(p, E)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    def test_dropped_or_extra_entry_still_fails(self):
+        p = gov_pair("basis"); E = p25_entries(p)
+        code, out = self._run(p, [e for e in E if not self._ge(e)])                 # GE change left unregistered
+        self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertIn("GE", out)
+        extra = E + [{"file": "GE.json", "path": f"{EPS}/stars", "op": "replace", "base": 3, "new": 4}]   # never realized
+        code, out = self._run(gov_pair("basis"), extra)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    # -- helper rule (dependency on withheld inputs, unknown components, leaf shape)
+    def test_rule_helper(self):
+        W = {"operating_income", "cfo", "capex"}
+        self.assertIsNone(ck.governed_entry_problem(N_MIG, f"{EPS}/previous_value_basis", W))
+        self.assertIsNone(ck.governed_entry_problem(N_MIG, "/stages/data_sufficiency/sufficiency/eps_yoy/detail", W))
+        self.assertIsNone(ck.governed_entry_problem(N_MIG, f"{EPS}/source[0]", W))
+        for path in (f"{G}/growth/score", f"{G}/warnings[0]", f"{G}/limitations/eps_yoy", f"{G}/components/fcf_yoy/value",
+                     f"{G}/components/operating_income_yoy/value", f"{G}/components/revenue_yoy/value", EPS, f"{EPS}/",
+                     f"{EPS}/a/b", "/stages/derived_metrics/derived/derived_metrics/fcf/value", "/stages/data_sufficiency/sufficiency/eps_yoy",
+                     f"{G}/components/eps_yoy_x/value", f"{G}/eps_yoy/value", "/stages/growth/eps_yoy/value",
+                     "/stages/data_sufficiency/eps_yoy/detail"):
+            with self.subTest(path=path):
+                self.assertIsInstance(ck.governed_entry_problem(N_MIG, path, W), str)
+        self.assertIn("depends on withheld", ck.governed_entry_problem(N_MIG, f"{EPS}/value", W | {"diluted_eps"}))
+        for mig in (P25_MIG, "UNKNOWN", None, [], {}):
+            self.assertIsInstance(ck.governed_entry_problem(mig, f"{EPS}/value", W), str)
+
+    def test_input_withheld_in_new_only_still_blocks(self):
+        # withheld inputs are taken from BOTH runs: diluted_eps withheld only in NEW must block the eps entry
+        p = gov_pair("basis")
+        p.res["NEW"]["GE"]["stages"]["eligibility_gate"]["withheld"] = list(W) + ["diluted_eps"]
+        E = [e for e in p25_entries(p) if "/eligibility_gate/" not in e["path"]]
+        code, out = self._run(p, E)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out)
+        self.assertIn("depends on withheld metric(s) ['diluted_eps']", out)
+
+    # -- static parity with production (AST only: no production import, no execution)
+    def test_scope_matches_production_dependency_map(self):
+        """Repository guard: production _GROWTH_METRIC_CONCEPT_DEPENDENCIES and GOVERNED_PATCH_SCOPE must agree."""
+        path = REPO / "src" / "fundamentals" / "orchestrator.py"
+        self.assertEqual(ck.governed_scope_parity_problems(str(path)), [])
+        self.assertEqual(ck.static_dict(str(path), "_GROWTH_METRIC_CONCEPT_DEPENDENCIES")["eps_yoy"], ("diluted_eps",))
+        self.assertNotIn("src.fundamentals.orchestrator", sys.modules)          # never imported by this check
+
+    def _parity(self, source, scope=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "orchestrator.py")
+            if source is not None:
+                with open(f, "w", encoding="utf-8") as fh: fh.write(source)
+            return ck.governed_scope_parity_problems(f, scope)
+
+    PROD_OK = ('_GROWTH_METRIC_CONCEPT_DEPENDENCIES = {\n    "revenue_yoy": ("revenue",),\n'
+               '    "eps_yoy": ("diluted_eps",),\n    "fcf_yoy": ("cfo", "capex"),\n}\n')
+
+    def test_parity_matching_mapping_passes(self):
+        self.assertEqual(self._parity(self.PROD_OK), [])
+        self.assertEqual(self._parity(self.PROD_OK.replace('("diluted_eps",)', '["diluted_eps"]')), [])   # list literal ok
+
+    def test_parity_changed_production_input_fails(self):
+        for changed in ('("diluted_eps", "shares_outstanding")', '("basic_eps",)', '()'):
+            with self.subTest(changed=changed):
+                probs = self._parity(self.PROD_OK.replace('("diluted_eps",)', changed))
+                self.assertEqual(len(probs), 1); self.assertIn("inputs", probs[0])
+
+    def test_parity_missing_production_component_fails(self):
+        probs = self._parity(self.PROD_OK.replace('    "eps_yoy": ("diluted_eps",),\n', ""))
+        self.assertEqual(len(probs), 1); self.assertIn("not declared in production", probs[0])
+
+    def test_parity_checker_only_component_fails(self):
+        scope = {N_MIG: {"eps_yoy": ("diluted_eps",), "dividend_yoy": ("dividends",)}}
+        probs = self._parity(self.PROD_OK, scope)
+        self.assertEqual(len(probs), 1); self.assertIn("'dividend_yoy' is not declared", probs[0])
+
+    def test_parity_stale_checker_after_production_change_fails(self):
+        stale = {N_MIG: {"eps_yoy": ("diluted_eps",)}}
+        prod = self.PROD_OK.replace('("diluted_eps",)', '("diluted_eps", "weighted_shares")')
+        self.assertTrue(self._parity(prod, stale))
+
+    def test_parity_unverifiable_fails_closed(self):
+        cases = {
+            "file missing": None,
+            "syntax error": "_GROWTH_METRIC_CONCEPT_DEPENDENCIES = {\n",
+            "name absent": "OTHER = {}\n",
+            "not a literal": "_GROWTH_METRIC_CONCEPT_DEPENDENCIES = build()\n",
+            "assigned twice": self.PROD_OK + self.PROD_OK,
+            "not a dict": "_GROWTH_METRIC_CONCEPT_DEPENDENCIES = [1, 2]\n",
+            "bad value type": '_GROWTH_METRIC_CONCEPT_DEPENDENCIES = {"eps_yoy": "diluted_eps"}\n',
+            "non-literal value": '_GROWTH_METRIC_CONCEPT_DEPENDENCIES = {"eps_yoy": tuple(["diluted_eps"])}\n',
+        }
+        for label, src in cases.items():
+            with self.subTest(case=label):
+                probs = self._parity(src)
+                self.assertEqual(len(probs), 1, probs); self.assertTrue(probs[0].startswith("_GROWTH_METRIC_CONCEPT_DEPENDENCIES"), probs)
+
+    def test_dependency_maps_unchanged(self):
+        self.assertEqual(ck.GROWTH_DEPS, {"fcf_yoy": ("cfo", "capex"), "operating_income_yoy": ("operating_income",)})
+        self.assertNotIn("eps_yoy", ck.GROWTH_DEPS)
+        self.assertEqual(ck.GOVERNED_PATCH_SCOPE, {N_MIG: {"eps_yoy": ("diluted_eps",)}})
 
 
 if __name__ == "__main__":
