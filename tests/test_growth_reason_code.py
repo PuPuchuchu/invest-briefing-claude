@@ -58,7 +58,8 @@ BRANCHES = [
 def test_registered_code_set_is_closed_and_disjoint_from_sufficiency_codes():
     assert GROWTH_REASON_CODES == frozenset({
         "NON_NUMERIC_INPUT", "NON_FINITE_INPUT", "NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT",
-        "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER", "NON_FINITE_RESULT"})   # A-2: 8 codes
+        "ZERO_PRIOR_BASE", "NEGATIVE_END_VALUE", "INVALID_PERIOD_PARAMETER", "NON_FINITE_RESULT",
+        "SAME_FILING_COMPARATIVE_UNAVAILABLE"})                     # A-2: 8 codes; STEP 24.6-N: 9
     from src.fundamentals.data_sufficiency import REASON_CODES
     assert not (GROWTH_REASON_CODES & set(REASON_CODES))
 
@@ -77,12 +78,13 @@ def test_years_parameter_branch():
 
 
 def test_every_invalid_call_site_passes_a_registered_literal_code():
-    """18 call sites: 9 from A-1, 1 STEP 24.4 P1 negative-prior branch, and 8 from A-2 (3 NON_FINITE_INPUT,
-    3 NON_FINITE_RESULT result guards, 1 CAGR period check, 1 rating-guard propagation in calculate_growth).
+    """19 call sites: 9 from A-1, 1 STEP 24.4 P1 negative-prior branch, 8 from A-2 (3 NON_FINITE_INPUT,
+    3 NON_FINITE_RESULT result guards, 1 CAGR period check, 1 rating-guard propagation in calculate_growth),
+    and 1 STEP 24.6-N same-filing comparative fail-closed branch (explicit revision).
     The third argument is a string literal in the registered set (never computed)."""
     tree = ast.parse(GROWTH_PY.read_text(encoding="utf-8"))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_build_invalid_metric"]
-    assert len(calls) == 18
+    assert len(calls) == 19
     for c in calls:
         assert len(c.args) == 3 and not c.keywords
         code = c.args[2]

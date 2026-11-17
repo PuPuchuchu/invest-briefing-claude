@@ -1920,7 +1920,7 @@ class MigrationAllowanceV24(unittest.TestCase):
 
     def test_allowance_values_are_the_registered_set(self):
         self.assertEqual(ck.ALLOWANCE_VALUE_SETS["GROWTH_REASON_CODES"], ck.GROWTH_REASON_CODES)
-        self.assertEqual(len(ck.GROWTH_REASON_CODES), 8)         # A-2: + NON_FINITE_RESULT (explicit revision)
+        self.assertEqual(len(ck.GROWTH_REASON_CODES), 9)         # STEP 24.6-N P1: + SAME_FILING_COMPARATIVE_UNAVAILABLE (explicit revision)
 
     def test_c3_accepts_only_the_allowed_coverage_shift(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -2321,11 +2321,12 @@ class ExpectedPatchStep246N(unittest.TestCase):
     def _run(self, p, entries):
         return run_pair(p, profile=n_profile(entries))
 
-    def test_registered_and_mirror_unchanged(self):
+    def test_registered_and_mirror_updated_with_production(self):
         self.assertIn(N_MIG, ck.PATCH_MIGRATIONS)
         self.assertEqual(sorted(ck.PATCH_MIGRATIONS), [P25_MIG, N_MIG])
-        self.assertNotIn(N_UNAVAILABLE, ck.GROWTH_REASON_CODES)               # mirror moves with production in N-P1
-        self.assertEqual(len(ck.GROWTH_REASON_CODES), 8)
+        # N-P1 (explicit revision of the N-P0 test): the mirror gains the code together with production growth.py
+        self.assertIn(N_UNAVAILABLE, ck.GROWTH_REASON_CODES)
+        self.assertEqual(len(ck.GROWTH_REASON_CODES), 9)
 
     def test_exact_patch_passes_for_each_mode(self):
         for mode in ("split", "failclosed", "basis_only"):

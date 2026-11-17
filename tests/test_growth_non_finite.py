@@ -195,4 +195,4 @@ def test_data_sufficiency_and_batch_coverage():
 
 def test_registered_codes():
     assert {"NON_FINITE_INPUT", "NON_FINITE_RESULT"} <= growth.GROWTH_REASON_CODES
-    assert len(growth.GROWTH_REASON_CODES) == 8
+    assert len(growth.GROWTH_REASON_CODES) == 9                  # STEP 24.6-N: + SAME_FILING_COMPARATIVE_UNAVAILABLE

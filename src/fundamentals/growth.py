@@ -4,6 +4,8 @@ from datetime import date, datetime
 import math
 from typing import Any
 
+from src.fundamentals import per_share_comparatives as psc
+
 
 # ============================================================
 # CONFIGURATION
@@ -42,7 +44,26 @@ GROWTH_REASON_CODES = frozenset({
     "NEGATIVE_END_VALUE",
     "INVALID_PERIOD_PARAMETER",
     "NON_FINITE_RESULT",         # A-2: finite inputs whose computed growth is not finite (overflow)
+    "SAME_FILING_COMPARATIVE_UNAVAILABLE",  # STEP 24.6-N: per-share prior-year comparative absent/ambiguous
 })
+
+# STEP 24.6-N: eps_yoy limitation texts, one per state (calculate_growth). The NONPOSITIVE_* text is the
+# pre-existing one and stays accurate: under S2a both values must still be positive (H1 is a separate step).
+EPS_LIMITATION_NONPOSITIVE = (
+    "EPS growth requires positive current and prior-year comparable-quarter values."
+)
+EPS_LIMITATION_MISSING = (
+    "EPS growth requires a current and a prior-year comparable-quarter value; none is available."
+)
+EPS_LIMITATION_COMPARATIVE_MISSING = (           # neutral: also covers unidentified filing / unit / annotation
+    "EPS growth requires a verifiable prior-year comparative from the current quarter's filing."
+)
+EPS_LIMITATION_COMPARATIVE_AMBIGUOUS = (
+    "EPS growth requires a single prior-year comparative in the current quarter's filing; it reports several."
+)
+EPS_LIMITATION_OTHER = (
+    "EPS growth could not be computed from the available values."
+)
 
 
 # ============================================================
@@ -765,6 +786,63 @@ def _calculate_history_yoy(
     return result
 
 
+def _calculate_eps_yoy_same_filing(
+    history: Any,
+) -> dict[str, Any]:
+    """
+    STEP 24.6-N (S2a): eps_yoy with the prior-year value taken from the
+    current quarter's own filing (per_share_comparatives.match_comparative).
+
+    Same pair selection and same calculate_positive_yoy() as the legacy
+    path; only the prior-year VALUE differs. Fail-closed: when the
+    comparative is absent, ambiguous or unverifiable the component is
+    INVALID / SAME_FILING_COMPARATIVE_UNAVAILABLE -- never the own-filing
+    value. previous_value_basis is set whenever a pair exists; with no pair
+    the result is the legacy MISSING without the field.
+    """
+    latest, previous = _select_latest_quarter_pair(history)
+
+    if latest is None:
+        return _build_missing_metric("eps_yoy", "No usable quarterly history found.")
+
+    if previous is None:
+        return _build_missing_metric("eps_yoy", "No prior-year comparable quarter found.")
+
+    status, comparative, reason = psc.match_comparative(latest, previous)
+
+    if status != psc.FOUND:
+        result = _build_invalid_metric("eps_yoy", reason, "SAME_FILING_COMPARATIVE_UNAVAILABLE")
+        result["previous_value_basis"] = psc.BASIS_MISSING
+        return result
+
+    result = calculate_positive_yoy("eps_yoy", latest["value"], comparative)
+
+    if result["status"] == "OK":
+        result["source"] = ["historical", "quarterly"]
+        result["current_period_end"] = _record_period_end(latest)
+        result["previous_period_end"] = _record_period_end(previous)
+
+    result["previous_value_basis"] = psc.BASIS_FOUND
+    return result
+
+
+def _eps_limitation(component: dict[str, Any]) -> str:
+    """STEP 24.6-N: limitation text matching the eps_yoy state (only called when status != OK)."""
+    status = component.get("status")
+    code = component.get("reason_code")
+    if code in ("NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT"):
+        return EPS_LIMITATION_NONPOSITIVE
+    if code == "SAME_FILING_COMPARATIVE_UNAVAILABLE":
+        if component.get("reason") == psc.REASONS[psc.AMBIGUOUS]:
+            return EPS_LIMITATION_COMPARATIVE_AMBIGUOUS
+        return EPS_LIMITATION_COMPARATIVE_MISSING
+    if status == "MISSING":
+        return EPS_LIMITATION_MISSING
+    if status == "INVALID":
+        return EPS_LIMITATION_OTHER
+    return EPS_LIMITATION_NONPOSITIVE        # any other non-OK status (e.g. WITHHELD): pre-existing text, unchanged
+
+
 def _calculate_revenue_cagr(
     revenue_history: Any,
 ) -> dict[str, Any]:
@@ -1271,13 +1349,28 @@ def calculate_growth(
     # EPS YoY
     # --------------------------------------------------------
 
-    components["eps_yoy"] = (
-        _calculate_history_yoy(
-            "eps_yoy",
-            eps_history,
-            positive_only=True,
-        )
+    # STEP 24.6-N: the production orchestrator opts in to the same-filing
+    # comparative policy on the EPS history; callers that pass plain history
+    # (no policy key) keep the legacy computation. An unknown policy value is
+    # a programming error, never a silent fallback.
+    eps_policy = (
+        eps_history.get(psc.POLICY_KEY)
+        if isinstance(eps_history, dict)
+        else None
     )
+
+    if eps_policy is None:
+        components["eps_yoy"] = (
+            _calculate_history_yoy(
+                "eps_yoy",
+                eps_history,
+                positive_only=True,
+            )
+        )
+    elif eps_policy == psc.POLICY_SAME_FILING_COMPARATIVE:
+        components["eps_yoy"] = _calculate_eps_yoy_same_filing(eps_history)
+    else:
+        raise ValueError(f"Unknown per-share comparative policy: {eps_policy!r}")
 
     # --------------------------------------------------------
     # FCF YoY
@@ -1334,12 +1427,15 @@ def calculate_growth(
         # component INVALID (not "OK without stars"); it is then excluded by
         # the unchanged weighted-score rule.
         if rated.get("reason_code") == "NON_FINITE_RESULT":
+            basis = component.get("previous_value_basis")
             component = _build_invalid_metric(
                 metric_name,
                 rated["reason"],
                 "NON_FINITE_RESULT",
             )
             component["stars"] = None
+            if basis is not None:                 # STEP 24.6-N: provenance survives the A-2 replacement
+                component["previous_value_basis"] = basis
             components[metric_name] = component
             continue
 
@@ -1374,8 +1470,9 @@ def calculate_growth(
         != "OK"
     ):
         limitations["eps_yoy"] = (
-            "EPS growth requires positive current "
-            "and prior-year comparable-quarter values."
+            _eps_limitation(components["eps_yoy"])
+            if eps_policy is not None
+            else EPS_LIMITATION_NONPOSITIVE      # legacy callers: text unchanged
         )
 
     if (

@@ -222,13 +222,16 @@ from src.fundamentals.finance_lease_evidence_registry import (
     resolve_lease_scope_mismatch_with_evidence,
 )
 from src.fundamentals.growth import calculate_growth
+from src.fundamentals import per_share_comparatives
 from src.fundamentals.peer_classification import get_peer_mapping_as_of
 from src.fundamentals.point_in_time import (
+    as_of_concept_data,
     coerce_evaluation_date,
     gate_companyfacts_as_of,
     get_point_in_time_history,
 )
 from src.fundamentals.sec_normalizer import (
+    find_concept,
     normalize_company,
     validate_companyfacts,
     validate_normalized_data,
@@ -479,6 +482,53 @@ def _pit_history_for_selected_concept(
         concept,
         evaluation_date,
     )
+
+
+def _with_same_filing_comparatives(
+    eps_slice: dict,
+    gated_data: dict,
+    metric_result: dict | None,
+    sec_cutoff: date,
+) -> dict:
+    """
+    STEP 24.6-N: return a copy of growth's diluted-EPS history slice with
+    per_share_comparatives annotations on every quarterly record and the
+    opt-in policy key set. concept_data is the selected concept, re-gated to
+    sec_cutoff (as_of_concept_data is idempotent on gated data), i.e. exactly
+    the observations sec_history reconstructed from. No selection logic of
+    its own: per_share_comparatives.annotate_records() does the matching.
+    """
+    concept_data = None
+    if isinstance(metric_result, dict) and metric_result.get("status") == "OK":
+        namespace, concept = metric_result.get("namespace"), metric_result.get("concept")
+        if namespace and concept:
+            found = find_concept(gated_data, namespace, concept)
+            if found is not None:
+                concept_data = as_of_concept_data(found, sec_cutoff)
+
+    unit = metric_result.get("unit") if isinstance(metric_result, dict) else None
+
+    result = dict(eps_slice)
+    result["quarterly"] = per_share_comparatives.annotate_records(
+        list(eps_slice.get("quarterly") or []), concept_data, sec_cutoff, unit
+    )
+    result[per_share_comparatives.POLICY_KEY] = per_share_comparatives.POLICY_SAME_FILING_COMPARATIVE
+    return result
+
+
+def _assert_per_share_policy_applied(growth_result: dict) -> None:
+    """
+    STEP 24.6-N production guard: eps_yoy's status, reason_code and
+    previous_value_basis must form one of the combinations the same-filing
+    comparative policy produces (per_share_comparatives.
+    basis_consistency_problem). A computed pair without a basis means the
+    policy was not applied; that, or any contradictory combination, is
+    raised -- never silently accepted as the legacy own-filing value.
+    """
+    component = ((growth_result or {}).get("components") or {}).get("eps_yoy")
+    problem = per_share_comparatives.basis_consistency_problem(component)
+    if problem is not None:
+        raise RuntimeError(f"STEP 24.6-N guard: {problem}")
 
 
 def _growth_historical_slice(history: dict | None) -> dict[str, list[dict]]:
@@ -945,7 +995,22 @@ def run_fundamentals_pipeline(
         concept_found_by_concept[concept_key] = concept_history is not None
         growth_historical[concept_key] = _growth_historical_slice(concept_history)
 
+    # STEP 24.6-N (S2a): per-share YoY takes the prior-year value from the
+    # current quarter's own filing. The comparatives are read from the SAME
+    # PIT-gated concept data sec_history reconstructed the history from
+    # (re-gated idempotently), and attached to COPIES of the quarterly
+    # records; the opt-in policy key makes growth.py apply the fail-closed
+    # S2a path. The guard below turns any wiring gap into an explicit error
+    # instead of a silent fallback to the own-filing value.
+    growth_historical["diluted_eps"] = _with_same_filing_comparatives(
+        growth_historical.get("diluted_eps") or {"annual": [], "quarterly": []},
+        gated_companyfacts,
+        normalized["metrics"].get("diluted_eps"),
+        sec_cutoff,
+    )
+
     growth_result = calculate_growth(normalized, derived, historical=growth_historical)
+    _assert_per_share_policy_applied(growth_result)
     stages["growth"] = {
         "status": STAGE_OK,
         "growth": growth_result,
