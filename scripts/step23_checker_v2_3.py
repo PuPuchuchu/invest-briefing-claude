@@ -1,7 +1,11 @@
-"""STEP 23 Checker v2.5 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.6 (read-only): DEC055 gate materialization + same-date batch pair comparison.
 
 v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
 newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
+v2.6 (STEP 24.6-N P0b): a governed ticker (withheld metrics) may carry expected_patch entries ONLY for the
+component-scoped leaves GOVERNED_PATCH_SCOPE explicitly lists for that migration, and only when the component's
+declared input metrics are not withheld in either run; Growth aggregate / warnings / limitations, derived metrics and
+every other path stay forbidden on governed tickers (fail closed, input-independent of GROWTH_DEPS gaps).
 v2.5 (STEP 24.4 P0): optional profile field "expected_patch" lets D2/C3 (and a new D9 for coverage.json) accept an
 EXACT, pair-bound list of leaf changes {file, path, op, base, new} whose paths come from a per-migration_id leaf
 allowlist; BASE and NEW must both equal the registered values. Without that field the output is exactly v2.4's.
@@ -38,7 +42,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.5"
+VERSION = "checker_v2.6"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -139,6 +143,37 @@ PATCH_MIGRATIONS = {
             r"|^/data_sufficiency/eps_yoy/by_reason_code(/NO_REASON_CODE)?$"),
     },
 }
+# v2.6 (STEP 24.6-N P0b): component-scoped expected_patch on governed tickers. Per migration: component -> the
+# metrics it is computed from (explicit; a component absent here is never allowed, even if absent from GROWTH_DEPS).
+# An entry on a governed ticker is accepted only if its path is one of the component's container leaves below, the
+# path is in the migration grammar (checked separately), and none of the declared inputs is withheld in either run.
+GOVERNED_PATCH_SCOPE = {
+    "STEP24_6_N_SAME_FILING_COMPARATIVE": {"eps_yoy": ("diluted_eps",)},
+}
+GOVERNED_PATCH_CONTAINERS = ("/stages/growth/growth/components/", "/stages/data_sufficiency/sufficiency/")
+
+
+def governed_entry_problem(migration_id, path, withheld) -> str | None:
+    """None if a governed ticker may carry this expected_patch entry (v2.6), else the reason (fail closed)."""
+    scope = GOVERNED_PATCH_SCOPE.get(migration_id) if isinstance(migration_id, str) else None
+    if not scope:
+        return "governed ticker (withheld metrics) cannot carry expected_patch entries for this migration"
+    for container in GOVERNED_PATCH_CONTAINERS:
+        if not path.startswith(container):
+            continue
+        rest = path[len(container):]
+        comp, sep, leaf = rest.partition("/")
+        if not sep or not leaf or comp not in scope:
+            break
+        if not re.fullmatch(r"[a-z_]+(\[[0-9]\])?", leaf):
+            break
+        hit = sorted(set(scope[comp]) & set(withheld))
+        if hit:
+            return f"governed ticker: {comp} depends on withheld metric(s) {hit}"
+        return None
+    return "governed ticker: only component-scoped leaves of an independent component may carry expected_patch entries"
+
+
 # container paths (flat leaf only while empty): the only places [] / {} may appear as a patch value
 PATCH_CONTAINER_LEAF = {"warnings": [], "by_reason_code": {}, "limitations": {}}
 EXPECTED_PATCH = "EXPECTED_PATCH"
@@ -1253,8 +1288,9 @@ class Checker:
     # ---------- v2.5 expected patch (shared by C3, D2 and D9)
     def patch(self):
         """(patch, entries, realized, problems). Cached. realized = entries whose BASE leaf equals `base` AND whose NEW
-        leaf equals `new` (type-strict; ABSENT = leaf does not exist). A ticker entry also needs the ticker in both runs
-        and outside governance (no withheld metric in either run). Every unrealized entry is a problem (FAIL)."""
+        leaf equals `new` (type-strict; ABSENT = leaf does not exist). A ticker entry also needs the ticker in both runs;
+        on a governed ticker (withheld metric in either run) only governed_entry_problem()-approved component leaves
+        are allowed (v2.6). Every unrealized entry is a problem (FAIL)."""
         if hasattr(self, "_patch_cache"): return self._patch_cache
         pt = (self.profile or {}).get("expected_patch")
         entries, realized, problems = [], set(), []
@@ -1283,8 +1319,11 @@ class Checker:
                         t = f[:-5]
                         if t not in self.base.results or t not in self.new.results:
                             problems.append(f"{t}: not an OK ticker in both runs"); continue
-                        if gate(self.base.results[t]).get("withheld") or gate(self.new.results[t]).get("withheld"):
-                            problems.append(f"{t}: governed ticker (withheld metrics) cannot carry expected_patch entries"); continue
+                        withheld = set(gate(self.base.results[t]).get("withheld") or []) | set(gate(self.new.results[t]).get("withheld") or [])
+                        if withheld:
+                            why = governed_entry_problem(pt["migration_id"], pa, withheld)
+                            if why is not None:
+                                problems.append(f"{t}{pa}: {why}"); continue
                     fb, fn = fl(self.base, f), fl(self.new, f)
                     where = f"{f[:-5] if f != COVERAGE_FILE else f}{pa}"
                     if fb is None or fn is None: problems.append(f"{where}: document missing"); continue
@@ -1680,6 +1719,32 @@ def static_dict(path, name):
     found += [n.value for n in tree.body if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name and n.value]
     if len(found) != 1: raise ValueError(f"{name}: {len(found)} top-level assignments")
     return ast.literal_eval(found[0])
+
+
+# v2.6 (STEP 24.6-N P0b): GOVERNED_PATCH_SCOPE's component -> input declarations must equal production's own map.
+GOVERNED_SCOPE_SOURCE = {"file": "src/fundamentals/orchestrator.py", "name": "_GROWTH_METRIC_CONCEPT_DEPENDENCIES"}
+
+
+def governed_scope_parity_problems(path, scope=None) -> list[str]:
+    """Static (AST, no import, no execution) parity of GOVERNED_PATCH_SCOPE with production's
+    _GROWTH_METRIC_CONCEPT_DEPENDENCIES in `path`. [] = every scoped component exists in production with exactly the
+    same input metrics. Anything unverifiable is a problem (fail closed)."""
+    scope = GOVERNED_PATCH_SCOPE if scope is None else scope
+    name = GOVERNED_SCOPE_SOURCE["name"]
+    try:
+        prod = static_dict(path, name)
+    except (OSError, SyntaxError, ValueError, TypeError, UnicodeDecodeError) as e:
+        return [f"{name} not statically verifiable ({type(e).__name__}: {e})"]
+    if not isinstance(prod, dict) or not all(isinstance(k, str) and isinstance(v, (tuple, list)) for k, v in prod.items()):
+        return [f"{name} is not a literal dict of component -> input tuples"]
+    problems = []
+    for mig, comps in sorted(scope.items()):
+        for comp, inputs in sorted(comps.items()):
+            if comp not in prod:
+                problems.append(f"{mig}: component {comp!r} is not declared in production {name}")
+            elif tuple(prod[comp]) != tuple(inputs):
+                problems.append(f"{mig}: {comp!r} inputs {tuple(inputs)} != production {tuple(prod[comp])}")
+    return problems
 
 
 def mapping_drift(repo_root):
