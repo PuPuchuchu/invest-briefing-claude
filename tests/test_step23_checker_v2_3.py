@@ -1812,7 +1812,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.6")             # STEP 24.6-N P0b (explicit revision; was v2.5)
+        self.assertEqual(ck.VERSION, "checker_v2.7")             # STEP 24.6 D9 patchless gap (explicit revision; was v2.6)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -1957,6 +1957,9 @@ G = "/stages/growth/growth"
 OPI = f"{G}/components/operating_income_yoy"
 
 
+D9_STRICT = "D9 coverage.json: no change outside the C1/C3-delegated stage blocks (same evaluation date)"
+
+
 def p25_pair(change=True):
     """Same-policy BASE/NEW pair; AAPL carries a realistic Growth block. With change=True NEW applies the STEP 24.4
     policy to AAPL operating_income_yoy (OK -> INVALID) together with its full cascade."""
@@ -2041,17 +2044,24 @@ class ExpectedPatchV25(unittest.TestCase):
     def test_without_patch_the_change_fails_like_v23(self):
         code, out = run_pair(self.p, profile=P25_PROFILE)
         self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(verdict(out, "C3"), "FAIL")
-        self.assertIn("D2 ticker JSON: no data change (same evaluation date)", out); self.assertIsNone(verdict(out, "D9"))
+        # v2.7 (explicit revision): without expected_patch D9 now runs in its strict form. The change lives only in the
+        # delegated growth block, so strict D9 PASSes and C3 / D2 still FAIL it (was: no D9 line at all)
+        self.assertIn("D2 ticker JSON: no data change (same evaluation date)", out); self.assertEqual(verdict(out, "D9"), "PASS", out)
+        self.assertIn(D9_STRICT, out); self.assertNotIn("except expected_patch", out)
         code, out = run_pair(self.p, profile=None)
-        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertIsNone(verdict(out, "D9"))
+        self.assertEqual(verdict(out, "D2"), "FAIL"); self.assertEqual(verdict(out, "C3"), "FAIL"); self.assertIn(D9_STRICT, out)
 
     def test_without_patch_clean_pair_output_has_no_v25_lines(self):
         code, out = run_pair(p25_pair(change=False), profile=P25_PROFILE)
-        self.assertEqual(code, 0, out); self.assertNotIn("expected_patch", out); self.assertNotIn("D9", out)
+        # v2.7 (explicit revision): the strict D9 line is present and PASSes (was: no D9 line)
+        self.assertEqual(code, 0, out); self.assertNotIn("expected_patch", out)
+        self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertIn(D9_STRICT, out)
 
     def test_v24_allowance_untouched(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
-        self.assertEqual(verdict(out, "D2"), "PASS", out); self.assertIsNone(verdict(out, "D9"))
+        # v2.7 (explicit revision): allowance mode now also runs strict D9 (was: no D9 line); C3 still governs growth
+        self.assertEqual(verdict(out, "D2"), "PASS", out); self.assertEqual(verdict(out, "C3"), "PASS", out)
+        self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertIn(D9_STRICT, out)
 
     # -- binding
     def test_binding_mismatch_fails(self):
@@ -2387,7 +2397,8 @@ class ExpectedPatchStep246N(unittest.TestCase):
 
     def test_without_patch_the_n_change_fails_like_v23(self):
         code, out = run_pair(n_pair("basis_only"), profile=P25_PROFILE)
-        self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertIsNone(verdict(out, "D9"))
+        # v2.7 (explicit revision): strict D9 runs and PASSes (ticker-only change); D2 still FAILs (was: no D9 line)
+        self.assertEqual(verdict(out, "D2"), "FAIL", out); self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertIn(D9_STRICT, out)
 
 
 
@@ -2659,6 +2670,169 @@ print(json.dumps({"problems": problems, "attempts": attempts,
         self.assertEqual(ck.GROWTH_DEPS, {"fcf_yoy": ("cfo", "capex"), "operating_income_yoy": ("operating_income",)})
         self.assertNotIn("eps_yoy", ck.GROWTH_DEPS)
         self.assertEqual(ck.GOVERNED_PATCH_SCOPE, {N_MIG: {"eps_yoy": ("diluted_eps",)}})
+
+
+
+# ---------------------------------------------------------------- v2.7 (STEP 24.6): strict D9 without expected_patch
+def _set(path, value):
+    def f(c):
+        keys = path.strip("/").split("/"); o = c
+        for k in keys[:-1]: o = o.setdefault(k, {})
+        o[keys[-1]] = value
+    return f
+
+
+def _real_blocks(c):
+    """The coverage.json blocks the synthetic fixture lacks, shaped like a real run (2026-11-17 BASE)."""
+    c.update({"schema_version": "coverage.v1", "batch_schema_version": "fundamentals_batch.v2", "generated_at_utc": "T",
+              "inputs": {"metric_eligibility_rows_supplied": True, "finance_lease_evidence_rows_supplied": True, "tickers_filter": None},
+              "universe": {"active_watchlist_rows_considered": 3, "pit_watchlist_members": 3, "requested_not_in_watchlist": [],
+                           "by_execution_status": {"OK": 3}, "tickers_by_execution_status": {"OK": ["AAPL", "GE", "LLY"]},
+                           "watchlist_lookup_status_counts": {}, "evaluated_tickers": 3},
+              "stage_status_counts": {"growth": {"OK": 3}, "debt_tiers": {"OK": 3}},
+              "debt_tiers": {"total_debt_including_finance_leases": {"by_status": {"INCOMPLETE": 2, "OK": 1}, "by_reason_code": {"TIER1_INCOMPLETE": 2}}},
+              "notes": ["Execution OK means the pipeline returned; it does not mean metric data is OK.", "R1/R2 apply to normalized metrics only."]})
+
+
+G_TAMPERS = {
+    "G1 universe execution-status count": _set("/universe/by_execution_status/OK", 4),
+    "G2 universe ticker list addition": lambda c: c["universe"]["tickers_by_execution_status"]["OK"].append("ZZZ"),
+    "G3 stage_status_counts": _set("/stage_status_counts/growth", {"OK": 2, "ERROR": 1}),
+    "G4 debt_tiers": _set("/debt_tiers/total_debt_including_finance_leases/by_status/OK", 2),
+    "G5 inputs flag": _set("/inputs/finance_lease_evidence_rows_supplied", False),
+    "G6 notes": lambda c: c["notes"].__setitem__(0, "tampered"),
+    "G7 schema_version": _set("/schema_version", "coverage.v2"),
+}
+
+
+class StrictD9V27(unittest.TestCase):
+    MODES = ("no_change", "no_profile", "allowance")
+
+    def _pair(self, mode, new_mut=None, base_mut=None):
+        p = mig_pair() if mode == "allowance" else p25_pair(change=False)
+        def mk(extra):
+            def f(c):
+                _real_blocks(c)
+                if extra: extra(c)
+            return f
+        p.cov_mut["BASE"] = mk(base_mut); p.cov_mut["NEW"] = mk(new_mut)
+        prof = {"no_change": P25_PROFILE, "no_profile": None, "allowance": mig_profile()}[mode]
+        return run_pair(p, profile=prof)
+
+    def _d9(self, mode, new_mut=None, base_mut=None):
+        code, out = self._pair(mode, new_mut, base_mut)
+        self.assertIn(D9_STRICT, out)
+        return code, out, verdict(out, "D9")
+
+    # -- clean pairs
+    def test_clean_pairs_pass_in_every_mode(self):
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                code, out, v = self._d9(mode)
+                self.assertEqual(v, "PASS", out); self.assertEqual(code, 0, out)
+                self.assertIn("delegated to C1/C3: /derived_metrics, /growth, /data_sufficiency", out)
+                self.assertIn("run-varying excluded: /generated_at_utc", out)
+
+    # -- G1-G7 in every non-patch mode
+    def test_g1_to_g7_fail_in_no_change_and_allowance_modes(self):
+        for mode in self.MODES:
+            for name, mut in G_TAMPERS.items():
+                with self.subTest(mode=mode, tamper=name):
+                    code, out, v = self._d9(mode, new_mut=mut)
+                    self.assertEqual(v, "FAIL", out); self.assertEqual(code, 1, out)
+                    self.assertEqual(verdict(out, "D2"), "PASS", out)             # ticker files are untouched
+
+    def test_tamper_in_base_only_also_fails(self):
+        code, out, v = self._d9("no_change", base_mut=G_TAMPERS["G1 universe execution-status count"])
+        self.assertEqual(v, "FAIL", out)
+
+    # -- leaf shape
+    def test_leaf_added_and_removed_fail(self):
+        for name, mut in (("added", _set("/universe/new_counter", 1)),
+                          ("removed", lambda c: c["universe"].pop("evaluated_tickers")),
+                          ("top-level added", _set("/extra_block", {"x": 1})),
+                          ("top-level removed", lambda c: c.pop("notes"))):
+            with self.subTest(change=name):
+                self.assertEqual(self._d9("no_change", new_mut=mut)[2], "FAIL")
+
+    def test_list_order_change_fails(self):
+        mut = lambda c: c["universe"]["tickers_by_execution_status"].__setitem__("OK", ["GE", "AAPL", "LLY"])
+        self.assertEqual(self._d9("no_change", new_mut=mut)[2], "FAIL")
+
+    def test_type_strict(self):
+        for name, base_v, new_v, path in (("int vs float", 3, 3.0, "/universe/evaluated_tickers"),
+                                          ("true vs 1", True, 1, "/inputs/metric_eligibility_rows_supplied"),
+                                          ("empty dict vs scalar", {}, 0, "/universe/watchlist_lookup_status_counts"),
+                                          ("empty list vs empty dict", [], {}, "/universe/requested_not_in_watchlist"),
+                                          ("None vs absent-like string", None, "None", "/inputs/tickers_filter")):
+            with self.subTest(case=name):
+                code, out, v = self._d9("no_change", base_mut=_set(path, base_v), new_mut=_set(path, new_v))
+                self.assertEqual(v, "FAIL", out)
+
+    # -- run-varying timestamp: exact path only
+    def test_generated_at_utc_change_passes(self):
+        code, out, v = self._d9("no_change", base_mut=_set("/generated_at_utc", "2026-11-17T11:18:26Z"),
+                                new_mut=_set("/generated_at_utc", "2026-11-17T11:33:22Z"))
+        self.assertEqual(v, "PASS", out)
+
+    def test_timestamp_named_leaf_elsewhere_fails(self):
+        for path in ("/universe/generated_at_utc", "/inputs/run_started_at_utc", "/notes_meta/normalized_at",
+                     "/debt_tiers/fetched_at_utc"):
+            with self.subTest(path=path):
+                self.assertEqual(self._d9("no_change", new_mut=_set(path, "2026-11-17T00:00:00Z"))[2], "FAIL")
+        self.assertEqual(self._d9("no_change", base_mut=_set("/universe/generated_at_utc", "A"),
+                                  new_mut=_set("/universe/generated_at_utc", "B"))[2], "FAIL")
+
+    def test_run_ts_paths_are_exact(self):
+        self.assertEqual(ck.COVERAGE_RUN_TS_PATHS, frozenset({"/generated_at_utc"}))
+
+    # -- delegation: segment-exact
+    def test_change_inside_delegated_blocks_is_left_to_c1_c3(self):
+        for path in ("/growth/aggregate_status_counts/OK", "/derived_metrics/fcf/by_status/OK", "/data_sufficiency/eps_yoy/by_calculation_status/OK"):
+            with self.subTest(path=path):
+                code, out, v = self._d9("no_change", new_mut=_set(path, 99))
+                self.assertEqual(v, "PASS", out)                                # D9 delegates ...
+                self.assertEqual(verdict(out, "C1", "NEW"), "FAIL", out)        # ... and C1 catches the inconsistency
+
+    def test_sibling_of_delegated_block_fails(self):
+        for path in ("/growth_extra", "/growthx/a", "/derived_metrics_v2/x", "/data_sufficiency2", "/universe/growth"):
+            with self.subTest(path=path):
+                self.assertEqual(self._d9("no_change", new_mut=_set(path, 1))[2], "FAIL")
+
+    def test_delegation_helper(self):
+        for p in ("/growth", "/growth/components", "/growth[0]", "/derived_metrics/fcf", "/data_sufficiency"):
+            self.assertTrue(ck.d9_delegated(p), p)
+        for p in ("/growth_extra", "/growthx", "/g", "/universe/growth", "", "/derived", "/data_sufficiency_x/a"):
+            self.assertFalse(ck.d9_delegated(p), p)
+
+    # -- allowance: the legitimate by_reason_code shift stays C3's job
+    def test_allowance_reason_code_shift_passes_d9_and_c3_still_governs_it(self):
+        b, n = mig_pair(), mig_pair()
+        r = {}
+        for lab, pp in (("BASE", b), ("NEW", n)):
+            class R: pass
+            x = R(); x.summary = {"records": [{"ticker": t, "status": "OK"} for t in pp.tickers]}; x.results = pp.res[lab]
+            r[lab] = ck.recompute_stage_coverage(x)["growth"]
+        changed = [k for k in set(ck.flat(r["BASE"])) | set(ck.flat(r["NEW"])) if "by_reason_code" in k
+                   and not ck.same_leaf(ck.flat_get(ck.flat(r["BASE"]), k), ck.flat_get(ck.flat(r["NEW"]), k))]
+        self.assertTrue(changed)                                             # the allowance really moves by_reason_code
+        code, out, v = self._d9("allowance")
+        self.assertEqual(v, "PASS", out); self.assertEqual(verdict(out, "C3"), "PASS", out)
+        # an extra, unaccepted by_reason_code shift in NEW's coverage is still caught (C1), D9 stays out of it
+        mut = lambda c: c["growth"]["components"].setdefault("revenue_yoy", {}).setdefault("by_reason_code", {}).__setitem__("ZERO_PRIOR_BASE", 7)
+        code, out, v = self._d9("allowance", new_mut=mut)
+        self.assertEqual(v, "PASS", out); self.assertEqual(verdict(out, "C1", "NEW"), "FAIL", out); self.assertEqual(code, 1)
+        # C3 still decides the shift: allow only 2 of the 3 additions -> BASE+accepted no longer matches NEW
+        p = mig_pair()
+        p.cov_mut["BASE"] = _real_blocks; p.cov_mut["NEW"] = _real_blocks
+        code, out = run_pair(p, profile=mig_profile(entries=MIG[:2]))
+        self.assertEqual(verdict(out, "C3"), "FAIL", out); self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertEqual(code, 1)
+
+    # -- patch mode untouched
+    def test_patch_mode_keeps_v25_d9(self):
+        p = p25_pair(); code, out = run_pair(p, profile=p25_profile(p25_entries(p)))
+        self.assertEqual(verdict(out, "D9"), "PASS", out); self.assertNotIn(D9_STRICT, out)
+        self.assertIn("D9 coverage.json: no change except expected_patch", out)
 
 
 if __name__ == "__main__":
