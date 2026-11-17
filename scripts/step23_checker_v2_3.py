@@ -1,7 +1,11 @@
-"""STEP 23 Checker v2.6 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.7 (read-only): DEC055 gate materialization + same-date batch pair comparison.
 
 v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
 newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
+v2.7 (STEP 24.6 D9 patchless gap): D9 runs in every D2 mode. Without expected_patch (allowance mode and the no-change
+mode) it is the strict form: every coverage.json leaf outside the delegated stage blocks (/derived_metrics, /growth,
+/data_sufficiency: recomputed by C1, compared by C3) must be identical BASE -> NEW (type-strict, additions and removals
+included); only the exact run-varying path /generated_at_utc is excluded. expected_patch mode's D9 is unchanged.
 v2.6 (STEP 24.6-N P0b): a governed ticker (withheld metrics) may carry expected_patch entries ONLY for the
 component-scoped leaves GOVERNED_PATCH_SCOPE explicitly lists for that migration, and only when the component's
 declared input metrics are not withheld in either run; Growth aggregate / warnings / limitations, derived metrics and
@@ -42,7 +46,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.6"
+VERSION = "checker_v2.7"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -96,6 +100,27 @@ ALLOWANCE_PATH_RE = {"GROWTH_REASON_CODES": re.compile(
 ALLOWANCE_KEYS = {"migration_id", "binding", "value_set", "paths"}
 ALLOWANCE_BINDING_KEYS = {"evaluation_date", "base_github_run_id", "base_github_sha", "new_github_run_id", "new_github_sha"}
 ALLOWED_ADDITION = "ALLOWED_ADDITION"
+# ---------------------------------------------------------------- v2.7 strict D9 (no expected_patch)
+# The only run-varying coverage.json leaf: batch_coverage.build_coverage() writes "generated_at_utc" at the top level
+# (datetime.now) and batch_runner writes the dict unchanged. Exact paths only: the same key name anywhere else is data.
+COVERAGE_RUN_TS_PATHS = frozenset({"/generated_at_utc"})
+# Blocks recomputed from the ticker files by C1 (every run) and compared across runs by C3 (governed tickers excluded,
+# allowance / patch leaves applied). Matched by whole path segment, never by string prefix.
+D9_DELEGATED_BLOCKS = ("/derived_metrics", "/growth", "/data_sufficiency")
+
+
+def d9_delegated(path: str) -> bool:
+    return any(path == d or path.startswith(d + "/") or path.startswith(d + "[") for d in D9_DELEGATED_BLOCKS)
+
+
+def strict_coverage_changes(base_cov, new_cov) -> list[str]:
+    """coverage.json leaf paths that differ BASE -> NEW (type-strict; added and removed leaves included), outside the
+    delegated stage blocks and the exact run-varying paths."""
+    cb, cn = flat(base_cov), flat(new_cov)
+    return sorted(p for p in set(cb) | set(cn)
+                  if p not in COVERAGE_RUN_TS_PATHS and not d9_delegated(p) and not same_leaf(flat_get(cb, p), flat_get(cn, p)))
+
+
 # ---------------------------------------------------------------- v2.5 expected patch (D2 / C3 / D9)
 # Leaf grammar = this checker's flat() paths: "/key" for object members, "[i]" for list items; a leaf is a scalar or an
 # EMPTY container. Patch values are therefore scalars, or [] / {} at the few container paths below; a non-empty object
@@ -1285,6 +1310,14 @@ class Checker:
         self._allow_cache = (allow, want, accepted, problems)
         return self._allow_cache
 
+    # ---------- v2.7 strict D9 (allowance and no-change modes)
+    def check_d9_strict(self, base, new):
+        changed = strict_coverage_changes(base.coverage, new.coverage)
+        self.add("CMP", "D9 coverage.json: no change outside the C1/C3-delegated stage blocks (same evaluation date)",
+                 "PASS" if not changed else "FAIL",
+                 f"{len(changed)} changed coverage paths: {changed[:12]}; delegated to C1/C3: {', '.join(D9_DELEGATED_BLOCKS)}; "
+                 f"run-varying excluded: {', '.join(sorted(COVERAGE_RUN_TS_PATHS))}")
+
     # ---------- v2.5 expected patch (shared by C3, D2 and D9)
     def patch(self):
         """(patch, entries, realized, problems). Cached. realized = entries whose BASE leaf equals `base` AND whose NEW
@@ -1451,9 +1484,11 @@ class Checker:
             detail = (f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}; allowed additions {len(found)}/{len(want)}"
                       + (f"; {'; '.join(allow_problems)}" if allow_problems else ""))
             self.add("CMP", label, "PASS" if not data_changes and not allow_problems else "FAIL", detail)
+            self.check_d9_strict(base, new)
         else:
             self.add("CMP", "D2 ticker JSON: no data change (same evaluation date)", "PASS" if not data_changes else "FAIL",
                      f"{len(data_changes)} changed paths (paths only): {data_changes[:12]}")
+            self.check_d9_strict(base, new)
         self.add("CMP", "D3 frame drift only where source identity is unchanged", "PASS" if not frame_bad else "FAIL",
                  f"frame+identity changes: {frame_bad[:12]}")
         frames = []
