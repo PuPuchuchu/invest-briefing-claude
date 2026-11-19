@@ -1812,7 +1812,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.8")             # STEP 24.6 Phase A exact-path timestamps (explicit revision; was v2.7)
+        self.assertEqual(ck.VERSION, "checker_v2.9")             # P2 Quality v0.2 stage checks (explicit revision; was v2.8)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -2333,7 +2333,8 @@ class ExpectedPatchStep246N(unittest.TestCase):
 
     def test_registered_and_mirror_updated_with_production(self):
         self.assertIn(N_MIG, ck.PATCH_MIGRATIONS)
-        self.assertEqual(sorted(ck.PATCH_MIGRATIONS), [P25_MIG, N_MIG])
+        # v2.9 (explicit revision): the registry gains P2_QUALITY_V02_STAGE; the two earlier migrations are unchanged
+        self.assertEqual(sorted(ck.PATCH_MIGRATIONS), sorted([P25_MIG, N_MIG, "P2_QUALITY_V02_STAGE"]))
         # N-P1 (explicit revision of the N-P0 test): the mirror gains the code together with production growth.py
         self.assertIn(N_UNAVAILABLE, ck.GROWTH_REASON_CODES)
         self.assertEqual(len(ck.GROWTH_REASON_CODES), 9)
@@ -2907,6 +2908,648 @@ class ExactPathTimestampsV28(unittest.TestCase):
         code, out = self._patch_cov()
         for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
         self.assertEqual(code, 0, out)
+
+
+
+# ---------------------------------------------------------------- v2.9: characterization of v2.8 behaviour (written first)
+D7_ID = "D7"
+V28_BODY_SHA = {"profile": "c200a0dd806a1beb89bea2a22f7688cde5e5ea6266d0af5a0585f558730c7566",
+                "none": "934c99f6cbc20df3d212ed988f35bbc2a73a12988146efad40c712505ae16798"}
+
+
+class CharacterizationV28(unittest.TestCase):
+    """Pinned before any v2.9 change: a pair without any Quality output must produce byte-identical check lines
+    (header aside), and D7 keeps its exact v2.8 allow-list when no summary expected_patch entry exists."""
+
+    def test_no_quality_output_identical_to_v28(self):
+        for key, prof in (("profile", PROFILE), ("none", None)):
+            code, out = run_pair(Pair(), profile=prof)
+            body = "\n".join(out.splitlines()[3:])
+            self.assertEqual(code, 0, out)
+            self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), V28_BODY_SHA[key], out)
+
+    def _d7(self, mut):
+        p = Pair(); p.summary_mut["NEW"] = mut
+        return verdict(run_pair(p)[1], D7_ID)
+
+    def test_d7_run_metadata_and_provenance_allowed(self):
+        self.assertEqual(self._d7(lambda s: s["reproducibility"].update(extra_note="x")), "PASS")
+        self.assertEqual(self._d7(lambda s: s["records"][0]["raw_input"].update(sha256="0" * 64)), "PASS")
+        self.assertEqual(self._d7(lambda s: s["records"][0]["raw_input"].update(size_bytes=1)), "PASS")
+
+    def test_d7_record_field_added_or_changed_fails(self):
+        self.assertEqual(self._d7(lambda s: s["records"][0].update(foo=1)), "FAIL")
+        self.assertEqual(self._d7(lambda s: s["records"][0].update(company_type="FINANCIAL")), "FAIL")
+        self.assertEqual(self._d7(lambda s: s["records"][0]["raw_input"].update(path="x.json")), "FAIL")
+        self.assertEqual(self._d7(lambda s: s.update(operational_review={"status": "FAIL", "reasons": []})), "FAIL")
+
+    def test_d7_record_order_change_fails(self):
+        self.assertEqual(self._d7(lambda s: s["records"].reverse()), "FAIL")
+
+    def test_summary_entry_rejected_for_existing_migrations(self):
+        for mig in ("STEP24_4_NEGATIVE_PRIOR_BASE", "STEP24_6_N_SAME_FILING_COMPARATIVE"):
+            pt = {"migration_id": mig, "binding": {"evaluation_date": DATE, "base_github_run_id": RUN_B, "base_github_sha": SHA_B,
+                                                   "new_github_run_id": RUN_N, "new_github_sha": SHA_N},
+                  "entries": [{"file": "summary.json", "path": "/records[0]/foo", "op": "add", "base": {"$absent": True}, "new": 1}]}
+            self.assertTrue(ck.patch_problems(pt), mig)
+
+
+# ---------------------------------------------------------------- v2.9: P2 Quality v0.2 stage (synthetic)
+# q_oracle() is a third, test-only rendering of the P2 design rules (production v0.2 and the checker being the other
+# two) used to build CLEAN synthetic fixtures; every test then mutates a fixture and asserts the checker's verdict.
+# Ratings are fixed at 3.0 (the checker never re-derives value -> rating thresholds; production unit tests do).
+QW = {m: b / 0.90 for m, b in {"operating_margin": 0.20, "net_margin": 0.10, "fcf_margin": 0.20, "fcf_conversion": 0.20,
+                               "net_debt_to_fcf": 0.15, "debt_to_cash": 0.05}.items()}
+QIN = {"operating_margin": (("operating_income", "revenue"), ("operating_margin",)), "net_margin": (("net_income", "revenue"), ("net_margin",)),
+       "fcf_margin": (("cfo", "capex", "revenue"), ("fcf", "fcf_margin")), "fcf_conversion": (("net_income", "cfo", "capex"), ("fcf",)),
+       "net_debt_to_fcf": (("total_debt", "cash", "cfo", "capex"), ("net_debt", "fcf")), "debt_to_cash": (("total_debt", "cash"), ("debt_to_cash",)),
+       "profit_to_cash_consistency": (("net_income", "cfo", "capex", "revenue"), ("fcf_margin", "net_margin"))}
+QM = tuple(QIN)
+QIND = QM[:6]
+PRE = {"WITHHELD": ("WITHHELD", "INPUT_WITHHELD"), "INVALID": ("INVALID", "INPUT_INVALID"),
+       "INCOMPLETE": ("MISSING", "INPUT_INCOMPLETE"), "MISSING": ("MISSING", "INPUT_MISSING")}
+QP = "/stages/quality/quality"
+
+
+def _cls(st):
+    return None if st == "OK" else (st if st in ("MISSING", "INCOMPLETE", "WITHHELD", "INVALID") else "INVALID")
+
+
+def _band(x): return 5 if x >= 4.5 else 4 if x >= 3.5 else 3 if x >= 2.5 else 2 if x >= 1.5 else 1
+
+
+def q_oracle(doc):
+    st = doc["stages"]; nm = st["normalization"]["normalized"]["metrics"]; dm = st["derived_metrics"]["derived"]["derived_metrics"]
+    ev = doc["evaluation_date"]
+    lim = {k: {"status": "NOT_IMPLEMENTED", "reason": "x"} for k in ("liquidity_basis", "roic", "roe", "relative_evaluation",
+                                                                      "historical_evaluation", "staleness_policy")}
+    days = lambda a, b: None if a is None or b is None else (__import__("datetime").date.fromisoformat(a) - __import__("datetime").date.fromisoformat(b)).days
+    okf = [nm[n] for n in ("revenue", "operating_income", "net_income", "cfo", "capex") if (nm.get(n) or {}).get("status") == "OK"]
+    sigs = {tuple(m.get(k) for k in ("period_start", "period_end", "fy", "fp", "period_kind", "period_class")) for m in okf}
+    cons = (len(sigs) <= 1 and len({m.get("unit") for m in okf}) <= 1) if okf else None
+    fend = okf[0]["period_end"] if okf and cons else None
+    fstart = okf[0]["period_start"] if okf and cons else None
+    acc = [m.get("accession") for m in okf]
+    cash = nm.get("cash") or {}
+    cash_as_of = cash.get("period_end") if cash.get("status") == "OK" else None
+    td = nm.get("total_debt") or {}
+    debt = []
+    if td.get("status") == "OK":
+        debt = sorted({c["period_end"] for c in (td.get("component_sum") or {}).get("components", [])} if "component_sum" in td
+                      else {td["components"][k]["period_end"] for k in ("current_debt", "noncurrent_debt")})
+    bdc = (set(debt) == {cash_as_of}) if cash_as_of and debt else None
+    bsa = cash_as_of if bdc else None
+    periods = {"flow_basis": "ANNUAL_FY", "flow_inputs_consistent": cons, "flow_period_start": fstart, "flow_period_end": fend,
+               "flow_age_days": days(ev, fend), "flow_accession_consistent": (None if not okf or not all(isinstance(a, str) and a for a in acc) else len(set(acc)) == 1),
+               "cash_as_of": cash_as_of, "cash_age_days": days(ev, cash_as_of), "debt_as_of": debt, "debt_age_days": [days(ev, d) for d in debt],
+               "balance_sheet_as_of": bsa, "balance_dates_consistent": bdc}
+    comps = {}
+    for m in QM:
+        c = {"metric": m, "status": None, "value": None, "rating": None, "stars": None, "weight": QW.get(m, 0.0), "reason_code": None,
+             "upstream_reason_code": None, "upstream_inputs": [], "role": "INFORMATIONAL" if m == "profit_to_cash_consistency" else "INDEPENDENT"}
+        if m == "profit_to_cash_consistency": c["duplicate_of"] = "fcf_conversion"
+        if m in ("net_debt_to_fcf", "debt_to_cash"): c["liquidity_basis"] = "CASH_AND_CASH_EQUIVALENTS_ONLY"
+        if m == "net_debt_to_fcf":
+            nd = dm.get("net_debt") or {}
+            c.update(net_debt_sign=(("ZERO" if nd["value"] == 0 else "NEGATIVE" if nd["value"] < 0 else "POSITIVE")
+                                    if nd.get("status") == "OK" else None), mixed_period_ratio=True,
+                     cash_flow_gap_days=days(cash_as_of, fend), debt_flow_gap_days=[days(d, fend) for d in debt] if fend else [],
+                     balance_flow_gap_days=days(bsa, fend) if bsa else None)
+        comps[m] = c
+        items = [(x, nm.get(x) or {}) for x in QIN[m][0]] + [(x, dm.get(x) or {}) for x in QIN[m][1]]
+        bad = [(x, it, _cls(it.get("status"))) for x, it in items if _cls(it.get("status"))]
+        if bad:
+            c["upstream_inputs"] = [{"metric": x, "status": it.get("status"), "reason_code": it.get("reason_code")} for x, it, _k in bad]
+            bad.sort(key=lambda b: ("WITHHELD", "INVALID", "INCOMPLETE", "MISSING").index(b[2]))
+            x, it, k = bad[0]
+            c["status"], pre = PRE[k]; c["reason_code"] = f"{pre}:{x}"; c["upstream_reason_code"] = it.get("reason_code") or "UPSTREAM_REASON_UNSPECIFIED"
+            continue
+        v = {x: it.get("value") for x, it in items}
+        if m == "fcf_conversion" and v["net_income"] <= 0: c.update(status="NOT_MEANINGFUL", reason_code="NONPOSITIVE_NET_INCOME"); continue
+        if m == "profit_to_cash_consistency" and v["net_margin"] <= 0: c.update(status="NOT_MEANINGFUL", reason_code="NONPOSITIVE_NET_INCOME"); continue
+        if m == "net_debt_to_fcf" and v["fcf"] <= 0:
+            if v["net_debt"] > 0: c.update(status="OK", rating=1.0, stars=1, reason_code="NONPOSITIVE_FCF_WITH_NET_DEBT")
+            else: c.update(status="NOT_MEANINGFUL", reason_code="NONPOSITIVE_FCF_WITH_NONPOSITIVE_NET_DEBT")
+            continue
+        val = {"fcf_conversion": lambda: v["fcf"] / v["net_income"], "profit_to_cash_consistency": lambda: v["fcf_margin"] / v["net_margin"],
+               "net_debt_to_fcf": lambda: v["net_debt"] / v["fcf"]}.get(m, lambda: float(v[m]))()
+        c.update(status="OK", value=float(val), rating=3.0, stars=3)
+    rated = [m for m in QIND if comps[m]["status"] == "OK"]; nmc = [m for m in QIND if comps[m]["status"] == "NOT_MEANINGFUL"]
+    e = {"status": None, "reason_code": None, "score": None, "stars": None, "scored_weight_fraction": None, "normalized_score_weights": None,
+         "rated_count": len(rated), "not_meaningful_count": len(nmc), "independent_total": 6,
+         "assessed_dimensions": {d: (lambda n, t: "ASSESSED" if n == t else ("PARTIALLY_ASSESSED" if n else "NOT_ASSESSED"))(
+             sum(comps[x]["status"] in ("OK", "NOT_MEANINGFUL") for x in ms), len(ms))
+             for d, ms in {"profitability": ("operating_margin", "net_margin", "fcf_margin"), "cash_conversion": ("fcf_conversion",),
+                           "leverage": ("net_debt_to_fcf", "debt_to_cash")}.items()},
+         "unavailable_components": [{k: comps[m][k] for k in ("metric", "status", "reason_code", "upstream_reason_code")}
+                                    for m in QIND if comps[m]["status"] not in ("OK", "NOT_MEANINGFUL")], "flags": []}
+    fcf, ndi = dm.get("fcf") or {}, dm.get("net_debt") or {}
+    if fcf.get("status") == "OK" and fcf["value"] <= 0 and ndi.get("status") != "OK": e["flags"].append("NONPOSITIVE_FCF_LEVERAGE_UNASSESSED")
+    if len(rated) >= 3 and len(rated) + len(nmc) >= 4:
+        f = sum(QW[m] for m in rated); w = {m: QW[m] / f for m in rated}; sc = sum(comps[m]["rating"] * w[m] for m in rated)
+        e.update(status="OK", score=sc, stars=_band(sc), scored_weight_fraction=f, normalized_score_weights=w)
+    else:
+        e.update(status="MISSING", reason_code="INSUFFICIENT_INDEPENDENT_COMPONENTS")
+    return {"schema_version": "quality_v0.2", "ticker": doc["ticker"], "company_type": doc["company_type"], "evaluation_date": ev,
+            "element": e, "components": comps, "periods": periods, "limitations": lim}
+
+
+def q_ticker(t, policy):
+    doc = ticker(t, policy, frame=None if policy == "V2" else "CY2025")
+    doc["company_type"] = "NON_FINANCIAL"
+    nm = doc["stages"]["normalization"]["normalized"]["metrics"]
+    nm["net_income"] = metric("net_income", 25_000)
+    for k in ("current_debt", "noncurrent_debt"): nm["total_debt"]["components"][k]["period_end"] = "2025-12-31"
+    dm = doc["stages"]["derived_metrics"]["derived"]["derived_metrics"]
+    dm["net_margin"] = ok(0.25)
+    return doc
+
+
+def add_quality(doc):
+    doc["stages"]["quality"] = {"status": "OK", "quality": q_oracle(doc)}
+    return doc
+
+
+class QPair(Pair):
+    """Pair whose tickers carry the inputs Quality reads; with_quality = labels whose tickers carry the Quality stage,
+    summary Quality fields (13 keys) and coverage Quality block (all derived from the ticker files)."""
+
+    def __init__(self, with_quality=("NEW", "BASE")):
+        super().__init__()
+        new = {t: q_ticker(t, "V2") for t in self.tickers}
+        self.res = {"NEW": new, "BASE": copy.deepcopy(new)}          # steady state: same policy (V2) in both runs
+        self.policy["BASE"] = ck.POLICY_V2
+        self.with_quality = with_quality
+        for lab in with_quality:
+            for doc in self.res[lab].values(): add_quality(doc)
+        self.q_sum_mut = {"NEW": None, "BASE": None}
+        self.q_cov_mut = {"NEW": None, "BASE": None}
+
+    def files(self, lab):
+        out = super().files(lab)
+        if lab not in self.with_quality: return out
+        summary = json.loads(out["summary.json"]); cov = json.loads(out["coverage.json"])
+
+        class R: pass
+        r = R(); r.summary = summary; r.results = self.res[lab]; r.coverage = cov; r.label = lab
+        for rec in summary["records"]:
+            if rec["status"] == "OK":
+                rec["stage_statuses"] = {"quality": self.res[lab][rec["ticker"]]["stages"]["quality"].get("status")}
+                rec["quality"] = ck.q_summary_expected(self.res[lab][rec["ticker"]])
+        ss, qc = ck.recompute_quality_coverage(r)
+        cov.setdefault("stage_status_counts", {})["quality"] = ss
+        cov["quality"] = qc
+        if self.q_sum_mut[lab]: self.q_sum_mut[lab](summary)
+        if self.q_cov_mut[lab]: self.q_cov_mut[lab](cov)
+        out["summary.json"] = json.dumps(summary).encode(); out["coverage.json"] = json.dumps(cov).encode()
+        return out
+
+
+Q_IDS = ("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7")
+
+
+def qv(out, cid, lab="NEW"): return verdict(out, cid, lab)
+
+
+class QualityCleanV29(unittest.TestCase):
+    def test_oracle_ge_shape(self):
+        q = q_oracle(q_ticker("GE", "V2"))
+        c = q["components"]
+        self.assertEqual({m: c[m]["status"] for m in QM},
+                         {"operating_margin": "WITHHELD", "net_margin": "OK", "fcf_margin": "WITHHELD", "fcf_conversion": "WITHHELD",
+                          "net_debt_to_fcf": "WITHHELD", "debt_to_cash": "MISSING", "profit_to_cash_consistency": "WITHHELD"})
+        self.assertEqual(c["fcf_margin"]["reason_code"], "INPUT_WITHHELD:cfo")
+        self.assertEqual(c["debt_to_cash"]["reason_code"], "INPUT_MISSING:debt_to_cash")
+        self.assertEqual(q["element"]["status"], "MISSING")
+
+    def test_clean_steady_state_passes(self):
+        code, out = run_pair(QPair(), profile=None)
+        self.assertEqual(code, 0, out)
+        for lab in ("NEW", "BASE"):
+            for c in Q_IDS: self.assertEqual(qv(out, c, lab), "PASS", f"{lab} {c}\n{out}")
+        for c in ("D2", "D7", "D9"): self.assertEqual(verdict(out, c), "PASS", out)
+        self.assertIsNone(verdict(out, "Q0"))
+
+    def test_component_debt_gap_is_review(self):
+        p = QPair()
+        for lab in ("NEW", "BASE"):
+            g = p.res[lab]["GE"]["stages"]["eligibility_gate"]
+            g["withheld"] = g["withheld"] + ["current_debt"]
+            g["unmasked_originals"]["current_debt"] = metric("current_debt", 5_000)
+            p.res[lab]["GE"]["stages"]["normalization"]["normalized"]["metrics"]["current_debt"] = {"metric": "current_debt", "status": "WITHHELD", "value": None}
+        out = run_pair(p, profile=None)[1]
+        self.assertEqual(qv(out, "Q5"), "REVIEW", out)
+
+
+def p2_profile(base_files, new_files, tickers):
+    """Exact add-only expected_patch from two runs' files (test twin of the scratch generator)."""
+    entries = []
+    def diff(f, kind, a, b, skip):
+        fa, fb = ck.flat(a), ck.flat(b)
+        for pth in sorted(set(fa) | set(fb)):
+            if skip(pth): continue
+            va, vb = ck.flat_get(fa, pth), ck.flat_get(fb, pth)
+            if not ck.same_leaf(va, vb):
+                entries.append({"file": f, "path": pth, "op": "add", "base": va, "new": vb})
+    for t in tickers:
+        diff(f"{t}.json", "ticker", json.loads(base_files[f"{t}.json"]), json.loads(new_files[f"{t}.json"]), lambda x: x in ck.TICKER_RUN_TS_PATHS)
+    diff("coverage.json", "coverage", json.loads(base_files["coverage.json"]), json.loads(new_files["coverage.json"]), lambda x: x in ck.COVERAGE_RUN_TS_PATHS)
+    diff("summary.json", "summary", json.loads(base_files["summary.json"]), json.loads(new_files["summary.json"]), lambda x: bool(ck.SUMMARY_RUN_PATHS.fullmatch(x)))
+    prof = {"profile_version": 1, "name": "SYNTH_P2", "applies_to": copy.deepcopy(PROFILE["applies_to"])}
+    prof["applies_to"]["base"]["governance_policy_version"] = ck.POLICY_V2
+    prof["expected_patch"] = {"migration_id": "P2_QUALITY_V02_STAGE",
+                              "binding": {"evaluation_date": DATE, "base_github_run_id": RUN_B, "base_github_sha": SHA_B,
+                                          "new_github_run_id": RUN_N, "new_github_sha": SHA_N}, "entries": entries}
+    return prof
+
+
+class P2MigrationV29(unittest.TestCase):
+    def _pair_prof(self):
+        p = QPair(with_quality=("NEW",))
+        return p, p2_profile(p.files("BASE"), p.files("NEW"), p.tickers)
+
+    def test_migration_run_passes(self):
+        p, prof = self._pair_prof()
+        self.assertEqual(ck.patch_problems(prof["expected_patch"]), [])
+        code, out = run_pair(p, profile=prof)
+        self.assertEqual(code, 0, out)
+        for c in ("D2", "D9", "D7", "C3", "Q0"): self.assertEqual(verdict(out, c), "PASS", f"{c}\n{out}")
+        self.assertIn("expected_patch P2_QUALITY_V02_STAGE", out)
+        self.assertEqual(verdict(out, "Q", "INFO"), "INFO")      # BASE: pre-P2 run
+
+    def test_summary_entry_unrealized_fails_d7(self):
+        p, prof = self._pair_prof()
+        e = next(x for x in prof["expected_patch"]["entries"] if x["file"] == "summary.json" and x["path"].endswith("/quality/rated_count"))
+        e["new"] = e["new"] + 1
+        self.assertEqual(verdict(run_pair(p, profile=prof)[1], "D7"), "FAIL")
+
+    def test_unregistered_summary_change_fails_d7(self):
+        p, prof = self._pair_prof()
+        prof["expected_patch"]["entries"] = [x for x in prof["expected_patch"]["entries"] if not x["path"].endswith("/quality/score")]
+        self.assertEqual(verdict(run_pair(p, profile=prof)[1], "D7"), "FAIL")
+
+    def test_q0_no_valid_ticker_fails(self):
+        p, prof = self._pair_prof()
+        for doc in p.res["NEW"].values():
+            doc["stages"]["quality"]["quality"]["company_type"] = "FINANCIAL"      # in grammar, but not a valid P0 ticker
+        prof = p2_profile(p.files("BASE"), p.files("NEW"), p.tickers)
+        self.assertEqual(verdict(run_pair(p, profile=prof)[1], "Q0"), "FAIL")
+
+    def test_governed_entry_outside_quality_stage_rejected(self):
+        self.assertIsNone(ck.governed_entry_problem("P2_QUALITY_V02_STAGE", f"{QP}/components/fcf_margin/value", {"cfo"}))
+        self.assertIsNotNone(ck.governed_entry_problem("P2_QUALITY_V02_STAGE", "/stages/growth/growth/growth/score", {"cfo"}))
+        self.assertIsNotNone(ck.governed_entry_problem("P2_QUALITY_V02_STAGE", "/stages/qualityX/status", {"cfo"}))
+
+
+def p2_pt(entries):
+    return {"migration_id": "P2_QUALITY_V02_STAGE", "binding": {"evaluation_date": DATE, "base_github_run_id": RUN_B, "base_github_sha": SHA_B,
+                                                                 "new_github_run_id": RUN_N, "new_github_sha": SHA_N}, "entries": entries}
+
+
+def add_e(f, pth, new): return {"file": f, "path": pth, "op": "add", "base": {"$absent": True}, "new": new}
+
+
+class P2GrammarV29(unittest.TestCase):
+    def ok(self, *entries): self.assertEqual(ck.patch_problems(p2_pt(list(entries))), [])
+    def bad(self, *entries): self.assertTrue(ck.patch_problems(p2_pt(list(entries))))
+
+    def test_add_only(self):
+        e = add_e("AAPL.json", "/stages/quality/status", "OK")
+        self.ok(e)
+        self.bad(dict(e, op="replace", base="ERROR"))
+        self.bad(dict(e, op="remove", base="OK", new={"$absent": True}))
+
+    def test_list_bounds_match_maxlen(self):
+        for m, n in ck.P2_LIST_MAXLEN["upstream_inputs"].items():
+            self.ok(add_e("AAPL.json", f"{QP}/components/{m}/upstream_inputs[{n - 1}]/metric", "x"))
+            self.bad(add_e("AAPL.json", f"{QP}/components/{m}/upstream_inputs[{n}]/metric", "x"))
+        for k in ("debt_as_of", "debt_age_days"):
+            self.ok(add_e("AAPL.json", f"{QP}/periods/{k}[1]", 1)); self.bad(add_e("AAPL.json", f"{QP}/periods/{k}[2]", 1))
+        self.ok(add_e("AAPL.json", f"{QP}/element/unavailable_components[5]/metric", "x"))
+        self.bad(add_e("AAPL.json", f"{QP}/element/unavailable_components[6]/metric", "x"))
+        self.bad(add_e("AAPL.json", f"{QP}/element/flags[1]", "x"))
+        self.bad(add_e("summary.json", "/records[0]/quality/flags[1]", "x"))
+
+    def test_containers_exact_path_and_type(self):
+        self.ok(add_e("AAPL.json", f"{QP}/element/flags", []))
+        self.ok(add_e("coverage.json", "/quality/components/net_margin/by_reason_code", {}))
+        self.ok(add_e("summary.json", "/records[3]/quality/flags", []))
+        self.bad(add_e("AAPL.json", f"{QP}/element/flags", {}))                                # wrong type
+        self.bad(add_e("coverage.json", "/quality/element_status_counts/OK", {}))              # not a container path
+        self.bad(add_e("AAPL.json", f"{QP}/element/normalized_score_weights", {}))             # grammar path, not a container
+        self.bad(add_e("AAPL.json", f"{QP}/element/flags", "x"))                               # scalar at a container path
+        self.bad(add_e("coverage.json", "/quality/element_status_counts", {}))                 # unregistered empty block
+        self.bad(add_e("AAPL.json", f"{QP}/element/flags", []), add_e("AAPL.json", f"{QP}/element/flags[0]", "x"))
+
+    def test_error_and_financial_paths_outside_grammar(self):
+        self.bad(add_e("AAPL.json", "/stages/quality/error/type", "ValueError"))
+        self.bad(add_e("AAPL.json", "/stages/quality/quality", None))
+        self.bad(add_e("coverage.json", "/stage_status_counts/quality/ERROR", 1))
+        self.bad(add_e("coverage.json", "/quality/element_status_counts/NOT_APPLICABLE", 1))
+        self.bad(add_e("AAPL.json", f"{QP}/components", {}))
+
+    def test_summary_and_coverage_paths(self):
+        self.ok(add_e("summary.json", "/records[0]/stage_statuses/quality", "OK"), add_e("summary.json", "/records[0]/quality/error_type", None),
+                add_e("coverage.json", "/quality/stage_error_count", 0), add_e("coverage.json", "/quality/stage_error_tickers", []),
+                add_e("coverage.json", "/quality/components/debt_to_cash/by_reason_code/INPUT_INCOMPLETE:cash", 1))
+        self.bad(add_e("summary.json", "/records[0]/quality/extra", 1))
+        self.bad(add_e("summary.json", "/records[0]/raw_input/sha256", "x"))
+        self.bad(add_e("coverage.json", "/quality/components/debt_to_cash/by_reason_code/INPUT_INCOMPLETE:cfo", 1))   # not an input of debt_to_cash
+
+
+def _mut_new(fn, lab="NEW"):
+    p = QPair()
+    fn(p.res[lab])
+    for doc in (p.res["BASE"] if lab == "NEW" else p.res["NEW"]).values(): pass
+    return p
+
+
+def q_of(res, t): return res[t]["stages"]["quality"]["quality"]
+
+
+class QualityChecksV29(unittest.TestCase):
+    """Mutate NEW (and BASE identically where a run-to-run change would only add D2 noise), assert the Q verdict."""
+
+    def _both(self, fn, profile=None):
+        p = QPair()
+        for lab in ("NEW", "BASE"): fn(p, lab)
+        return run_pair(p, profile=profile)[1]
+
+    def test_q1_structure_extra_key(self):
+        out = self._both(lambda p, lab: q_of(p.res[lab], "AAPL")["components"]["net_margin"].update(raw=1))
+        self.assertEqual(qv(out, "Q1"), "FAIL")
+
+    def test_q2_error_stage(self):
+        def f(p, lab):
+            p.res[lab]["LLY"]["stages"]["quality"] = {"status": "ERROR", "quality": None, "error": {"type": "ValueError"}}
+        out = self._both(f)
+        self.assertEqual(qv(out, "Q2"), "FAIL"); self.assertEqual(qv(out, "Q1"), "PASS", out)
+        self.assertEqual(qv(out, "Q6"), "PASS", out); self.assertEqual(qv(out, "Q7"), "PASS", out)
+
+    def test_q2_malformed_error_shape(self):
+        out = self._both(lambda p, lab: p.res[lab]["LLY"]["stages"].update(quality={"status": "ERROR", "quality": None, "error": {"type": "X", "message": "m"}}))
+        self.assertEqual(qv(out, "Q1"), "FAIL")
+
+    def test_q3_tolerance_boundaries(self):
+        for delta, want in ((1e-13, "PASS"), (1e-11, "FAIL")):
+            out = self._both(lambda p, lab: q_of(p.res[lab], "AAPL")["element"].update(score=q_of(p.res[lab], "AAPL")["element"]["score"] + delta))
+            self.assertEqual(qv(out, "Q3"), want, f"{delta}\n{out}")
+
+    def test_q3_stars_band_boundary(self):
+        self.assertEqual(ck.q_band(3.5), 4); self.assertEqual(ck.q_band(3.4999999999999996), 3)
+        self.assertEqual(ck.q_band(4.5), 5); self.assertEqual(ck.q_band(1.4999999999999998), 1)
+
+    def test_q3_mutations(self):
+        cases = {
+            "weight": lambda q: q["components"]["net_margin"].update(weight=0.2),
+            "ptc weight": lambda q: q["components"]["profit_to_cash_consistency"].update(weight=0.1),
+            "fraction": lambda q: q["element"].update(scored_weight_fraction=0.9),
+            "weights keys": lambda q: q["element"]["normalized_score_weights"].pop("net_margin"),
+            "stars": lambda q: q["element"].update(stars=1),
+            "rating range": lambda q: q["components"]["debt_to_cash"].update(rating=5.5, stars=5),
+            "dims": lambda q: q["element"]["assessed_dimensions"].update(leverage="NOT_ASSESSED"),
+            "counts": lambda q: q["element"].update(rated_count=5),
+            "flags": lambda q: q["element"].update(flags=["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"]),
+            "unavailable": lambda q: q["element"]["unavailable_components"].append({"metric": "net_margin", "status": "OK", "reason_code": None, "upstream_reason_code": None}),
+            "net_debt_sign": lambda q: q["components"]["net_debt_to_fcf"].update(net_debt_sign="NEGATIVE"),
+            "ok with reason": lambda q: q["components"]["net_margin"].update(reason_code="NON_FINITE_INPUT"),
+            "non-ok with value": lambda q: q["components"]["net_margin"].update(status="INVALID", reason_code="NON_FINITE_INPUT"),
+        }
+        for name, fn in cases.items():
+            with self.subTest(name):
+                out = self._both(lambda p, lab: fn(q_of(p.res[lab], "AAPL")))
+                self.assertEqual(qv(out, "Q3"), "FAIL", out)
+
+    def test_q4_periods(self):
+        cases = {
+            "flow end": lambda q: q["periods"].update(flow_period_end="2025-06-30"),
+            "age": lambda q: q["periods"].update(flow_age_days=1),
+            "debt extra": lambda q: (q["periods"]["debt_as_of"].append("2024-12-31"), q["periods"]["debt_age_days"].append(1)),
+            "gap": lambda q: q["components"]["net_debt_to_fcf"].update(cash_flow_gap_days=5),
+            "accession": lambda q: q["periods"].update(flow_accession_consistent=False),
+        }
+        for name, fn in cases.items():
+            with self.subTest(name):
+                self.assertEqual(qv(self._both(lambda p, lab: fn(q_of(p.res[lab], "AAPL"))), "Q4"), "FAIL")
+
+    def test_q4_invalid_input_date_is_structure_fail(self):
+        def f(p, lab):
+            p.res[lab]["AAPL"]["stages"]["normalization"]["normalized"]["metrics"]["total_debt"]["components"]["current_debt"]["period_end"] = "2025-02-30"
+        self.assertEqual(qv(self._both(f), "Q4"), "FAIL")
+
+    def test_q6_coverage(self):
+        cases = {"count": lambda c: c["quality"]["element_status_counts"].update(OK=99),
+                 "zero key": lambda c: c["quality"]["flag_counts"].update(X=0),
+                 "missing N3 key": lambda c: c["quality"].pop("stage_error_tickers"),
+                 "stage counts": lambda c: c["stage_status_counts"]["quality"].update(OK=1),
+                 "empty instead of absent": lambda c: c["quality"]["components"]["net_margin"]["by_reason_code"].update(NO_REASON_CODE=1)}
+        for name, fn in cases.items():
+            with self.subTest(name):
+                p = QPair(); p.q_cov_mut["NEW"] = fn
+                self.assertEqual(qv(run_pair(p, profile=None)[1], "Q6"), "FAIL")
+
+    def test_q6_recompute_edge_rules(self):
+        class R: pass
+        r = R(); p = QPair()
+        r.results = copy.deepcopy(p.res["NEW"])
+        r.results["LLY"]["stages"]["quality"] = {"status": "ERROR", "quality": None, "error": {"type": "ValueError"}}
+        r.results["AAPL"]["stages"]["quality"]["status"] = None
+        r.summary = {"records": [{"ticker": t, "status": "OK"} for t in p.tickers] + [{"ticker": "ZZZ", "status": "ERROR"}]}
+        ss, qc = ck.recompute_quality_coverage(r)
+        self.assertEqual(ss, {"null": 1, "OK": 1, "ERROR": 1})
+        self.assertEqual((qc["stage_error_count"], qc["stage_error_tickers"]), (1, ["LLY"]))
+        self.assertEqual(sum(qc["element_status_counts"].values()), 2)          # ERROR ticker not in element counts
+
+    def test_q7_summary(self):
+        def rec(s, t): return next(x for x in s["records"] if x["ticker"] == t)
+        cases = {"value": lambda s: rec(s, "AAPL")["quality"].update(score=1.0),
+                 "type": lambda s: rec(s, "AAPL")["quality"].update(stars=float(rec(s, "AAPL")["quality"]["stars"])),
+                 "missing key": lambda s: rec(s, "AAPL")["quality"].pop("error_type"),
+                 "swap": lambda s: rec(s, "AAPL").update(quality=copy.deepcopy(rec(s, "GE")["quality"])),
+                 "stage status": lambda s: rec(s, "AAPL")["stage_statuses"].update(quality="ERROR"),
+                 "duplicate": lambda s: s["records"].append(copy.deepcopy(rec(s, "AAPL"))),
+                 "flags null": lambda s: rec(s, "AAPL")["quality"].update(flags=None)}
+        for name, fn in cases.items():
+            with self.subTest(name):
+                p = QPair(); p.q_sum_mut["NEW"] = fn
+                self.assertEqual(qv(run_pair(p, profile=None)[1], "Q7"), "FAIL")
+
+    def test_q7_error_row(self):
+        p = QPair()
+        for lab in ("NEW", "BASE"):
+            p.res[lab]["LLY"]["stages"]["quality"] = {"status": "ERROR", "quality": None, "error": {"type": "KeyError"}}
+        s = json.loads(p.files("NEW")["summary.json"])
+        row = next(x for x in s["records"] if x["ticker"] == "LLY")["quality"]
+        self.assertEqual((row["_available"], row["stage_status"], row["error_type"], row["flags"], row["score"]), (False, "ERROR", "KeyError", [], None))
+
+
+class QGapsV29(unittest.TestCase):
+    """Rules found unexercised by the v2.9 code-mutant run (accession null semantics, upstream item copy)."""
+
+    def test_accession_unknown_is_null(self):
+        for recorded, want in ((True, "FAIL"), (None, "PASS")):
+            p = QPair()
+            for lab in ("NEW", "BASE"):
+                p.res[lab]["AAPL"]["stages"]["normalization"]["normalized"]["metrics"]["net_income"]["accession"] = None
+                q_of(p.res[lab], "AAPL")["periods"]["flow_accession_consistent"] = recorded
+            self.assertEqual(qv(run_pair(p, profile=None)[1], "Q4"), want, recorded)
+
+    def test_upstream_item_must_copy_gated_item(self):
+        p = QPair()
+        for lab in ("NEW", "BASE"):
+            ui = q_of(p.res[lab], "GE")["components"]["operating_margin"]["upstream_inputs"]
+            next(x for x in ui if x["metric"] == "operating_margin")["reason_code"] = "STALE_PERIOD"
+        self.assertEqual(qv(run_pair(p, profile=None)[1], "Q3"), "FAIL")
+
+
+class QLeakV29(unittest.TestCase):
+    def _ge(self, fn, both=True):
+        p = QPair()
+        for lab in (("NEW", "BASE") if both else ("NEW",)): fn(p.res[lab]["GE"], q_of(p.res[lab], "GE"))
+        return qv(run_pair(p, profile=None)[1], "Q5")
+
+    def test_clean_ge_sources_reported(self):
+        out = run_pair(QPair(), profile=None)[1]
+        self.assertIn("GE.fcf_margin: cfo=DIRECT", out)
+
+    def test_l0_gate_status_mismatch(self):
+        self.assertEqual(self._ge(lambda d, q: d["stages"]["normalization"]["normalized"]["metrics"]["total_debt"].update(status="WITHHELD")), "FAIL")
+
+    def test_l1_l2(self):
+        self.assertEqual(self._ge(lambda d, q: q["components"]["fcf_margin"].update(value=0.3)), "FAIL")
+        self.assertEqual(self._ge(lambda d, q: q["components"]["fcf_margin"].update(status="MISSING")), "FAIL")
+
+    def test_l3a_derived_not_withheld(self):
+        def f(d, q):
+            d["stages"]["derived_metrics"]["derived"]["derived_metrics"]["fcf"] = ok(0.2)
+        self.assertEqual(self._ge(f), "FAIL")
+
+    def test_l3b_reason_names_non_withheld_source(self):
+        self.assertEqual(self._ge(lambda d, q: q["components"]["fcf_margin"].update(reason_code="INPUT_WITHHELD:revenue")), "FAIL")
+
+    def test_l7_tainted_weight(self):
+        self.assertEqual(self._ge(lambda d, q: q["element"].update(normalized_score_weights={"fcf_margin": 1.0})), "FAIL")
+
+    def test_aux_large_amount(self):
+        self.assertEqual(self._ge(lambda d, q: q["limitations"]["roe"].update(reason=f"x {SECRET['cfo']}")), "FAIL")
+
+    def test_upstream_reason_from_unmasked_original_fails_q3(self):
+        p = QPair()
+        for lab in ("NEW", "BASE"): q_of(p.res[lab], "GE")["components"]["operating_margin"]["upstream_reason_code"] = "STALE_PERIOD"
+        self.assertEqual(qv(run_pair(p, profile=None)[1], "Q3"), "FAIL")
+
+
+def _vec_r(normalized, derived):
+    """A minimal ticker for net_debt_to_fcf reason-code vectors: unspecified inputs are OK."""
+    nm = {k: {"status": "OK", "value": 1.0} for k in ("total_debt", "cash", "cfo", "capex")}
+    dm = {"net_debt": {"status": "OK", "value": 10.0}, "fcf": {"status": "OK", "value": 5.0}}
+    for k, v in normalized.items(): nm[k] = v
+    for k, v in derived.items(): dm[k] = v
+    return {"stages": {"normalization": {"normalized": {"metrics": nm}}, "derived_metrics": {"derived": {"derived_metrics": dm}}}}
+
+
+def _vec_c(status, rc, ui=None, urc=None, value=None, rating=None, stars=None):
+    return {"metric": "net_debt_to_fcf", "status": status, "value": value, "rating": rating, "stars": stars, "weight": QW["net_debt_to_fcf"],
+            "reason_code": rc, "upstream_reason_code": urc, "upstream_inputs": ui or [], "role": "INDEPENDENT", "net_debt_sign": None,
+            "liquidity_basis": "CASH_AND_CASH_EQUIVALENTS_ONLY", "mixed_period_ratio": True, "cash_flow_gap_days": None,
+            "debt_flow_gap_days": [], "balance_flow_gap_days": None}
+
+
+def _u(m, st, rc=None): return {"metric": m, "status": st, "reason_code": rc}
+
+
+WH = {"status": "WITHHELD", "value": None}
+INV = {"status": "INVALID", "value": None, "reason_code": "X_INV"}
+INC_TD = {"status": "INCOMPLETE", "value": None, "reason_code": "STALE_PERIOD"}
+INC_C = {"status": "INCOMPLETE", "value": None, "reason_code": "STALE_PERIOD"}
+MIS = {"status": "MISSING", "value": None}
+U = "UPSTREAM_REASON_UNSPECIFIED"
+# id: (normalized, derived, component, expected verdict, rule id expected in the problem text when FAIL)
+VECTORS = {
+    "T1": ({"cfo": WH, "cash": INV}, {}, _vec_c("WITHHELD", "INPUT_WITHHELD:cfo", [_u("cash", "INVALID", "X_INV"), _u("cfo", "WITHHELD")], U), "PASS", None),
+    "T1'": ({"cfo": WH, "cash": INV}, {}, _vec_c("INVALID", "INPUT_INVALID:cash", [_u("cash", "INVALID", "X_INV"), _u("cfo", "WITHHELD")], "X_INV"), "FAIL", "I7-precedence"),
+    "T2": ({"cash": INV, "total_debt": INC_TD}, {}, _vec_c("INVALID", "INPUT_INVALID:cash", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "INVALID", "X_INV")], "X_INV"), "PASS", None),
+    "T2'": ({"cash": INV, "total_debt": INC_TD}, {}, _vec_c("MISSING", "INPUT_INCOMPLETE:total_debt", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "INVALID", "X_INV")], "STALE_PERIOD"), "FAIL", "I7-precedence"),
+    "T3": ({"total_debt": INC_TD, "cash": MIS}, {}, _vec_c("MISSING", "INPUT_INCOMPLETE:total_debt", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "MISSING")], "STALE_PERIOD"), "PASS", None),
+    "T3'": ({"total_debt": INC_TD, "cash": MIS}, {}, _vec_c("MISSING", "INPUT_MISSING:cash", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "MISSING")], U), "FAIL", "I7-prefix"),
+    "T4a": ({"total_debt": INC_TD, "cash": INC_C}, {}, _vec_c("MISSING", "INPUT_INCOMPLETE:total_debt", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "INCOMPLETE", "STALE_PERIOD")], "STALE_PERIOD"), "PASS", None),
+    "T4b": ({"total_debt": INC_TD, "cash": INC_C}, {}, _vec_c("MISSING", "INPUT_INCOMPLETE:cash", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "INCOMPLETE", "STALE_PERIOD")], "STALE_PERIOD"), "PASS", None),
+    "T4'": ({"total_debt": INC_TD, "cash": INC_C}, {}, _vec_c("MISSING", "INPUT_MISSING:cash", [_u("total_debt", "INCOMPLETE", "STALE_PERIOD"), _u("cash", "INCOMPLETE", "STALE_PERIOD")], "STALE_PERIOD"), "FAIL", "I7-prefix"),
+    "T5": ({"cash": INV}, {}, _vec_c("INVALID", "NON_FINITE_INPUT"), "FAIL", "I7-upstream-set"),
+    "T6": ({}, {"fcf": {"status": "OK", "value": -5.0}, "net_debt": {"status": "OK", "value": 10.0}}, _vec_c("OK", None, value=-2.0, rating=1.0, stars=1), "FAIL", "E1-required"),
+    "T6'": ({}, {"fcf": {"status": "OK", "value": -5.0}, "net_debt": {"status": "OK", "value": 10.0}}, _vec_c("OK", "NONPOSITIVE_FCF_WITH_NET_DEBT", rating=1.0, stars=1), "PASS", None),
+    "T7": ({}, {"fcf": {"status": "OK", "value": 5.0}, "net_debt": {"status": "OK", "value": 10.0}}, _vec_c("OK", "NONPOSITIVE_FCF_WITH_NET_DEBT", rating=1.0, stars=1), "FAIL", "E1-condition"),
+    "T7'": ({}, {"fcf": {"status": "OK", "value": -5.0}, "net_debt": {"status": "OK", "value": -3.0}}, _vec_c("OK", "NONPOSITIVE_FCF_WITH_NET_DEBT", rating=1.0, stars=1), "FAIL", "E1-condition"),
+    "T8": ({"cash": {"status": "STALE", "value": None}}, {}, _vec_c("INVALID", "INPUT_INVALID:cash", [_u("cash", "STALE")], U), "PASS", None),
+    "T9": ({"cfo": WH, "total_debt": INC_TD}, {}, _vec_c("WITHHELD", "INPUT_WITHHELD:cfo", [_u("cfo", "WITHHELD")], U), "FAIL", "I7-upstream-set"),
+}
+
+
+class ReasonCodeVectorsV29(unittest.TestCase):
+    def test_sixteen_vectors(self):
+        self.assertEqual(len(VECTORS), 16)
+        for vid, (nm, dm, comp, want, rule) in VECTORS.items():
+            with self.subTest(vid):
+                got = ck.q_component_problems("T", _vec_r(nm, dm), "net_debt_to_fcf", comp)
+                if want == "PASS": self.assertEqual(got, [], vid)
+                else:
+                    self.assertTrue(got, vid)
+                    self.assertTrue(any(rule in x for x in got), f"{vid}: {got}")
+
+
+class DebtDatesV29(unittest.TestCase):
+    def td(self, **kw):
+        t = {"status": "OK", "value": 20_000, "components": {
+            "current_debt": {"status": "OK", "value": 5_000, "concept": "LongTermDebtCurrent", "period_end": "2026-09-26"},
+            "noncurrent_debt": {"status": "OK", "value": 15_000, "concept": "LongTermDebtNoncurrent", "period_end": "2026-09-26"}}}
+        t.update(kw); return t
+
+    def applied(self, over=None):
+        rows = [{"role": "current_debt", "concept": "LongTermDebtCurrent", "value": 5_000, "period_end": "2026-09-26"},
+                {"role": "short_term_component", "concept": "CommercialPaper", "value": 1_000, "period_end": "2026-09-26"},
+                {"role": "noncurrent_debt", "concept": "LongTermDebtNoncurrent", "value": 15_000, "period_end": "2026-09-26"}]
+        for i, kv in (over or {}).items(): rows[i].update(kv)
+        return self.td(value=sum(r["value"] for r in rows), component_sum={"applied": True, "components": rows})
+
+    def test_not_applied(self):
+        self.assertEqual(ck.q_debt_dates(self.td()), (["2026-09-26"], []))
+        t = self.td(); t["components"]["noncurrent_debt"]["period_end"] = "2026-06-30"
+        self.assertEqual(ck.q_debt_dates(t)[0], ["2026-06-30", "2026-09-26"])
+        self.assertTrue(ck.q_debt_dates(self.td(value=1))[1])
+
+    def test_applied(self):
+        self.assertEqual(ck.q_debt_dates(self.applied()), (["2026-09-26"], []))
+        self.assertTrue(ck.q_debt_dates(self.applied({0: {"concept": "DebtCurrent"}}))[1])           # same date, different concept
+        self.assertTrue(ck.q_debt_dates(self.applied({1: {"period_end": "2026-06-30"}}))[1])          # A-5
+        t = self.applied(); t["component_sum"]["applied"] = False
+        self.assertTrue(ck.q_debt_dates(t)[1])
+        t = self.applied(); t["component_sum"]["components"].pop(1)
+        self.assertTrue(ck.q_debt_dates(t)[1])
+
+    def test_scope_alignment_and_formats(self):
+        self.assertEqual(ck.q_debt_dates(self.td(scope_alignment={"period_end": "2026-09-26"}))[1], [])
+        self.assertTrue(ck.q_debt_dates(self.td(scope_alignment={"period_end": "2026-06-30"}))[1])
+        t = self.td(); t["components"]["current_debt"]["period_end"] = "2026-09-26T00:00:00"
+        self.assertTrue(ck.q_debt_dates(t)[1])
+        self.assertEqual(ck.q_debt_dates({"status": "INCOMPLETE", "scope_alignment": {"period_end": "bad"}}), ([], []))
+
+
+class ValidP0V29(unittest.TestCase):
+    def test_conditions(self):
+        good = add_quality(q_ticker("AAPL", "V2"))
+        self.assertTrue(ck.q_valid_p0(good))
+        missing = copy.deepcopy(good); missing["stages"]["quality"]["quality"]["element"]["status"] = "MISSING"
+        self.assertTrue(ck.q_valid_p0(missing))
+        for name, fn in {"financial": lambda d: (d.update(company_type="FINANCIAL"), d["stages"]["quality"]["quality"].update(company_type="FINANCIAL")),
+                         "empty": lambda d: (d.update(company_type=""), d["stages"]["quality"]["quality"].update(company_type="")),
+                         "unregistered": lambda d: (d.update(company_type="BANK"), d["stages"]["quality"]["quality"].update(company_type="BANK")),
+                         "mismatch": lambda d: d["stages"]["quality"]["quality"].update(company_type="FINANCIAL"),
+                         "error": lambda d: d["stages"].update(quality={"status": "ERROR", "quality": None, "error": {"type": "X"}}),
+                         "component missing": lambda d: d["stages"]["quality"]["quality"]["components"].pop("debt_to_cash"),
+                         "component keys": lambda d: d["stages"]["quality"]["quality"]["components"]["debt_to_cash"].pop("liquidity_basis")}.items():
+            with self.subTest(name):
+                d = copy.deepcopy(good); fn(d)
+                self.assertFalse(ck.q_valid_p0(d))
 
 
 if __name__ == "__main__":

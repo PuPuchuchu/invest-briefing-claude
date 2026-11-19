@@ -1,4 +1,14 @@
-"""STEP 23 Checker v2.8 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+"""STEP 23 Checker v2.9 (read-only): DEC055 gate materialization + same-date batch pair comparison.
+
+v2.9 (P2 Quality v0.2 stage; design r2-r5): expected_patch migration P2_QUALITY_V02_STAGE -- add-only, a grammar
+generated from P2_LIST_MAXLEN, empty containers only at exact registered paths, summary.json entries (D7 then accepts
+exactly the realized registered summary leaves), and governed tickers may carry entries only inside /stages/quality/.
+New check group Q (emitted only when a run carries Quality output, so a pre-P2 pair prints exactly v2.8's lines):
+Q0 P2 run has an evaluated non-FINANCIAL ticker; Q1 exact structure; Q2 no Quality stage ERROR; Q3 internal invariants
+(weights, score, stars, status/reason table, E1); Q4 periods recompute incl. debt-date provenance (I9/I9-D) and strict
+dates; Q5 Q-LEAK (dependency/provenance rules + the F1 amount scan as auxiliary); Q6 coverage Quality block recompute;
+Q7 summary Quality fields = ticker files, joined by ticker. Every Q rule re-derives from the ticker inputs; production
+Quality code is never imported.
 
 v2.4 (STEP 24.3 A-0): optional profile field "allowed_added_paths" lets D2 accept an EXACT, pair-bound list of
 newly added leaf paths (migration allowance). Without that field D2 behaves exactly as in v2.3.
@@ -50,7 +60,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.8"
+VERSION = "checker_v2.9"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -185,7 +195,13 @@ GOVERNED_PATCH_CONTAINERS = ("/stages/growth/growth/components/", "/stages/data_
 
 
 def governed_entry_problem(migration_id, path, withheld) -> str | None:
-    """None if a governed ticker may carry this expected_patch entry (v2.6), else the reason (fail closed)."""
+    """None if a governed ticker may carry this expected_patch entry (v2.6), else the reason (fail closed).
+    v2.9: a migration listed in GOVERNED_PATCH_STAGE allows exactly the leaves of its own new stage (P2: the Quality
+    stage); what those leaves may contain on a governed ticker is checked independently by Q5 (Q-LEAK)."""
+    stage_prefix = GOVERNED_PATCH_STAGE.get(migration_id) if isinstance(migration_id, str) else None
+    if stage_prefix is not None:
+        if path.startswith(stage_prefix): return None
+        return f"governed ticker: only {stage_prefix} leaves may carry expected_patch entries for this migration"
     scope = GOVERNED_PATCH_SCOPE.get(migration_id) if isinstance(migration_id, str) else None
     if not scope:
         return "governed ticker (withheld metrics) cannot carry expected_patch entries for this migration"
@@ -209,6 +225,163 @@ def governed_entry_problem(migration_id, path, withheld) -> str | None:
 PATCH_CONTAINER_LEAF = {"warnings": [], "by_reason_code": {}, "limitations": {}}
 EXPECTED_PATCH = "EXPECTED_PATCH"
 MAX_MEMBER = 512 * 1024 * 1024
+
+
+# ---------------------------------------------------------------- v2.9 (P2): Quality v0.2 stage -- constants and grammar
+# Every value below is the checker's own copy of the P2 design (v3 + v3.1, Checker design r2-r5). Production is never
+# imported; where a value mirrors a production literal, the source is named.
+Q_SCHEMA_VERSION = "quality_v0.2"
+Q_STAGE_PREFIX = "/stages/quality/"
+Q_METRICS = ("operating_margin", "net_margin", "fcf_margin", "fcf_conversion", "net_debt_to_fcf", "debt_to_cash",
+             "profit_to_cash_consistency")
+Q_INDEP = Q_METRICS[:6]
+Q_INFO = {"profit_to_cash_consistency": "fcf_conversion"}
+# per Quality metric: (gated normalized inputs, derived inputs) -- design v3 D1-D7
+Q_INPUTS = {
+    "operating_margin": (("operating_income", "revenue"), ("operating_margin",)),
+    "net_margin": (("net_income", "revenue"), ("net_margin",)),
+    "fcf_margin": (("cfo", "capex", "revenue"), ("fcf", "fcf_margin")),
+    "fcf_conversion": (("net_income", "cfo", "capex"), ("fcf",)),
+    "net_debt_to_fcf": (("total_debt", "cash", "cfo", "capex"), ("net_debt", "fcf")),
+    "debt_to_cash": (("total_debt", "cash"), ("debt_to_cash",)),
+    "profit_to_cash_consistency": (("net_income", "cfo", "capex", "revenue"), ("fcf_margin", "net_margin")),
+}
+Q_USES_FLOW = {m: m != "debt_to_cash" for m in Q_METRICS}
+Q_BASE_WEIGHTS = {"operating_margin": 0.20, "net_margin": 0.10, "fcf_margin": 0.20, "fcf_conversion": 0.20,
+                  "net_debt_to_fcf": 0.15, "debt_to_cash": 0.05}
+Q_WEIGHTS = {m: Q_BASE_WEIGHTS[m] / sum(Q_BASE_WEIGHTS.values()) for m in Q_INDEP}
+Q_DIMS = {"profitability": ("operating_margin", "net_margin", "fcf_margin"), "cash_conversion": ("fcf_conversion",),
+          "leverage": ("net_debt_to_fcf", "debt_to_cash")}
+Q_REASON_CODES = frozenset({
+    "NONPOSITIVE_NET_INCOME", "NONPOSITIVE_FCF_WITH_NET_DEBT", "NONPOSITIVE_FCF_WITH_NONPOSITIVE_NET_DEBT",
+    "FLOW_PERIOD_MISMATCH", "FLOW_UNIT_MISMATCH", "PERIOD_END_AFTER_EVALUATION_DATE", "NON_FINITE_INPUT",
+    "NON_FINITE_RESULT", "INPUT_MISSING", "INPUT_INCOMPLETE", "INPUT_WITHHELD", "INPUT_INVALID",
+    "UPSTREAM_REASON_UNSPECIFIED", "INSUFFICIENT_INDEPENDENT_COMPONENTS", "COMPANY_TYPE_FINANCIAL"})
+Q_FLAG = "NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"
+Q_E1 = "NONPOSITIVE_FCF_WITH_NET_DEBT"
+Q_NM_CODE = {"fcf_conversion": "NONPOSITIVE_NET_INCOME", "profit_to_cash_consistency": "NONPOSITIVE_NET_INCOME",
+             "net_debt_to_fcf": "NONPOSITIVE_FCF_WITH_NONPOSITIVE_NET_DEBT"}
+Q_LOCAL_INVALID = {m: frozenset({"NON_FINITE_INPUT", "PERIOD_END_AFTER_EVALUATION_DATE"}
+                                | ({"FLOW_PERIOD_MISMATCH", "FLOW_UNIT_MISMATCH"} if Q_USES_FLOW[m] else set())
+                                | ({"NON_FINITE_RESULT"} if m in ("fcf_conversion", "net_debt_to_fcf", "profit_to_cash_consistency") else set()))
+                   for m in Q_METRICS}
+# upstream status -> class; class precedence; class -> (component status, reason prefix)   (design v3.1 / r3 §6)
+Q_UPSTREAM_ORDER = ("WITHHELD", "INVALID", "INCOMPLETE", "MISSING")
+Q_UPSTREAM_MAP = {"WITHHELD": ("WITHHELD", "INPUT_WITHHELD"), "INVALID": ("INVALID", "INPUT_INVALID"),
+                  "INCOMPLETE": ("MISSING", "INPUT_INCOMPLETE"), "MISSING": ("MISSING", "INPUT_MISSING")}
+Q_COMPONENT_STATUSES = ("OK", "MISSING", "INVALID", "WITHHELD", "NOT_MEANINGFUL")
+Q_FLOW_INPUTS = ("revenue", "operating_income", "net_income", "cfo", "capex")
+Q_FLOW_SIG = ("period_start", "period_end", "fy", "fp", "period_kind", "period_class")
+Q_LIQUIDITY_BASIS = "CASH_AND_CASH_EQUIVALENTS_ONLY"
+Q_FLOW_BASIS = "ANNUAL_FY"
+# company_type_registry.COMPANY_TYPE_VALUES = {"NON_FINANCIAL", "FINANCIAL"}; Quality is evaluated for the former only
+Q_EVALUATED_COMPANY_TYPE = "NON_FINANCIAL"
+# metric_eligibility_registry.GOVERNED_METRICS intersected with Quality's normalized inputs (Checker design r5 §2)
+Q_GOVERNED_INPUTS = ("operating_income", "cfo", "capex", "total_debt")
+Q_DEBT_COMPONENTS = ("current_debt", "noncurrent_debt")
+Q_TOL = 1e-12          # Quality v0.2 records unrounded floats; production's own validator uses the same tolerance
+Q_LIMITATIONS = ("liquidity_basis", "roic", "roe", "relative_evaluation", "historical_evaluation", "staleness_policy")
+Q_KEYS_COMMON = frozenset({"metric", "status", "value", "rating", "stars", "weight", "reason_code", "upstream_reason_code",
+                           "upstream_inputs", "role"})
+Q_KEYS_EXTRA = {"profit_to_cash_consistency": frozenset({"duplicate_of"}),
+                "net_debt_to_fcf": frozenset({"net_debt_sign", "liquidity_basis", "mixed_period_ratio", "cash_flow_gap_days",
+                                              "debt_flow_gap_days", "balance_flow_gap_days"}),
+                "debt_to_cash": frozenset({"liquidity_basis"})}
+Q_UPSTREAM_KEYS = frozenset({"metric", "status", "reason_code"})
+Q_ELEMENT_KEYS = frozenset({"status", "reason_code", "score", "stars", "scored_weight_fraction", "normalized_score_weights",
+                            "rated_count", "not_meaningful_count", "independent_total", "assessed_dimensions",
+                            "unavailable_components", "flags"})
+Q_UNAVAILABLE_KEYS = frozenset({"metric", "status", "reason_code", "upstream_reason_code"})
+Q_PERIOD_KEYS = frozenset({"flow_basis", "flow_inputs_consistent", "flow_period_start", "flow_period_end", "flow_age_days",
+                           "flow_accession_consistent", "cash_as_of", "cash_age_days", "debt_as_of", "debt_age_days",
+                           "balance_sheet_as_of", "balance_dates_consistent"})
+Q_TOP_KEYS = frozenset({"schema_version", "ticker", "company_type", "evaluation_date", "element", "components", "periods",
+                        "limitations"})
+Q_SUMMARY_KEYS = ("_available", "schema_version", "status", "reason_code", "score", "stars", "scored_weight_fraction",
+                  "rated_count", "not_meaningful_count", "leverage_assessment", "flags", "stage_status", "error_type")
+Q_ERROR = "ERROR"
+# Single source of list-length limits for the P2 grammar AND the pre-registration generator (r2 §4.1, r5 §3.5).
+P2_LIST_MAXLEN = {"upstream_inputs": {m: len(Q_INPUTS[m][0]) + len(Q_INPUTS[m][1]) for m in Q_METRICS},
+                  "unavailable_components": len(Q_INDEP), "flags": 1, "debt_dates": 2}
+
+
+def _alt(xs) -> str:
+    return "(" + "|".join(re.escape(x) for x in xs) + ")"
+
+
+def _idx(n: int) -> str:
+    assert 1 <= n <= 10
+    return r"\[[0-%d]\]" % (n - 1)
+
+
+def _p2_grammar() -> dict:
+    q = r"/stages/quality/quality"
+    tick = [r"/stages/quality/status",
+            q + "/" + _alt(("schema_version", "ticker", "company_type", "evaluation_date")),
+            q + "/element/" + _alt(("status", "reason_code", "score", "stars", "scored_weight_fraction", "normalized_score_weights",
+                                    "rated_count", "not_meaningful_count", "independent_total")),
+            q + "/element/normalized_score_weights/" + _alt(Q_INDEP),
+            q + "/element/assessed_dimensions/" + _alt(Q_DIMS),
+            q + "/element/unavailable_components(" + _idx(P2_LIST_MAXLEN["unavailable_components"]) + "/"
+              + _alt(sorted(Q_UNAVAILABLE_KEYS)) + ")?",
+            q + "/element/flags(" + _idx(P2_LIST_MAXLEN["flags"]) + ")?",
+            q + "/periods/" + _alt(sorted(Q_PERIOD_KEYS - {"debt_as_of", "debt_age_days"})),
+            q + "/periods/(debt_as_of|debt_age_days)(" + _idx(P2_LIST_MAXLEN["debt_dates"]) + ")?",
+            q + "/limitations/" + _alt(Q_LIMITATIONS) + "/(status|reason)"]
+    for m in Q_METRICS:
+        keys = (Q_KEYS_COMMON | Q_KEYS_EXTRA.get(m, frozenset())) - {"upstream_inputs", "debt_flow_gap_days"}
+        tick.append(q + "/components/" + m + "/" + _alt(sorted(keys)))
+        tick.append(q + "/components/" + m + "/upstream_inputs(" + _idx(P2_LIST_MAXLEN["upstream_inputs"][m]) + "/"
+                    + _alt(sorted(Q_UPSTREAM_KEYS)) + ")?")
+    tick.append(q + "/components/net_debt_to_fcf/debt_flow_gap_days(" + _idx(P2_LIST_MAXLEN["debt_dates"]) + ")?")
+    cov = [r"/stage_status_counts/quality/OK",
+           r"/quality/element_status_counts/(OK|MISSING)",
+           r"/quality/element_reason_code_counts(/INSUFFICIENT_INDEPENDENT_COMPONENTS)?",
+           r"/quality/leverage_assessment_counts/(ASSESSED|PARTIALLY_ASSESSED|NOT_ASSESSED)",
+           r"/quality/quality_ok_with_leverage_(not|partially)_assessed",
+           r"/quality/flag_counts(/" + Q_FLAG + ")?",
+           r"/quality/stage_error_count", r"/quality/stage_error_tickers"]
+    for m in Q_METRICS:
+        codes = set(Q_LOCAL_INVALID[m]) | ({Q_NM_CODE[m]} if m in Q_NM_CODE else set())
+        codes |= {f"{prefix}:{x}" for _s, prefix in Q_UPSTREAM_MAP.values() for x in Q_INPUTS[m][0] + Q_INPUTS[m][1]}
+        cov.append(r"/quality/components/" + m + "/by_status/" + _alt(Q_COMPONENT_STATUSES))
+        cov.append(r"/quality/components/" + m + "/by_reason_code(/" + _alt(sorted(codes)) + ")?")
+    summ = [r"/records\[\d+\]/stage_statuses/quality",
+            r"/records\[\d+\]/quality/" + _alt([k for k in Q_SUMMARY_KEYS if k != "flags"]),
+            r"/records\[\d+\]/quality/flags(" + _idx(P2_LIST_MAXLEN["flags"]) + ")?"]
+    comp = lambda parts: re.compile("|".join(f"^{x}$" for x in parts))
+    return {"ticker": comp(tick), "coverage": comp(cov), "summary": comp(summ)}
+
+
+def _p2_containers() -> dict:
+    """Exact (file kind, path) -> the only empty container that path may take (r2 §4.2). Summary paths differ only in
+    the record index, which the registered entry pins exactly."""
+    q = "/stages/quality/quality"
+    ticker = {f"{q}/element/unavailable_components": [], f"{q}/element/flags": [],
+              f"{q}/components/net_debt_to_fcf/debt_flow_gap_days": [], f"{q}/periods/debt_as_of": [],
+              f"{q}/periods/debt_age_days": []}
+    ticker.update({f"{q}/components/{m}/upstream_inputs": [] for m in Q_METRICS})
+    coverage = {"/quality/element_reason_code_counts": {}, "/quality/flag_counts": {}, "/quality/stage_error_tickers": []}
+    coverage.update({f"/quality/components/{m}/by_reason_code": {} for m in Q_METRICS})
+    return {"ticker": ticker, "coverage": coverage, "summary": [(re.compile(r"^/records\[\d+\]/quality/flags$"), [])]}
+
+
+P2_MIGRATION = "P2_QUALITY_V02_STAGE"
+PATCH_MIGRATIONS[P2_MIGRATION] = dict(_p2_grammar(), ops=("add",), containers=_p2_containers())
+# A governed ticker may carry P2 entries only inside the Quality stage; their content is checked independently by Q5.
+GOVERNED_PATCH_STAGE = {P2_MIGRATION: Q_STAGE_PREFIX}
+SUMMARY_FILE = "summary.json"
+SUMMARY_RUN_PATHS = re.compile(r"^/(generated_at_utc|reproducibility(/.*)?|records\[\d+\]/raw_input/(fetched_at_utc|loaded_at_utc|sha256|size_bytes))$")
+
+
+def container_for(containers, kind, path):
+    """The empty container registered for this exact path, or None."""
+    if not containers: return None
+    table = containers.get(kind)
+    if isinstance(table, dict): return table.get(path)
+    for rx, empty in table or ():
+        if rx.fullmatch(path): return empty
+    return None
 
 class InputError(Exception):
     pass
@@ -818,6 +991,520 @@ def manifest_structure_problems(man) -> list[str]:
 
 
 # ---------------------------------------------------------------- checker
+
+# ---------------------------------------------------------------- v2.9 (P2): Quality v0.2 stage checks (Q0-Q7)
+# Independent re-derivation from the ticker file only (gated normalized metrics + derived metrics); production's
+# calculate_quality_v02 / batch_coverage / batch_runner are never imported or called. Every function returns
+# paths, metric names and rule ids only -- never amounts.
+def q_stage(r): return stages(r).get("quality")
+def q_doc(r):
+    s_ = q_stage(r)
+    return s_.get("quality") if isinstance(s_, dict) else None
+def _num(x) -> bool: return isinstance(x, (int, float)) and not isinstance(x, bool)
+def _int(x) -> bool: return isinstance(x, int) and not isinstance(x, bool)
+def q_band(x) -> int:
+    """quality._stars_from_rating thresholds (copied)."""
+    return 5 if x >= 4.5 else 4 if x >= 3.5 else 3 if x >= 2.5 else 2 if x >= 1.5 else 1
+def q_upstream_class(status):
+    if status == "OK": return None
+    return status if status in ("MISSING", "INCOMPLETE", "WITHHELD", "INVALID") else "INVALID"
+def q_days(later, earlier):
+    if later is None or earlier is None: return None
+    return (date.fromisoformat(later) - date.fromisoformat(earlier)).days
+def run_has_quality(run) -> bool:
+    return (any(isinstance(stages(r), dict) and "quality" in stages(r) for r in run.results.values())
+            or "quality" in _d(run.coverage) or "quality" in _d(_d(run.coverage).get("stage_status_counts"))
+            or any(isinstance(rec, dict) and "quality" in rec for rec in run.summary["records"]))
+
+
+def q_structure_problems(t, r) -> list[str]:
+    """Q1: exact key sets and value types of one ticker's Quality stage (r2 §1.4, r3 §1.3)."""
+    p, s_ = [], q_stage(r)
+    if not isinstance(s_, dict): return [f"{t}: stages.quality missing or not an object"]
+    st = s_.get("status")
+    if st == Q_ERROR:
+        e = s_.get("error")
+        if set(s_) != {"status", "quality", "error"} or s_.get("quality") is not None or not isinstance(e, dict) \
+                or set(e) != {"type"} or not (isinstance(e.get("type"), str) and e["type"]):
+            p.append(f"{t}: ERROR stage must be exactly {{status, quality: null, error: {{type}}}}")
+        return p
+    if st != "OK" or set(s_) != {"status", "quality"}:
+        return [f"{t}: stage must be exactly {{status: OK, quality}} or the ERROR shape"]
+    q = s_["quality"]
+    if not isinstance(q, dict) or set(q) != Q_TOP_KEYS: return [f"{t}: quality keys must be exactly {sorted(Q_TOP_KEYS)}"]
+    if q["schema_version"] != Q_SCHEMA_VERSION: p.append(f"{t}: schema_version")
+    if q["ticker"] != t or _d(r).get("ticker") != t: p.append(f"{t}: ticker")
+    if not isinstance(q["evaluation_date"], str) or q["evaluation_date"] != _d(r).get("evaluation_date"): p.append(f"{t}: evaluation_date")
+    if not isinstance(q["company_type"], str) or q["company_type"] != _d(r).get("company_type"): p.append(f"{t}: company_type")
+    lim = q["limitations"]
+    if not isinstance(lim, dict) or set(lim) != set(Q_LIMITATIONS) or not all(
+            isinstance(v, dict) and set(v) == {"status", "reason"} and all(isinstance(x, str) for x in v.values()) for v in lim.values()):
+        p.append(f"{t}: limitations")
+    e = q["element"]
+    if not isinstance(e, dict) or set(e) != Q_ELEMENT_KEYS: return p + [f"{t}: element keys"]
+    if e["status"] not in ("OK", "MISSING", "NOT_APPLICABLE"): p.append(f"{t}: element.status")
+    if e["reason_code"] is not None and not isinstance(e["reason_code"], str): p.append(f"{t}: element.reason_code")
+    for k in ("score", "scored_weight_fraction"):
+        if e[k] is not None and not is_finite_number(e[k]): p.append(f"{t}: element.{k}")
+    if e["stars"] is not None and not _int(e["stars"]): p.append(f"{t}: element.stars")
+    for k in ("rated_count", "not_meaningful_count", "independent_total"):
+        if not _int(e[k]): p.append(f"{t}: element.{k}")
+    w = e["normalized_score_weights"]
+    if w is not None and not (isinstance(w, dict) and w and set(w) <= set(Q_INDEP) and all(is_finite_number(v) for v in w.values())):
+        p.append(f"{t}: element.normalized_score_weights")
+    ad = e["assessed_dimensions"]
+    if ad is not None and not (isinstance(ad, dict) and set(ad) == set(Q_DIMS)
+                               and all(v in ("ASSESSED", "PARTIALLY_ASSESSED", "NOT_ASSESSED") for v in ad.values())):
+        p.append(f"{t}: element.assessed_dimensions")
+    ua = e["unavailable_components"]
+    if not (isinstance(ua, list) and len(ua) <= P2_LIST_MAXLEN["unavailable_components"]
+            and all(isinstance(x, dict) and set(x) == Q_UNAVAILABLE_KEYS for x in ua)):
+        p.append(f"{t}: element.unavailable_components")
+    fl = e["flags"]
+    if not (isinstance(fl, list) and len(fl) <= P2_LIST_MAXLEN["flags"] and all(x == Q_FLAG for x in fl)):
+        p.append(f"{t}: element.flags")
+    comps, per = q["components"], q["periods"]
+    if e["status"] == "NOT_APPLICABLE":
+        if comps != {} or per is not None or ad is not None: p.append(f"{t}: NOT_APPLICABLE element with computed parts")
+        return p
+    if not isinstance(comps, dict) or set(comps) != set(Q_METRICS): return p + [f"{t}: components keys"]
+    for m in Q_METRICS:
+        c = comps[m]; lab = f"{t}: components.{m}"
+        if not isinstance(c, dict) or set(c) != Q_KEYS_COMMON | Q_KEYS_EXTRA.get(m, frozenset()):
+            p.append(f"{lab} keys"); continue
+        if c["metric"] != m: p.append(f"{lab}.metric")
+        if c["status"] not in Q_COMPONENT_STATUSES: p.append(f"{lab}.status")
+        if c["role"] != ("INFORMATIONAL" if m in Q_INFO else "INDEPENDENT"): p.append(f"{lab}.role")
+        if not _num(c["weight"]): p.append(f"{lab}.weight")
+        for k in ("value", "rating"):
+            if c[k] is not None and not is_finite_number(c[k]): p.append(f"{lab}.{k}")
+        if c["stars"] is not None and not _int(c["stars"]): p.append(f"{lab}.stars")
+        for k in ("reason_code", "upstream_reason_code"):
+            if c[k] is not None and not isinstance(c[k], str): p.append(f"{lab}.{k}")
+        ui = c["upstream_inputs"]
+        if not (isinstance(ui, list) and len(ui) <= P2_LIST_MAXLEN["upstream_inputs"][m]
+                and all(isinstance(x, dict) and set(x) == Q_UPSTREAM_KEYS and isinstance(x["metric"], str)
+                        and (x["status"] is None or isinstance(x["status"], str))
+                        and (x["reason_code"] is None or isinstance(x["reason_code"], str)) for x in ui)):
+            p.append(f"{lab}.upstream_inputs")
+        if m in Q_INFO and c["duplicate_of"] != Q_INFO[m]: p.append(f"{lab}.duplicate_of")
+        if m in ("net_debt_to_fcf", "debt_to_cash") and c["liquidity_basis"] != Q_LIQUIDITY_BASIS: p.append(f"{lab}.liquidity_basis")
+        if m == "net_debt_to_fcf":
+            if c["mixed_period_ratio"] is not True: p.append(f"{lab}.mixed_period_ratio")
+            if c["net_debt_sign"] not in (None, "ZERO", "NEGATIVE", "POSITIVE"): p.append(f"{lab}.net_debt_sign")
+            for k in ("cash_flow_gap_days", "balance_flow_gap_days"):
+                if c[k] is not None and not _int(c[k]): p.append(f"{lab}.{k}")
+            g = c["debt_flow_gap_days"]
+            if not (isinstance(g, list) and len(g) <= P2_LIST_MAXLEN["debt_dates"] and all(_int(x) for x in g)):
+                p.append(f"{lab}.debt_flow_gap_days")
+    if not isinstance(per, dict) or set(per) != Q_PERIOD_KEYS: return p + [f"{t}: periods keys"]
+    if per["flow_basis"] != Q_FLOW_BASIS: p.append(f"{t}: periods.flow_basis")
+    for k in ("debt_as_of", "debt_age_days"):
+        v = per[k]
+        if not (isinstance(v, list) and len(v) <= P2_LIST_MAXLEN["debt_dates"]): p.append(f"{t}: periods.{k}")
+    return p
+
+
+def _comp_inputs(r, m):
+    """[(name, item, class)] of the component's direct inputs, normalized first then derived (production order)."""
+    nm, dm = metrics(r), stage_items(r, "derived") or {}
+    out = []
+    for name in Q_INPUTS[m][0]: it = _d(nm.get(name)); out.append((name, it, q_upstream_class(it.get("status"))))
+    for name in Q_INPUTS[m][1]: it = _d(dm.get(name)); out.append((name, it, q_upstream_class(it.get("status"))))
+    return out
+
+
+def q_e1_condition(r) -> bool:
+    """r3 §6.1 E1: every direct input OK, derived fcf OK finite <= 0, derived net_debt OK finite > 0."""
+    dm = stage_items(r, "derived") or {}
+    fcf, nd = _d(dm.get("fcf")), _d(dm.get("net_debt"))
+    return (all(c is None for _n, _i, c in _comp_inputs(r, "net_debt_to_fcf"))
+            and fcf.get("status") == "OK" and is_finite_number(fcf.get("value")) and fcf["value"] <= 0
+            and nd.get("status") == "OK" and is_finite_number(nd.get("value")) and nd["value"] > 0)
+
+
+def q_component_problems(t, r, m, c) -> list[str]:
+    """I1, I6, I7 and E1 for one component (r3 §6, r4 §4)."""
+    p, lab = [], f"{t}.{m}"
+    ins = _comp_inputs(r, m)
+    bad = {n: (it, k) for n, it, k in ins if k is not None}
+    # I1 weight
+    if m in Q_INFO:
+        if not (_num(c["weight"]) and c["weight"] == 0.0): p.append(f"{lab}: I1 informational weight must be 0")
+    elif abs(c["weight"] - Q_WEIGHTS[m]) > Q_TOL: p.append(f"{lab}: I1 weight")
+    # upstream_inputs = exactly the non-OK direct inputs, each copying the gated item's status / reason_code
+    rec = c["upstream_inputs"]
+    names = [x["metric"] for x in rec]
+    if len(names) != len(set(names)) or set(names) != set(bad):
+        p.append(f"{lab}: I7-upstream-set")
+    else:
+        for x in rec:
+            it = bad[x["metric"]][0]
+            if not (same_leaf(x["status"], it.get("status")) and same_leaf(x["reason_code"], it.get("reason_code"))):
+                p.append(f"{lab}: I7-upstream-copy {x['metric']}")
+    s, rc, urc = c["status"], c["reason_code"], c["upstream_reason_code"]
+    if s != "OK" and any(c[k] is not None for k in ("value", "rating", "stars")):
+        p.append(f"{lab}: I7 value/rating/stars must be null when status is {s}")
+    if bad:
+        top = min((k for _it, k in bad.values()), key=Q_UPSTREAM_ORDER.index)
+        want_status, prefix = Q_UPSTREAM_MAP[top]
+        if s != want_status: p.append(f"{lab}: I7-precedence status {s} (highest upstream class {top})")
+        x = rc.split(":", 1)[1] if isinstance(rc, str) and rc.startswith(prefix + ":") else None
+        if x is None or x not in bad or bad[x][1] != top:
+            p.append(f"{lab}: I7-prefix reason_code must be {prefix}:<an input of class {top}>")
+        else:
+            want_urc = bad[x][0].get("reason_code") or "UPSTREAM_REASON_UNSPECIFIED"
+            if not same_leaf(urc, want_urc): p.append(f"{lab}: I7 upstream_reason_code")
+        return p
+    if urc is not None: p.append(f"{lab}: I7 upstream_reason_code must be null without an upstream cause")
+    if s in ("MISSING", "WITHHELD"):
+        p.append(f"{lab}: I7 status {s} needs an upstream cause")
+    elif s == "INVALID":
+        if rc not in Q_LOCAL_INVALID[m]: p.append(f"{lab}: I7-local reason_code not allowed for {m}")
+    elif s == "NOT_MEANINGFUL":
+        if m not in Q_NM_CODE or rc != Q_NM_CODE[m]: p.append(f"{lab}: I7-NM reason_code")
+    elif s == "OK":
+        e1 = m == "net_debt_to_fcf" and q_e1_condition(r)
+        if rc == Q_E1:
+            if not e1: p.append(f"{lab}: E1-condition not met")
+            if not (c["value"] is None and same_leaf(c["rating"], 1.0) and same_leaf(c["stars"], 1)):
+                p.append(f"{lab}: E1-shape (value null, rating 1.0, stars 1)")
+        elif rc is None:
+            if e1: p.append(f"{lab}: E1-required (condition met but general OK rule used)")
+            if not is_finite_number(c["value"]): p.append(f"{lab}: I7 OK value must be finite")
+            if not (is_finite_number(c["rating"]) and 1.0 <= c["rating"] <= 5.0): p.append(f"{lab}: I6 rating range")
+            elif not same_leaf(c["stars"], q_band(c["rating"])): p.append(f"{lab}: I5 component stars")
+        else:
+            p.append(f"{lab}: I7 OK reason_code must be null or {Q_E1}")
+    return p
+
+
+def q_invariant_problems(t, r) -> list[str]:
+    """Q3: I1-I8, reason-code table and E1 (r2 §5, r3 §5-6). Assumes q_structure_problems() is empty."""
+    q = q_doc(r)
+    if q is None: return []
+    e, comps = q["element"], q["components"]
+    p = []
+    if q["company_type"] == "FINANCIAL":
+        if not (e["status"] == "NOT_APPLICABLE" and e["reason_code"] == "COMPANY_TYPE_FINANCIAL"
+                and all(e[k] is None for k in ("score", "stars", "scored_weight_fraction", "normalized_score_weights"))
+                and e["rated_count"] == 0 and e["not_meaningful_count"] == 0 and e["unavailable_components"] == [] and e["flags"] == []):
+            p.append(f"{t}: I8 FINANCIAL element")
+        return p
+    if e["status"] == "NOT_APPLICABLE": return [f"{t}: I8 NOT_APPLICABLE for a non-FINANCIAL company"]
+    for m in Q_METRICS: p += q_component_problems(t, r, m, comps[m])
+    rated = [m for m in Q_INDEP if comps[m]["status"] == "OK"]
+    nmc = [m for m in Q_INDEP if comps[m]["status"] == "NOT_MEANINGFUL"]
+    if e["rated_count"] != len(rated) or e["not_meaningful_count"] != len(nmc) or e["independent_total"] != len(Q_INDEP):
+        p.append(f"{t}: I8 counts")
+    ok_cond = len(rated) >= 3 and len(rated) + len(nmc) >= 4
+    if ok_cond:
+        if e["status"] != "OK" or e["reason_code"] is not None: p.append(f"{t}: I8 element must be OK")
+        f, w, sc = e["scored_weight_fraction"], e["normalized_score_weights"], e["score"]
+        if not (is_finite_number(f) and is_finite_number(sc) and isinstance(w, dict)):
+            p.append(f"{t}: I8 OK element needs score, stars, fraction and weights")
+        else:
+            if abs(f - sum(Q_WEIGHTS[m] for m in rated)) > Q_TOL or not (0 < f <= 1 + Q_TOL): p.append(f"{t}: I2 scored_weight_fraction")
+            if set(w) != set(rated): p.append(f"{t}: I3 normalized_score_weights keys")
+            else:
+                if any(abs(w[m] - Q_WEIGHTS[m] / f) > Q_TOL for m in rated): p.append(f"{t}: I3 normalized weight")
+                if abs(sum(w.values()) - 1.0) > Q_TOL: p.append(f"{t}: I3 weights sum")
+                if abs(sc - sum(comps[m]["rating"] * w[m] for m in rated)) > Q_TOL: p.append(f"{t}: I4 score")
+            if not (1.0 - Q_TOL <= sc <= 5.0 + Q_TOL): p.append(f"{t}: I4 score range")   # weighted mean of floored ratings: float slack only
+            elif not same_leaf(e["stars"], q_band(sc)): p.append(f"{t}: I5 element stars")
+    else:
+        if e["status"] != "MISSING" or e["reason_code"] != "INSUFFICIENT_INDEPENDENT_COMPONENTS": p.append(f"{t}: I8 element must be MISSING")
+        if any(e[k] is not None for k in ("score", "stars", "scored_weight_fraction", "normalized_score_weights")):
+            p.append(f"{t}: I8 MISSING element with score fields")
+    def dim(members):
+        n = sum(comps[m]["status"] in ("OK", "NOT_MEANINGFUL") for m in members)
+        return "ASSESSED" if n == len(members) else ("PARTIALLY_ASSESSED" if n else "NOT_ASSESSED")
+    if e["assessed_dimensions"] != {d: dim(ms) for d, ms in Q_DIMS.items()}: p.append(f"{t}: I8 assessed_dimensions")
+    want_ua = {m: {"metric": m, "status": comps[m]["status"], "reason_code": comps[m]["reason_code"],
+                   "upstream_reason_code": comps[m]["upstream_reason_code"]}
+               for m in Q_INDEP if comps[m]["status"] not in ("OK", "NOT_MEANINGFUL")}
+    got_ua = {x["metric"]: x for x in e["unavailable_components"] if isinstance(x.get("metric"), str)}
+    if len(got_ua) != len(e["unavailable_components"]) or set(got_ua) != set(want_ua) \
+            or any(flat(got_ua[m]) != flat(want_ua[m]) or any(not same_leaf(got_ua[m][k], want_ua[m][k]) for k in want_ua[m]) for m in want_ua):
+        p.append(f"{t}: I8 unavailable_components")
+    dm = stage_items(r, "derived") or {}
+    fcf, nd = _d(dm.get("fcf")), _d(dm.get("net_debt"))
+    flag = fcf.get("status") == "OK" and is_finite_number(fcf.get("value")) and fcf["value"] <= 0 and nd.get("status") != "OK"
+    if e["flags"] != ([Q_FLAG] if flag else []): p.append(f"{t}: I8 flags")
+    sign = None
+    if nd.get("status") == "OK" and is_finite_number(nd.get("value")):
+        sign = "ZERO" if nd["value"] == 0 else ("NEGATIVE" if nd["value"] < 0 else "POSITIVE")
+    if comps["net_debt_to_fcf"]["net_debt_sign"] != sign: p.append(f"{t}: L6 net_debt_sign")
+    return p
+
+
+def q_debt_dates(td):
+    """r5 §3.3: (dates, problems) of the total-debt observations actually summed. Rule ids in problems."""
+    if td.get("status") != "OK": return [], []
+    comps, val = td.get("components"), td.get("value")
+    p = []
+    if not (isinstance(comps, dict) and set(comps) == set(Q_DEBT_COMPONENTS)
+            and all(isinstance(comps[k], dict) and comps[k].get("status") == "OK" for k in Q_DEBT_COMPONENTS)):
+        return [], ["I9-D B-1/A-4 components must be exactly current_debt and noncurrent_debt, both OK"]
+    for k in Q_DEBT_COMPONENTS:
+        if not is_iso_date(comps[k].get("period_end")): p.append(f"I9-D date format components.{k}.period_end")
+        if not is_finite_number(comps[k].get("value")): p.append(f"I9-D components.{k}.value")
+    if not is_finite_number(val): p.append("I9-D total_debt value")
+    if p: return [], p
+    if "component_sum" in td:
+        cs = td["component_sum"]
+        if not isinstance(cs, dict) or cs.get("applied") is not True: return [], ["I9-D A-1 component_sum present but applied is not true"]
+        rows = cs.get("components")
+        roles = [x.get("role") for x in rows] if isinstance(rows, list) and all(isinstance(x, dict) for x in rows) else None
+        if roles is None or len(rows) != 3 or sorted(roles) != sorted(["current_debt", "short_term_component", "noncurrent_debt"]):
+            return [], ["I9-D A-2 component_sum.components must be the three roles current_debt, short_term_component, noncurrent_debt"]
+        if not all(is_finite_number(x.get("value")) for x in rows): return [], ["I9-D A-3 component_sum values"]
+        if not all(is_iso_date(x.get("period_end")) for x in rows): return [], ["I9-D date format component_sum period_end"]
+        if sum(x["value"] for x in rows) != val: p.append("I9-D A-3 component_sum total != total_debt value")
+        by_role = {x["role"]: x for x in rows}
+        for k in Q_DEBT_COMPONENTS:
+            if any(not same_leaf(by_role[k].get(f), comps[k].get(f)) for f in ("concept", "value", "period_end")):
+                p.append(f"I9-D A-4 components.{k} does not match the summed {k}")
+        dates = {x["period_end"] for x in rows}
+        if len(dates) != 1: p.append("I9-D A-5 summed components must share one period_end")
+    else:
+        if comps["current_debt"]["value"] + comps["noncurrent_debt"]["value"] != val: p.append("I9-D B-2 component total != total_debt value")
+        dates = {comps[k]["period_end"] for k in Q_DEBT_COMPONENTS}
+    sa = td.get("scope_alignment")
+    if sa is not None:
+        if not isinstance(sa, dict) or not is_iso_date(sa.get("period_end")): p.append("I9-D C scope_alignment.period_end format")
+        elif sa["period_end"] not in dates: p.append("I9-D C scope_alignment.period_end not among the summed dates")
+    return (sorted(dates) if not p else []), p
+
+
+def q_period_problems(t, r) -> list[str]:
+    """Q4: I9 periods recompute + I9-D debt date provenance + date formats (r3 §4, r4 §3, r5 §3)."""
+    q = q_doc(r)
+    if q is None or q["company_type"] == "FINANCIAL": return []
+    nm, ev = metrics(r), q["evaluation_date"]
+    if not is_iso_date(ev): return [f"{t}: I9 evaluation_date format"]
+    okf = [(n, _d(nm.get(n))) for n in Q_FLOW_INPUTS if _d(nm.get(n)).get("status") == "OK"]
+    p = []
+    for n, it in okf:
+        if not is_iso_date(it.get("period_end")) or (it.get("period_start") is not None and not is_iso_date(it.get("period_start"))):
+            p.append(f"{t}: I9 date format {n}")
+    cash = _d(nm.get("cash"))
+    cash_as_of = cash.get("period_end") if cash.get("status") == "OK" else None
+    if cash_as_of is not None and not is_iso_date(cash_as_of): p.append(f"{t}: I9 date format cash")
+    dates, dp = q_debt_dates(_d(nm.get("total_debt")))
+    p += [f"{t}: {x}" for x in dp]
+    if p: return p
+    sigs = {tuple(it.get(k) for k in Q_FLOW_SIG) for _n, it in okf}
+    units = {it.get("unit") for _n, it in okf}
+    consistent = (len(sigs) <= 1 and len(units) <= 1) if okf else None
+    fstart = fend = None
+    if okf and consistent:
+        fstart, fend = okf[0][1].get("period_start"), okf[0][1].get("period_end")
+    acc = [it.get("accession") for _n, it in okf]
+    if not okf or any(not (isinstance(a, str) and a) for a in acc): acc_ok = None     # r4 §3.4 / r5 §4: unknown -> null
+    else: acc_ok = len(set(acc)) == 1
+    bdc = (set(dates) == {cash_as_of}) if (cash_as_of is not None and dates) else None
+    bsa = cash_as_of if bdc else None
+    want = {"flow_basis": Q_FLOW_BASIS, "flow_inputs_consistent": consistent, "flow_period_start": fstart, "flow_period_end": fend,
+            "flow_age_days": q_days(ev, fend), "flow_accession_consistent": acc_ok, "cash_as_of": cash_as_of,
+            "cash_age_days": q_days(ev, cash_as_of), "debt_as_of": dates, "debt_age_days": [q_days(ev, d) for d in dates],
+            "balance_sheet_as_of": bsa, "balance_dates_consistent": bdc}
+    fw, fg = flat(want), flat(q["periods"])
+    for k in sorted(set(fw) | set(fg)):
+        if not same_leaf(flat_get(fg, k), flat_get(fw, k)): p.append(f"{t}: I9 periods{k}")
+    nd = q["components"]["net_debt_to_fcf"]
+    wnd = {"cash_flow_gap_days": q_days(cash_as_of, fend), "balance_flow_gap_days": q_days(bsa, fend) if bsa else None,
+           "debt_flow_gap_days": [q_days(d, fend) for d in dates] if fend else []}
+    for k, v in wnd.items():
+        if flat(nd[k]) != flat(v) or any(not same_leaf(a, b) for a, b in zip(flat(nd[k]).values(), flat(v).values())):
+            p.append(f"{t}: I9 net_debt_to_fcf.{k}")
+    return p
+
+
+def q_leak_problems(t, r, targets) -> tuple[list, list, list]:
+    """Q5 (governed ticker): L0-L3d, L7 and the auxiliary amount scan (r2 §1, r4 §2, r5 §2). -> (fail, review, info)."""
+    g, q, nm = gate(r), q_doc(r), metrics(r)
+    W = [m for m in _l(g.get("withheld")) if isinstance(m, str)]
+    dm = stage_items(r, "derived") or {}
+    fail, review, info = [], [], []
+    for gi in Q_GOVERNED_INPUTS:                                                      # L0 (bidirectional, G_Q only)
+        it = _d(nm.get(gi))
+        if (it.get("status") == "WITHHELD") != (gi in W): fail.append(f"{t}: L0 {gi} gate/status mismatch")
+        if gi in W and it.get("value") is not None: fail.append(f"{t}: L0 {gi} withheld but valued")
+    if set(W) & set(Q_DEBT_COMPONENTS) and "total_debt" not in W:
+        review.append(f"{t}: total_debt used while a debt component is withheld (gate policy gap, owner decision)")
+    if q is None or q["company_type"] == "FINANCIAL": return fail, review, info
+    comps, ws = q["components"], set(W) & set(Q_GOVERNED_INPUTS)
+    tainted = set()
+    for m in Q_METRICS:
+        direct = set(Q_INPUTS[m][0]) & ws
+        derived = {d for d in Q_INPUTS[m][1] if set(DERIVED_DEPS.get(d, ())) & set(W)}
+        if not direct and not derived: continue
+        tainted.add(m); c = comps[m]
+        if c["status"] != "WITHHELD": fail.append(f"{t}.{m}: L1 tainted component not WITHHELD")
+        if any(c[k] is not None for k in ("value", "rating", "stars")): fail.append(f"{t}.{m}: L2 tainted component carries value/rating/stars")
+        for d in sorted(derived):
+            if _d(dm.get(d)).get("status") != "WITHHELD": fail.append(f"{t}.{m}: L3a derived input {d} not WITHHELD")
+        cand = {x for x in direct | derived if _d(nm.get(x) if x in Q_INPUTS[m][0] else dm.get(x)).get("status") == "WITHHELD"}
+        if not cand: fail.append(f"{t}.{m}: L3d no withheld input among direct/derived sources")
+        rc = c["reason_code"]
+        x = rc.split(":", 1)[1] if isinstance(rc, str) and rc.startswith("INPUT_WITHHELD:") else None
+        if x not in cand: fail.append(f"{t}.{m}: L3b reason_code does not name a withheld source")
+        else:
+            roots = sorted(direct | {w for d in derived for w in DERIVED_DEPS[d] if w in W})
+            info.append(f"{t}.{m}: {x}={'DIRECT' if x in Q_INPUTS[m][0] else 'DERIVED'} roots={roots}")
+    w_ = q["element"]["normalized_score_weights"]
+    if isinstance(w_, dict) and set(w_) & tainted: fail.append(f"{t}: L7 tainted metric in normalized_score_weights")
+    mine = [dict(x, names=set(x["names"]) | tainted) for x in targets if x["ticker"] == t]
+    if mine:
+        f_, r_ = scan_json(q, mine)
+        fail += [f"{t}: AUX amount match at {loc}" for loc in f_]
+        review += [f"{t}: AUX small-value match at {loc}" for loc in r_]
+    return fail, review, info
+
+
+def recompute_quality_coverage(run) -> tuple[dict, dict]:
+    """Q6: (stage_status_counts['quality'], coverage['quality']) recomputed from the ticker files (r3 §2 table)."""
+    ss: dict = {}
+    qc = {"element_status_counts": {}, "element_reason_code_counts": {}, "components": {}, "leverage_assessment_counts": {},
+          "quality_ok_with_leverage_not_assessed": 0, "quality_ok_with_leverage_partially_assessed": 0, "flag_counts": {},
+          "stage_error_count": 0, "stage_error_tickers": []}
+    for rec in run.summary["records"]:
+        if rec.get("status") != "OK": continue
+        t = rec["ticker"]; r = run.results[t]
+        if "quality" not in stages(r): continue
+        s_ = q_stage(r)
+        st = s_.get("status") if isinstance(s_, dict) else None
+        _inc(ss, "null" if st is None else st)               # production keys None, which JSON writes as "null"
+        if st == Q_ERROR:
+            qc["stage_error_count"] += 1; qc["stage_error_tickers"].append(t)
+        q = q_doc(r)
+        if not (isinstance(q, dict) and isinstance(q.get("element"), dict)): continue
+        e = q["element"]
+        _inc(qc["element_status_counts"], e.get("status") or KEY_ABSENT)
+        if e.get("status") != "OK": _inc(qc["element_reason_code_counts"], e.get("reason_code") or NO_REASON_CODE)
+        comps = q.get("components")
+        if isinstance(comps, dict) and comps:
+            for name, item in comps.items():
+                b = qc["components"].setdefault(name, {"by_status": {}, "by_reason_code": {}})
+                s2 = item.get("status") if isinstance(item, dict) else None
+                _inc(b["by_status"], s2 if s2 is not None else KEY_ABSENT)
+                if s2 not in ("OK", None): _inc(b["by_reason_code"], (item.get("reason_code") if isinstance(item, dict) else None) or NO_REASON_CODE)
+        ad = e.get("assessed_dimensions")
+        lev = ad.get("leverage") if isinstance(ad, dict) else None
+        if lev is not None: _inc(qc["leverage_assessment_counts"], lev)
+        if e.get("status") == "OK" and lev == "NOT_ASSESSED": qc["quality_ok_with_leverage_not_assessed"] += 1
+        if e.get("status") == "OK" and lev == "PARTIALLY_ASSESSED": qc["quality_ok_with_leverage_partially_assessed"] += 1
+        for f in _l(e.get("flags")): _inc(qc["flag_counts"], f)
+    qc["stage_error_tickers"].sort()
+    return ss, qc
+
+
+def q_summary_expected(r) -> dict:
+    """D10 (r3 §1.3): the 13-key summary Quality object an OK record must carry, from the ticker file."""
+    s_ = q_stage(r)
+    st = s_.get("status") if isinstance(s_, dict) else None
+    q = q_doc(r)
+    e = q.get("element") if isinstance(q, dict) else None
+    avail = st == "OK" and isinstance(e, dict)
+    out = {k: None for k in Q_SUMMARY_KEYS}
+    out.update(_available=avail, flags=[], stage_status=st,
+               error_type=_d(_d(s_).get("error")).get("type") if st == Q_ERROR else None)
+    if avail:
+        ad = e.get("assessed_dimensions")
+        out.update(schema_version=q.get("schema_version"), status=e.get("status"), reason_code=e.get("reason_code"),
+                   score=e.get("score"), stars=e.get("stars"), scored_weight_fraction=e.get("scored_weight_fraction"),
+                   rated_count=e.get("rated_count"), not_meaningful_count=e.get("not_meaningful_count"),
+                   leverage_assessment=ad.get("leverage") if isinstance(ad, dict) else None,
+                   flags=list(e.get("flags") or []))
+    return out
+
+
+def q_summary_problems(run) -> list[str]:
+    """Q7 (D10): summary.json Quality fields <-> ticker files, joined by ticker (never by index)."""
+    p, seen = [], set()
+    for rec in run.summary["records"]:
+        t = rec.get("ticker")
+        if t in seen: p.append(f"duplicate summary ticker {t}")
+        seen.add(t)
+        if rec.get("status") != "OK":
+            if "quality" in rec or "quality" in _d(rec.get("stage_statuses")): p.append(f"{t}: Quality on a non-OK record")
+            continue
+        r = run.results.get(t)
+        if r is None: p.append(f"{t}: ticker file missing"); continue
+        if _d(r).get("ticker") != t: p.append(f"{t}: ticker mismatch")
+        sq = rec.get("quality")
+        if not isinstance(sq, dict) or set(sq) != set(Q_SUMMARY_KEYS):
+            p.append(f"{t}: quality summary missing or keys != the 13 fixed keys"); continue
+        want = q_summary_expected(r)
+        for k in Q_SUMMARY_KEYS:
+            a, b = flat(sq[k]) if isinstance(sq[k], (dict, list)) else {"": sq[k]}, flat(want[k]) if isinstance(want[k], (dict, list)) else {"": want[k]}
+            if set(a) != set(b) or any(not same_leaf(a[x], b[x]) for x in a): p.append(f"{t}: quality summary differs: {k}")
+        s_ = q_stage(r)
+        if not same_leaf(_d(rec.get("stage_statuses")).get("quality"), s_.get("status") if isinstance(s_, dict) else None):
+            p.append(f"{t}: stage_statuses.quality differs")
+    return p
+
+
+def q_valid_p0(r) -> bool:
+    """Q0 (r4 §1 + r5 §1): one evaluated non-FINANCIAL Quality ticker."""
+    s_ = q_stage(r)
+    if not (isinstance(s_, dict) and s_.get("status") == "OK"): return False
+    q = s_.get("quality")
+    if not (isinstance(q, dict) and isinstance(q.get("element"), dict)): return False
+    ct = q.get("company_type")
+    if not (isinstance(ct, str) and ct == _d(r).get("company_type") and ct == Q_EVALUATED_COMPANY_TYPE): return False
+    if q["element"].get("status") not in ("OK", "MISSING"): return False
+    comps = q.get("components")
+    t = _d(r).get("ticker")
+    return isinstance(comps, dict) and set(comps) == set(Q_METRICS) and not [x for x in q_structure_problems(t, r) if ": components" in x]
+
+
+def q_check_run(run, targets) -> list[tuple]:
+    """All per-run Quality results as (layer, name, verdict, detail). Empty when the run has no Quality output."""
+    out, lab = [], run.label
+    if not run_has_quality(run):
+        return [("INFO", f"Q {lab} has no Quality output (pre-P2 run)", "INFO", "Q1-Q7 not applicable to this run")]
+    ok_t = sorted(run.results)
+    struct = {t: q_structure_problems(t, run.results[t]) for t in ok_t}
+    sp = [x for t in ok_t for x in struct[t]]
+    out.append((lab, "Q1 Quality stage exact structure (every OK ticker)", "PASS" if not sp else "FAIL",
+                f"{len(sp)} problem(s): {sp[:12]}" if sp else f"{len(ok_t)} tickers"))
+    errs = sorted(t for t in ok_t if _d(q_stage(run.results[t])).get("status") == Q_ERROR)
+    out.append((lab, "Q2 no Quality stage ERROR", "PASS" if not errs else "FAIL", f"ERROR tickers: {errs}" if errs else "0"))
+    clean = [t for t in ok_t if not struct[t] and q_doc(run.results[t]) is not None]
+    ip = [x for t in clean for x in q_invariant_problems(t, run.results[t])]
+    out.append((lab, "Q3 Quality internal invariants (weights, score, stars, status/reason table, E1)", "PASS" if not ip else "FAIL",
+                f"{len(ip)} problem(s): {ip[:12]}" if ip else f"{len(clean)} tickers"))
+    pp = [x for t in clean for x in q_period_problems(t, run.results[t])]
+    out.append((lab, "Q4 Quality periods = independent recompute (I9, I9-D debt date provenance, date formats)",
+                "PASS" if not pp else "FAIL", f"{len(pp)} problem(s): {pp[:12]}" if pp else f"{len(clean)} tickers"))
+    gov_t = sorted(t for t in ok_t if _l(gate(run.results[t]).get("withheld")))
+    lf, lr, li = [], [], []
+    for t in gov_t:
+        if struct[t]: lf.append(f"{t}: not evaluated (structure, see Q1)"); continue
+        f_, r_, i_ = q_leak_problems(t, run.results[t], targets); lf += f_; lr += r_; li += i_
+    out.append((lab, "Q5 Q-LEAK: governed tickers' Quality built only from non-withheld sources (+ amount scan)",
+                "FAIL" if lf else ("REVIEW" if lr else "PASS"),
+                f"governed={gov_t}; fail={lf[:10]}; review={lr[:10]}; sources={li[:10]}"))
+    ss, qc = recompute_quality_coverage(run)
+    cov = _d(run.coverage)
+    mism = []
+    for name, got, want in (("stage_status_counts/quality", _d(cov.get("stage_status_counts")).get("quality"), ss or None),
+                            ("quality", cov.get("quality"), qc)):
+        a, b = flat(got) if isinstance(got, (dict, list)) else {"": got}, flat(want) if isinstance(want, (dict, list)) else {"": want}
+        mism += [f"{name}{k}" for k in sorted(set(a) | set(b)) if not same_leaf(flat_get(a, k), flat_get(b, k))]
+    zeros = [f"quality{k}" for k, v in flat(cov.get("quality")).items() if isinstance(cov.get("quality"), dict) and v == 0 and type(v) is int
+             and not k.endswith(("_not_assessed", "_partially_assessed", "stage_error_count"))]
+    mism += [f"{z} is a zero-count key" for z in zeros]
+    out.append((lab, "Q6 coverage Quality block = independent recompute from ticker files", "PASS" if not mism else "FAIL",
+                f"{len(mism)} differing leaves (paths only): {mism[:12]}" if mism else f"{len(flat(qc))} leaves"))
+    dp = q_summary_problems(run)
+    out.append((lab, "Q7 summary.json Quality fields = ticker files (joined by ticker)", "PASS" if not dp else "FAIL",
+                f"{len(dp)} problem(s): {dp[:12]}" if dp else f"{len(run.summary['records'])} records"))
+    return out
+
+
 class Checker:
     def __init__(self, new: Run, base: Run, expect_date: str, new_sha, base_sha, profile: dict | None, repo_root=None):
         self.new, self.base, self.date, self.profile, self.repo_root = new, base, expect_date, profile, repo_root
@@ -1008,6 +1695,18 @@ class Checker:
             if given and not want["github_sha"].startswith(given): bad.append(f"--{side}-sha {given} contradicts profile {want['github_sha']}")
         self.add("PROF", f"P0 profile {self.profile.get('name')} applies to these runs (run id, full SHA, date, policy)",
                  "PASS" if not bad else "FAIL", "; ".join(bad) or f"BASE {at['base']['github_run_id']} / NEW {at['new']['github_run_id']}")
+
+
+    # ---------- Q: v2.9 Quality v0.2 stage (P2). Emits nothing when neither run carries Quality output (v2.8 output kept)
+    def check_quality(self):
+        if not (run_has_quality(self.new) or run_has_quality(self.base)): return
+        pt = (self.profile or {}).get("expected_patch")
+        if pt and pt.get("migration_id") == P2_MIGRATION:
+            valid = sorted(t for t, r in self.new.results.items() if q_valid_p0(r))
+            self.add("PROF", "Q0 P2 migration run has >= 1 evaluated non-FINANCIAL Quality ticker", "PASS" if valid else "FAIL",
+                     f"{len(valid)} valid: {valid[:20]}" if valid else "P2 migration run has no evaluated non-FINANCIAL Quality ticker")
+        for run in (self.new, self.base):
+            for row in q_check_run(run, self.targets): self.add(*row)
 
     # ---------- B: governance (both runs, each by its own policy)
     def check_governance(self):
@@ -1267,7 +1966,7 @@ class Checker:
                 note = (f"; BASE compared with the {len(accepted)} accepted allowance addition(s) of "
                         f"{allow['migration_id']} applied (no other change tolerated)")
             elif pt:
-                n_t = sum(1 for f, _ in realized if f != COVERAGE_FILE)
+                n_t = sum(1 for f, _ in realized if f not in (COVERAGE_FILE, SUMMARY_FILE))
                 note = (f"; BASE compared with the {n_t} realized ticker leaf change(s) of expected_patch "
                         f"{pt['migration_id']} applied (no other change tolerated)")
             self.add("CMP", "C3 stage coverage identical BASE vs NEW once governed tickers are excluded", "PASS" if same else "FAIL",
@@ -1349,12 +2048,12 @@ class Checker:
                 def fl(run, f):
                     key = (run.label, f)
                     if key not in flats:
-                        doc = run.coverage if f == COVERAGE_FILE else run.results.get(f[:-5])
+                        doc = run.coverage if f == COVERAGE_FILE else (run.summary if f == SUMMARY_FILE else run.results.get(f[:-5]))
                         flats[key] = None if doc is None else flat(doc)
                     return flats[key]
                 for e in entries:
                     f, pa = e["file"], e["path"]
-                    if f != COVERAGE_FILE:
+                    if f not in (COVERAGE_FILE, SUMMARY_FILE):
                         t = f[:-5]
                         if t not in self.base.results or t not in self.new.results:
                             problems.append(f"{t}: not an OK ticker in both runs"); continue
@@ -1364,7 +2063,7 @@ class Checker:
                             if why is not None:
                                 problems.append(f"{t}{pa}: {why}"); continue
                     fb, fn = fl(self.base, f), fl(self.new, f)
-                    where = f"{f[:-5] if f != COVERAGE_FILE else f}{pa}"
+                    where = f"{f if f in (COVERAGE_FILE, SUMMARY_FILE) else f[:-5]}{pa}"
                     if fb is None or fn is None: problems.append(f"{where}: document missing"); continue
                     ok_b, ok_n = same_leaf(flat_get(fb, pa), e["base"]), same_leaf(flat_get(fn, pa), e["new"])
                     if not ok_b: problems.append(f"{where}: BASE leaf differs from expected_patch base")
@@ -1463,8 +2162,8 @@ class Checker:
             missing = sorted(f"{t}{p}" for t, p in want - found)
             if missing: allow_problems.append(f"{len(missing)} expected addition(s) not found exactly: {missing[:12]}")
         if pt:
-            tick = [(f, p) for f, p in ((e["file"], e["path"]) for e in p_entries) if f != COVERAGE_FILE]
-            tprob = [x for x in patch_problems_ if not x.startswith(COVERAGE_FILE)]
+            tick = [(f, p) for f, p in ((e["file"], e["path"]) for e in p_entries) if f not in (COVERAGE_FILE, SUMMARY_FILE)]
+            tprob = [x for x in patch_problems_ if not x.startswith(COVERAGE_FILE) and not x.startswith(SUMMARY_FILE)]
             unseen = sorted(f"{f[:-5]}{p}" for f, p in set(tick) & realized - p_found)
             if unseen: tprob.append(f"{len(unseen)} registered change(s) not observed as a ticker diff: {unseen[:12]}")
             label = f"D2 ticker JSON: no data change except expected_patch {pt['migration_id']} (same evaluation date)"
@@ -1507,10 +2206,24 @@ class Checker:
         if prof_cls:
             self.add("PROF", "D6 change classes per ticker vs profile", "PASS" if not unexpected else "REVIEW", "; ".join(unexpected) or "as expected")
         # D7 summary.json
-        allowed_summary = re.compile(r"^/(generated_at_utc|reproducibility(/.*)?|records\[\d+\]/raw_input/(fetched_at_utc|loaded_at_utc|sha256|size_bytes))$")
+        allowed_summary = SUMMARY_RUN_PATHS
         fa, fb = flat(base.summary), flat(new.summary)
-        bad = [p for p in sorted(set(fa) | set(fb)) if fa.get(p) != fb.get(p) and not allowed_summary.match(p)]
-        self.add("CMP", "D7 summary.json differs only in run metadata / provenance / raw_input hashes", "PASS" if not bad else "FAIL", f"other changes: {bad[:10]}")
+        reg_s = [p for f, p in ((e["file"], e["path"]) for e in p_entries) if f == SUMMARY_FILE] if pt else []
+        if not reg_s:
+            bad = [p for p in sorted(set(fa) | set(fb)) if fa.get(p) != fb.get(p) and not allowed_summary.match(p)]
+            self.add("CMP", "D7 summary.json differs only in run metadata / provenance / raw_input hashes", "PASS" if not bad else "FAIL", f"other changes: {bad[:10]}")
+        else:
+            # v2.9: summary.json leaves registered in expected_patch (exact, pair-bound, realized in BASE and NEW)
+            real_s = {p for f, p in realized if f == SUMMARY_FILE}
+            diff_s = {p for p in set(fa) | set(fb) if not same_leaf(flat_get(fa, p), flat_get(fb, p))}
+            bad = sorted(p for p in diff_s if not allowed_summary.match(p) and p not in real_s)
+            sprob = [x for x in patch_problems_ if x.startswith(SUMMARY_FILE)]
+            unseen = sorted(set(reg_s) - diff_s)
+            if unseen: sprob.append(f"{len(unseen)} registered summary change(s) not observed: {unseen[:12]}")
+            self.add("CMP", f"D7 summary.json differs only in run metadata / provenance / raw_input hashes and expected_patch {pt['migration_id']}",
+                     "PASS" if not bad and not sprob else "FAIL",
+                     f"other changes: {bad[:10]}; expected summary changes {len(real_s & diff_s)}/{len(reg_s)}"
+                     + (f"; {'; '.join(sprob[:8])}" if sprob else ""))
         # D8 source snapshot drift
         def man_map(run): return {f["ticker"]: (f.get("sha256"), f.get("size_bytes")) for f in _l(_d(run.manifest).get("files"))
                                   if isinstance(f, dict) and isinstance(f.get("ticker"), str)}
@@ -1608,7 +2321,8 @@ class Checker:
         for name, fn in (("integrity (A)", self.check_integrity), ("profile/mapping (P0/M1)", self.check_profile),
                          ("stages (S1)", self.check_stages), ("schema (T0)", self.check_schema),
                          ("governance (B)", self.check_governance),
-                         ("coverage (C)", self.check_coverage), ("run comparison (D)", self.check_diff),
+                         ("coverage (C)", self.check_coverage), ("quality (Q)", self.check_quality),
+                         ("run comparison (D)", self.check_diff),
                          ("PIT (E)", self.check_pit), ("leak (F)", self.check_leak)):
             try:
                 fn()
@@ -1671,8 +2385,20 @@ def same_leaf(a, b) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _patch_value_problem(v, path) -> str | None:
+def _patch_value_problem(v, path, containers=None, kind=None) -> str | None:
     if is_absent(v): return None
+    if containers is not None:
+        # v2.9: per-migration exact table -- (migration, file kind, exact path, container type); the global
+        # last-key-name table is not consulted
+        want = container_for(containers, kind, path)
+        if isinstance(v, (dict, list)):
+            if want is not None and type(v) is type(want) and v == want: return None
+            return "value must be a scalar (an empty container only at a registered container path of this migration)"
+        if want is not None:
+            return "a registered container path takes only its empty container or ABSENT"
+        if isinstance(v, float) and not math.isfinite(v): return "non-finite number"
+        if v is None or isinstance(v, (str, bool, int, float)): return None
+        return "unsupported value type"
     last = None if path.endswith("]") else path.rsplit("/", 1)[-1]      # "[i]" = list item, never a container path
     if isinstance(v, (dict, list)):
         if last in PATCH_CONTAINER_LEAF and v == PATCH_CONTAINER_LEAF[last] and type(v) is type(PATCH_CONTAINER_LEAF[last]):
@@ -1702,13 +2428,19 @@ def patch_problems(pt) -> list[str]:
     for i, e in enumerate(entries):
         if not isinstance(e, dict) or set(e) != PATCH_ENTRY_KEYS: p.append(f"entry {i}: keys must be exactly {sorted(PATCH_ENTRY_KEYS)}"); continue
         f, pa, op, b, n = e["file"], e["path"], e["op"], e["base"], e["new"]
-        if not isinstance(f, str) or not (f == COVERAGE_FILE or PATCH_TICKER_FILE_RE.fullmatch(f)):
-            p.append(f"entry {i}: file must be coverage.json or <TICKER>.json"); continue
-        kind = "coverage" if f == COVERAGE_FILE else "ticker"
+        summary_ok = "summary" in grammar          # v2.9: only a migration with a summary grammar may patch summary.json
+        if not isinstance(f, str) or not (f == COVERAGE_FILE or PATCH_TICKER_FILE_RE.fullmatch(f) or (summary_ok and f == SUMMARY_FILE)):
+            p.append(f"entry {i}: file must be coverage.json or <TICKER>.json"
+                     + (" or summary.json" if summary_ok else "")); continue
+        kind = "coverage" if f == COVERAGE_FILE else ("summary" if f == SUMMARY_FILE else "ticker")
         if not isinstance(pa, str) or not grammar[kind].fullmatch(pa):
             p.append(f"entry {i}: {f}{pa!r} is not an allowed leaf of {mid}"); continue
-        if not isinstance(op, str) or op not in PATCH_OPS: p.append(f"entry {i}: op must be one of {list(PATCH_OPS)}"); continue
-        bad = _patch_value_problem(b, pa) or _patch_value_problem(n, pa)
+        if kind == "summary" and SUMMARY_RUN_PATHS.fullmatch(pa):
+            p.append(f"entry {i}: {f}{pa} is a D7 run-metadata path; it cannot also be registered"); continue
+        ops = grammar.get("ops", PATCH_OPS)
+        if not isinstance(op, str) or op not in ops: p.append(f"entry {i}: op must be one of {list(ops)}"); continue
+        containers = grammar.get("containers")
+        bad = _patch_value_problem(b, pa, containers, kind) or _patch_value_problem(n, pa, containers, kind)
         if bad: p.append(f"entry {i}: {f}{pa}: {bad}"); continue
         if op == "add" and not (is_absent(b) and not is_absent(n)): p.append(f"entry {i}: add needs base ABSENT and new present"); continue
         if op == "remove" and not (not is_absent(b) and is_absent(n)): p.append(f"entry {i}: remove needs base present and new ABSENT"); continue
@@ -1722,7 +2454,11 @@ def patch_problems(pt) -> list[str]:
         for c in es:
             kids = [k for k in es if _is_child(c["path"], k["path"])]
             if not kids: continue
-            is_container = c["path"].rsplit("/", 1)[-1] in PATCH_CONTAINER_LEAF
+            if "containers" in grammar:
+                fkind = "coverage" if f == COVERAGE_FILE else ("summary" if f == SUMMARY_FILE else "ticker")
+                is_container = container_for(grammar["containers"], fkind, c["path"]) is not None
+            else:
+                is_container = c["path"].rsplit("/", 1)[-1] in PATCH_CONTAINER_LEAF
             ok = is_container and ((c["op"] == "add" and all(k["op"] == "remove" for k in kids))
                                    or (c["op"] == "remove" and all(k["op"] == "add" for k in kids)))
             if not ok: p.append(f"{f}: overlapping parent/child entries under {c['path']}")
