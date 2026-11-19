@@ -974,3 +974,143 @@ def test_normalized_data_validation_hard_structural_raise_is_unaffected():
     }
     with pytest.raises(ValueError):
         validate_normalized_data(malformed)
+
+
+# ============================================================
+# P2 QUALITY v0.2 STAGE (additive; CI-only like the rest of this file)
+# ============================================================
+
+def test_quality_v02_stage_runs_after_d4_relabel_and_factor_stays_not_wired():
+    result = _run("2026-09-28")
+    stages = result["stages"]
+    names = list(stages)
+    # F-2 fix: Quality is computed after the DEC-055 D4 relabel, i.e. after data_sufficiency (the last relabelled stage)
+    assert names.index("quality") == names.index("data_sufficiency") + 1
+    stage = stages["quality"]
+    assert stage["status"] == STAGE_OK
+    quality = stage["quality"]
+    assert quality["schema_version"] == "quality_v0.2"
+    assert quality["evaluation_date"] == "2026-09-28"
+    assert quality["element"]["status"] in {"OK", "MISSING", "NOT_APPLICABLE"}
+    from src.fundamentals.quality import validate_quality_v02
+    assert validate_quality_v02(quality) == []
+    assert stages["factor"]["status"] == STAGE_NOT_WIRED
+    assert "percentile_score" not in stages["factor"]
+
+
+def test_quality_v02_stage_reads_but_does_not_change_earlier_stages():
+    import json as _json
+    from src.fundamentals.quality import calculate_quality_v02
+    result = _run("2026-09-28")
+    stages = result["stages"]
+    normalized = stages["normalization"]["normalized"]
+    derived = stages["derived_metrics"]["derived"]
+    before = _json.dumps([normalized, derived], sort_keys=True, default=str)
+    recomputed = calculate_quality_v02(normalized, derived, evaluation_date="2026-09-28")
+    assert _json.dumps([normalized, derived], sort_keys=True, default=str) == before
+    assert _json.dumps(recomputed, sort_keys=True, default=str) == _json.dumps(
+        stages["quality"]["quality"], sort_keys=True, default=str
+    )
+
+
+# ============================================================
+# P2 N3: Quality stage exception isolation (alternative A; CI-only like the rest of this file)
+# ============================================================
+
+SENSITIVE_SENTINEL = "SENSITIVE_SENTINEL"
+
+
+def _without_run_timestamp(result):
+    import copy as _copy
+    r = _copy.deepcopy(result)
+    r["stages"]["normalization"]["normalized"].pop("normalized_at", None)
+    return r
+
+
+def _raising(exc):
+    def fake(*args, **kwargs):
+        raise exc
+    return fake
+
+
+@pytest.mark.parametrize("exc", [RuntimeError(SENSITIVE_SENTINEL), ValueError(SENSITIVE_SENTINEL), KeyError(SENSITIVE_SENTINEL)])
+def test_quality_exception_is_isolated_to_the_quality_stage(monkeypatch, exc):
+    import json as _json
+    import src.fundamentals.orchestrator as orch
+    normal = _run("2026-09-28")
+    monkeypatch.setattr(orch, "calculate_quality_v02", _raising(exc))
+    broken = _run("2026-09-28")
+    stage = broken["stages"]["quality"]
+    assert stage == {"status": orch.STAGE_ERROR, "quality": None, "error": {"type": type(exc).__name__}}
+    assert orch.STAGE_ERROR == "ERROR"
+    # nothing of the message, traceback or inputs is recorded anywhere in the result
+    text = _json.dumps(broken, default=str)
+    assert SENSITIVE_SENTINEL not in text and "Traceback" not in text
+    # every later stage still ran, in the same order, with the same output
+    assert list(broken["stages"]) == list(normal["stages"])
+    a, b = _without_run_timestamp(normal), _without_run_timestamp(broken)
+    for name in normal["stages"]:
+        if name == "quality":
+            continue
+        assert _json.dumps(a["stages"][name], sort_keys=True, default=str) == _json.dumps(b["stages"][name], sort_keys=True, default=str), name
+    assert {k: v for k, v in a.items() if k != "stages"} == {k: v for k, v in b.items() if k != "stages"}
+
+
+def test_quality_base_exception_propagates(monkeypatch):
+    import src.fundamentals.orchestrator as orch
+
+    class _Halt(BaseException):
+        pass
+    monkeypatch.setattr(orch, "calculate_quality_v02", _raising(_Halt()))
+    with pytest.raises(_Halt):
+        _run("2026-09-28")
+
+
+def test_quality_normal_path_has_no_error_key():
+    stage = _run("2026-09-28")["stages"]["quality"]
+    assert set(stage) == {"status", "quality"} and stage["status"] == STAGE_OK
+
+
+def _checker_module():
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path as _P
+    path = _P(__file__).resolve().parents[1] / "scripts" / "step23_checker_v2_3.py"
+    spec = importlib.util.spec_from_file_location("checker_v2_9_orch", path)
+    mod = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _withheld_row(metric):
+    return {"ticker": "ORCL", "cik": ORCL_CIK, "metric": metric, "outcome": "2", "governance_status": "WITHHELD",
+            "use_scope": None, "effective_from": "2026-09-01", "effective_to": None,
+            "eligibility_available_date": "2026-09-01", "reviewed_at_utc": "2026-09-01T00:00:00Z",
+            "policy_version": "METRIC_ELIGIBILITY_V1", "decision_ref": "TEST", "rationale": "test"}
+
+
+def test_quality_reads_governance_final_inputs_after_d4_relabel():
+    """F-2 regression (confirmation run 44632163881): with a withheld input, every upstream_inputs entry Quality records
+    must equal the item as PUBLISHED in the same result (derived dependents relabelled WITHHELD, never their
+    pre-relabel MISSING), and Checker v2.9's per-component rules (I7 copy / precedence) find nothing."""
+    result = _run("2026-09-28", metric_eligibility_rows=[_withheld_row("cfo")])
+    stages = result["stages"]
+    assert stages["eligibility_gate"]["status"] == STAGE_OK and stages["eligibility_gate"]["withheld"] == ["cfo"]
+    normalized = stages["normalization"]["normalized"]["metrics"]
+    derived = stages["derived_metrics"]["derived"]["derived_metrics"]
+    quality = stages["quality"]["quality"]
+    seen_derived_withheld = 0
+    for name, comp in quality["components"].items():
+        for item in comp["upstream_inputs"]:
+            published = derived.get(item["metric"]) if item["metric"] in derived else normalized.get(item["metric"])
+            published = published or {}
+            assert (item["status"], item["reason_code"]) == (published.get("status"), published.get("reason_code")), (name, item)
+            if item["metric"] in derived and item["status"] == "WITHHELD":
+                seen_derived_withheld += 1
+    assert seen_derived_withheld > 0                      # the relabelled dependents (fcf, fcf_margin) are really exercised
+    ck = _checker_module()
+    for name, comp in quality["components"].items():
+        assert ck.q_component_problems("ORCL", result, name, comp) == [], name
+    fail, _review, _info = ck.q_leak_problems("ORCL", result, [])
+    assert fail == []

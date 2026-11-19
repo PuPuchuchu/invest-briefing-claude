@@ -390,3 +390,141 @@ def test_backward_compatible_summary_and_error_text_not_in_coverage(tmp_path):
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert "| AAA | OK |" in md and "coverage.md" in md
     assert (out / "AAA.json").exists()
+
+
+# ---------------------------------------------------------------- P2 Quality v0.2 aggregation
+
+def _quality_stage(status, leverage, flags=(), reason=None, comps=None):
+    return {
+        "status": "OK",
+        "quality": {
+            "schema_version": "quality_v0.2",
+            "element": {
+                "status": status,
+                "reason_code": reason,
+                "assessed_dimensions": {"profitability": "ASSESSED", "cash_conversion": "ASSESSED", "leverage": leverage},
+                "flags": list(flags),
+            },
+            "components": comps or {
+                "net_margin": {"status": "OK", "value": SECRET_VALUE},
+                "debt_to_cash": {"status": "MISSING", "reason_code": "INPUT_INCOMPLETE:total_debt"},
+            },
+        },
+    }
+
+
+def test_quality_v02_counts_without_values():
+    r1 = _result(_normalized())
+    r1["stages"]["quality"] = _quality_stage("OK", "NOT_ASSESSED", flags=["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"])
+    r2 = _result(_normalized())
+    r2["stages"]["quality"] = _quality_stage("OK", "PARTIALLY_ASSESSED")
+    r3 = _result(_normalized())
+    r3["stages"]["quality"] = _quality_stage("MISSING", "NOT_ASSESSED", reason="INSUFFICIENT_INDEPENDENT_COMPONENTS")
+    c = _cov([_rec("A"), _rec("B"), _rec("C")], {"A": r1, "B": r2, "C": r3})
+    qc = c["quality"]
+    assert qc["element_status_counts"] == {"OK": 2, "MISSING": 1}
+    assert qc["element_reason_code_counts"] == {"INSUFFICIENT_INDEPENDENT_COMPONENTS": 1}
+    assert qc["quality_ok_with_leverage_not_assessed"] == 1
+    assert qc["quality_ok_with_leverage_partially_assessed"] == 1
+    assert qc["flag_counts"] == {"NONPOSITIVE_FCF_LEVERAGE_UNASSESSED": 1}
+    assert qc["components"]["debt_to_cash"]["by_reason_code"] == {"INPUT_INCOMPLETE:total_debt": 3}
+    assert c["stage_status_counts"]["quality"] == {"OK": 3}
+    text = json.dumps(c) + cov.render_coverage_markdown(c)
+    assert str(SECRET_VALUE) not in text
+    assert "## Quality (v0.2)" in cov.render_coverage_markdown(c)
+
+
+def test_quality_block_present_and_empty_without_quality_stage():
+    c = _cov([_rec("A")], {"A": _result(_normalized())})
+    assert c["quality"]["element_status_counts"] == {}
+    assert "quality" not in c["stage_status_counts"]
+    assert c["quality"]["stage_error_count"] == 0 and c["quality"]["stage_error_tickers"] == []      # P2 N3 defaults
+
+
+# ---------------------------------------------------------------- P2 N3: Quality stage ERROR aggregation
+SENSITIVE_SENTINEL = "SENSITIVE_SENTINEL"
+_QERR = {"status": "ERROR", "quality": None, "error": {"type": "RuntimeError"}}
+
+
+def test_quality_stage_errors_counted_sorted_and_excluded_from_element_counts():
+    rs = {}
+    for t in ("ZED", "AAA", "MID"):
+        rs[t] = _result(_normalized())
+    rs["MID"]["stages"]["quality"] = _quality_stage("OK", "ASSESSED")
+    for t in ("ZED", "AAA"):
+        rs[t]["stages"]["quality"] = dict(_QERR)
+    c = _cov([_rec("ZED"), _rec("AAA"), _rec("MID")], rs)
+    qc = c["quality"]
+    assert qc["stage_error_count"] == 2 and qc["stage_error_tickers"] == ["AAA", "ZED"]
+    assert c["stage_status_counts"]["quality"] == {"ERROR": 2, "OK": 1}
+    assert qc["stage_error_count"] == c["stage_status_counts"]["quality"]["ERROR"]
+    assert qc["element_status_counts"] == {"OK": 1}                     # ERROR tickers not in element counts
+    assert sum(b["by_status"].get("OK", 0) for b in qc["components"].values()) == 1
+    md = cov.render_coverage_markdown(c)
+    assert "Quality stage ERROR (exception isolated to the stage; type only): 2 (AAA, ZED)" in md
+
+
+def test_quality_stage_error_text_never_copied():
+    rs = {"AAA": _result(_normalized())}
+    rs["AAA"]["stages"]["quality"] = {"status": "ERROR", "quality": None, "error": {"type": "RuntimeError", "message": SENSITIVE_SENTINEL}}
+    c = _cov([_rec("AAA")], rs)
+    assert c["quality"]["stage_error_tickers"] == ["AAA"]
+    assert SENSITIVE_SENTINEL not in json.dumps(c) and SENSITIVE_SENTINEL not in cov.render_coverage_markdown(c)
+
+
+# ---------------------------------------------------------------- P2 N3: contract with Checker v2.9 (Q6 / Q7)
+def _checker():
+    import importlib.util
+    from pathlib import Path as _P
+    path = _P(__file__).resolve().parents[1] / "scripts" / "step23_checker_v2_3.py"
+    spec = importlib.util.spec_from_file_location("checker_v2_9_contract", path)
+    mod = importlib.util.module_from_spec(spec)
+    import sys as _sys
+    _sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _contract_stage(kind):
+    if kind == "error":
+        return dict(_QERR)
+    if kind == "unavailable":
+        return {"status": "OK", "quality": {"schema_version": "quality_v0.2", "element": None}}
+    return _quality_stage("OK", "PARTIALLY_ASSESSED", flags=["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"])
+
+
+@pytest.mark.parametrize("kind", ["ok", "error", "unavailable"])
+def test_contract_production_summary_and_coverage_match_checker(tmp_path, kind):
+    """Production batch_runner._quality_summary + batch_coverage output, written by run_batch, must equal what
+    Checker v2.9 re-derives from the ticker files (q_summary_expected / recompute_quality_coverage), per state."""
+    ck = _checker()
+    members = [_member("AAA", "0000000001"), _member("BBB", "0000000002")]
+    cts = [_ct("AAA", "0000000001"), _ct("BBB", "0000000002")]
+    data = {"AAA": _normalized(), "BBB": _normalized()}
+    base = _pipeline(data)
+
+    def pipeline(**kw):
+        r = base(**kw)
+        r["ticker"] = kw["ticker"]                       # the real pipeline result names its ticker (Checker D10 joins on it)
+        r["stages"]["quality"] = _contract_stage(kind) if kw["ticker"] == "AAA" else _contract_stage("ok")
+        return r
+    summary, c, out = _run(tmp_path, members, cts, data, evaluation_date=EVAL, pipeline=pipeline)
+
+    class Run:
+        pass
+    run = Run()
+    run.label, run.coverage = "NEW", c
+    run.summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    run.results = {r["ticker"]: json.loads((out / f"{r['ticker']}.json").read_text(encoding="utf-8"))
+                   for r in run.summary["records"] if r["status"] == STATUS_OK}
+    assert ck.q_summary_problems(run) == []                                   # Q7
+    for rec in run.summary["records"]:
+        if rec["status"] == STATUS_OK:
+            want = ck.q_summary_expected(run.results[rec["ticker"]])
+            assert json.dumps(rec["quality"], sort_keys=True) == json.dumps(want, sort_keys=True)
+            assert [type(rec["quality"][k]) for k in ck.Q_SUMMARY_KEYS] == [type(want[k]) for k in ck.Q_SUMMARY_KEYS]
+    ss, qc = ck.recompute_quality_coverage(run)                                # Q6
+    assert c["stage_status_counts"]["quality"] == ss
+    assert json.dumps(c["quality"], sort_keys=True) == json.dumps(qc, sort_keys=True)
+    want_err = ["AAA"] if kind == "error" else []
+    assert c["quality"]["stage_error_tickers"] == want_err and c["quality"]["stage_error_count"] == len(want_err)
