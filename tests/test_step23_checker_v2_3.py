@@ -2913,8 +2913,11 @@ class ExactPathTimestampsV28(unittest.TestCase):
 
 # ---------------------------------------------------------------- v2.9: characterization of v2.8 behaviour (written first)
 D7_ID = "D7"
-V28_BODY_SHA = {"profile": "c200a0dd806a1beb89bea2a22f7688cde5e5ea6266d0af5a0585f558730c7566",
-                "none": "934c99f6cbc20df3d212ed988f35bbc2a73a12988146efad40c712505ae16798"}
+# sha256 of the check lines (header excluded) with ONLY the checker's repo-root string replaced by "<REPO>" (it appears
+# once, in M1's detail, and differs per checkout / CI runner). Recomputed on the v2.8 commit ececdd9 with this same
+# normalization; v2.9's normalized body is byte-identical.
+V28_BODY_SHA = {"profile": "4aef2f0c4fc75fa009c5fed1cfa845aa65d4dd71ae7a96781b38e72b7442bc30",
+                "none": "83f9e9b12d4cb60b122262e5a70a56f84de7c4fc0e919b44e61eea4e97fc560c"}
 
 
 class CharacterizationV28(unittest.TestCase):
@@ -2925,8 +2928,10 @@ class CharacterizationV28(unittest.TestCase):
         for key, prof in (("profile", PROFILE), ("none", None)):
             code, out = run_pair(Pair(), profile=prof)
             body = "\n".join(out.splitlines()[3:])
+            repo = ck.default_repo_root()
+            self.assertTrue(repo and body.count(repo) == 1, out)          # exactly the M1 detail; nothing else normalized
             self.assertEqual(code, 0, out)
-            self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), V28_BODY_SHA[key], out)
+            self.assertEqual(hashlib.sha256(body.replace(repo, "<REPO>").encode()).hexdigest(), V28_BODY_SHA[key], out)
 
     def _d7(self, mut):
         p = Pair(); p.summary_mut["NEW"] = mut
@@ -3532,6 +3537,54 @@ class DebtDatesV29(unittest.TestCase):
         t = self.td(); t["components"]["current_debt"]["period_end"] = "2026-09-26T00:00:00"
         self.assertTrue(ck.q_debt_dates(t)[1])
         self.assertEqual(ck.q_debt_dates({"status": "INCOMPLETE", "scope_alignment": {"period_end": "bad"}}), ([], []))
+
+
+class DirectRuleTestsV29(unittest.TestCase):
+    """Audit F-8: rules that had no test of their own. Each asserts the rule's own message (not just any FAIL)."""
+
+    def test_l3d_no_withheld_source(self):
+        # Normal: the clean GE fixture -> no L3d message.
+        doc = add_quality(q_ticker("GE", "V2"))
+        fail, _r, _i = ck.q_leak_problems("GE", doc, [])
+        self.assertFalse([x for x in fail if "L3d" in x], fail)
+        # Abnormal: operating_income is withheld by the gate, but the gated normalized item and the derived
+        # operating_margin are left un-withheld -> operating_margin is tainted with no WITHHELD source. (L3d is only
+        # reachable together with L0 / L3a, which is why it is a defensive rule; its own message must still appear.)
+        bad = copy.deepcopy(doc)
+        bad["stages"]["normalization"]["normalized"]["metrics"]["operating_income"] = metric("operating_income", 40_000)
+        bad["stages"]["derived_metrics"]["derived"]["derived_metrics"]["operating_margin"] = ok(0.4)
+        fail, _r, _i = ck.q_leak_problems("GE", bad, [])
+        self.assertIn("GE.operating_margin: L3d no withheld input among direct/derived sources", fail)
+        self.assertFalse([x for x in fail if "L3d" in x and "operating_margin" not in x], fail)
+
+    def _td(self, **kw):
+        t = {"status": "OK", "value": 20_000, "components": {
+            "current_debt": {"status": "OK", "value": 5_000, "concept": "LongTermDebtCurrent", "period_end": "2026-09-26"},
+            "noncurrent_debt": {"status": "OK", "value": 15_000, "concept": "LongTermDebtNoncurrent", "period_end": "2026-09-26"}}}
+        t.update(kw); return t
+
+    def test_i9d_b1_component_key_set(self):
+        B1 = ["I9-D B-1/A-4 components must be exactly current_debt and noncurrent_debt, both OK"]
+        self.assertEqual(ck.q_debt_dates(self._td()), (["2026-09-26"], []))
+        extra = self._td(); extra["components"]["short_term_debt"] = {"status": "OK", "value": 0, "period_end": "2026-09-26"}
+        missing = self._td(); missing["components"].pop("noncurrent_debt")
+        not_ok = self._td(); not_ok["components"]["current_debt"]["status"] = "INCOMPLETE"
+        not_dict = self._td(components=[])
+        for name, td in (("extra key", extra), ("missing key", missing), ("component not OK", not_ok), ("not an object", not_dict)):
+            with self.subTest(name):
+                self.assertEqual(ck.q_debt_dates(td), ([], B1))
+
+    def test_i9d_a3_component_sum_total(self):
+        rows = [{"role": "current_debt", "concept": "LongTermDebtCurrent", "value": 5_000, "period_end": "2026-09-26"},
+                {"role": "short_term_component", "concept": "CommercialPaper", "value": 1_000, "period_end": "2026-09-26"},
+                {"role": "noncurrent_debt", "concept": "LongTermDebtNoncurrent", "value": 15_000, "period_end": "2026-09-26"}]
+        good = self._td(value=21_000, component_sum={"applied": True, "components": copy.deepcopy(rows)})
+        self.assertEqual(ck.q_debt_dates(good), (["2026-09-26"], []))
+        off = self._td(value=21_001, component_sum={"applied": True, "components": copy.deepcopy(rows)})
+        self.assertEqual(ck.q_debt_dates(off), ([], ["I9-D A-3 component_sum total != total_debt value"]))
+        nonfinite = copy.deepcopy(rows); nonfinite[1]["value"] = "1000"
+        self.assertEqual(ck.q_debt_dates(self._td(value=21_000, component_sum={"applied": True, "components": nonfinite})),
+                         ([], ["I9-D A-3 component_sum values"]))
 
 
 class ValidP0V29(unittest.TestCase):
