@@ -176,6 +176,30 @@ def _metric_summary(result: dict) -> dict:
     return out
 
 
+def _quality_summary(result: dict) -> dict:
+    """P2 Quality v0.2 element summary for the batch record, read from the
+    pipeline's QUALITY stage. Absent structure is reported as absent."""
+    stage = (result.get("stages") or {}).get("quality") or {}
+    quality = stage.get("quality") if isinstance(stage, dict) else None
+    element = quality.get("element") if isinstance(quality, dict) else None
+    if not isinstance(element, dict):
+        return {"_available": False}
+    dims = element.get("assessed_dimensions") or {}
+    return {
+        "_available": True,
+        "schema_version": quality.get("schema_version"),
+        "status": element.get("status"),
+        "reason_code": element.get("reason_code"),
+        "score": element.get("score"),
+        "stars": element.get("stars"),
+        "scored_weight_fraction": element.get("scored_weight_fraction"),
+        "rated_count": element.get("rated_count"),
+        "not_meaningful_count": element.get("not_meaningful_count"),
+        "leverage_assessment": dims.get("leverage") if isinstance(dims, dict) else None,
+        "flags": list(element.get("flags") or []),
+    }
+
+
 def _stage_statuses(result: dict) -> dict:
     stages = result.get("stages") or {}
     return {
@@ -576,6 +600,7 @@ def run_batch(
             record["status"] = STATUS_OK
             record["stage_statuses"] = _stage_statuses(result)
             record["metrics"] = _metric_summary(result)
+            record["quality"] = _quality_summary(result)
             results[ticker] = result
             if output_dir is not None:
                 with (output_dir / f"{ticker}.json").open("w", encoding="utf-8") as f:

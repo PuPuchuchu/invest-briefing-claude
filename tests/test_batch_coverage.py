@@ -390,3 +390,51 @@ def test_backward_compatible_summary_and_error_text_not_in_coverage(tmp_path):
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert "| AAA | OK |" in md and "coverage.md" in md
     assert (out / "AAA.json").exists()
+
+
+# ---------------------------------------------------------------- P2 Quality v0.2 aggregation
+
+def _quality_stage(status, leverage, flags=(), reason=None, comps=None):
+    return {
+        "status": "OK",
+        "quality": {
+            "schema_version": "quality_v0.2",
+            "element": {
+                "status": status,
+                "reason_code": reason,
+                "assessed_dimensions": {"profitability": "ASSESSED", "cash_conversion": "ASSESSED", "leverage": leverage},
+                "flags": list(flags),
+            },
+            "components": comps or {
+                "net_margin": {"status": "OK", "value": SECRET_VALUE},
+                "debt_to_cash": {"status": "MISSING", "reason_code": "INPUT_INCOMPLETE:total_debt"},
+            },
+        },
+    }
+
+
+def test_quality_v02_counts_without_values():
+    r1 = _result(_normalized())
+    r1["stages"]["quality"] = _quality_stage("OK", "NOT_ASSESSED", flags=["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"])
+    r2 = _result(_normalized())
+    r2["stages"]["quality"] = _quality_stage("OK", "PARTIALLY_ASSESSED")
+    r3 = _result(_normalized())
+    r3["stages"]["quality"] = _quality_stage("MISSING", "NOT_ASSESSED", reason="INSUFFICIENT_INDEPENDENT_COMPONENTS")
+    c = _cov([_rec("A"), _rec("B"), _rec("C")], {"A": r1, "B": r2, "C": r3})
+    qc = c["quality"]
+    assert qc["element_status_counts"] == {"OK": 2, "MISSING": 1}
+    assert qc["element_reason_code_counts"] == {"INSUFFICIENT_INDEPENDENT_COMPONENTS": 1}
+    assert qc["quality_ok_with_leverage_not_assessed"] == 1
+    assert qc["quality_ok_with_leverage_partially_assessed"] == 1
+    assert qc["flag_counts"] == {"NONPOSITIVE_FCF_LEVERAGE_UNASSESSED": 1}
+    assert qc["components"]["debt_to_cash"]["by_reason_code"] == {"INPUT_INCOMPLETE:total_debt": 3}
+    assert c["stage_status_counts"]["quality"] == {"OK": 3}
+    text = json.dumps(c) + cov.render_coverage_markdown(c)
+    assert str(SECRET_VALUE) not in text
+    assert "## Quality (v0.2)" in cov.render_coverage_markdown(c)
+
+
+def test_quality_block_present_and_empty_without_quality_stage():
+    c = _cov([_rec("A")], {"A": _result(_normalized())})
+    assert c["quality"]["element_status_counts"] == {}
+    assert "quality" not in c["stage_status_counts"]

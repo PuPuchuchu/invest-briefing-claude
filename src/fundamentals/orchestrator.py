@@ -222,6 +222,7 @@ from src.fundamentals.finance_lease_evidence_registry import (
     resolve_lease_scope_mismatch_with_evidence,
 )
 from src.fundamentals.growth import calculate_growth
+from src.fundamentals.quality import calculate_quality_v02
 from src.fundamentals import per_share_comparatives
 from src.fundamentals.peer_classification import get_peer_mapping_as_of
 from src.fundamentals.point_in_time import (
@@ -955,6 +956,25 @@ def run_fundamentals_pipeline(
     stages["derived_metrics"] = {
         "status": STAGE_OK,
         "derived": derived,
+    }
+
+    # --------------------------------------------------------
+    # STAGE: QUALITY (P2, Quality v0.2 -- design v3 + v3.1)
+    #
+    # Reads the already computed (eligibility-gated) normalized result and
+    # the derived metrics; fetches nothing and changes neither. Writes only
+    # this new stage. The factor stage below stays NOT_WIRED: a Quality
+    # element score is an individual factor result, not a Factor/Composite
+    # score or a buy/sell signal. A defect in Quality's own output raises
+    # (fail closed); the batch runner isolates that to the one ticker.
+    # --------------------------------------------------------
+    stages["quality"] = {
+        "status": STAGE_OK,
+        "quality": calculate_quality_v02(
+            normalized,
+            derived,
+            evaluation_date=eval_date,
+        ),
     }
 
     # --------------------------------------------------------

@@ -264,3 +264,19 @@ def test_real_reference_data_gating(tmp_path, evaluation_date, expected_ok):
         assert excluded == ["BLK", "JPM", "UNH"]
     else:
         assert len(excluded) == 21
+
+
+def test_quality_summary_reads_quality_stage_and_reports_absence():
+    from src.fundamentals.batch_runner import _quality_summary
+    assert _quality_summary({"stages": {}}) == {"_available": False}
+    result = {"stages": {"quality": {"status": "OK", "quality": {
+        "schema_version": "quality_v0.2",
+        "element": {
+            "status": "OK", "reason_code": None, "score": 4.2, "stars": 4,
+            "scored_weight_fraction": 0.7778, "rated_count": 4, "not_meaningful_count": 0,
+            "assessed_dimensions": {"leverage": "NOT_ASSESSED"}, "flags": [],
+        },
+    }}}}
+    s = _quality_summary(result)
+    assert s["_available"] is True and s["status"] == "OK" and s["stars"] == 4
+    assert s["leverage_assessment"] == "NOT_ASSESSED" and s["schema_version"] == "quality_v0.2"

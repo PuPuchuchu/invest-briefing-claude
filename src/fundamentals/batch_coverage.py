@@ -287,6 +287,15 @@ def build_coverage(
     withheld_components: dict[str, int] = {}
     sufficiency: dict = {}
     debt_tier2: dict = {"by_status": {}, "by_reason_code": {}}
+    quality: dict = {
+        "element_status_counts": {},
+        "element_reason_code_counts": {},
+        "components": {},
+        "leverage_assessment_counts": {},
+        "quality_ok_with_leverage_not_assessed": 0,
+        "quality_ok_with_leverage_partially_assessed": 0,
+        "flag_counts": {},
+    }
     for ticker, _ct, result in evaluated:
         if result is None:
             continue
@@ -311,6 +320,24 @@ def build_coverage(
                 _inc(block["by_calculation_status"], (item or {}).get("calculation_status") or KEY_ABSENT)
                 if (item or {}).get("calculation_status") != "OK":
                     _inc(block["by_reason_code"], (item or {}).get("reason_code") or NO_REASON_CODE)
+        q = (stages.get("quality") or {}).get("quality")
+        if isinstance(q, dict) and isinstance(q.get("element"), dict):
+            element = q["element"]
+            _inc(quality["element_status_counts"], element.get("status") or KEY_ABSENT)
+            if element.get("status") != "OK":
+                _inc(quality["element_reason_code_counts"], element.get("reason_code") or NO_REASON_CODE)
+            comps = q.get("components")
+            if isinstance(comps, dict) and comps:
+                _merge_blocks(quality["components"], _status_block(comps))
+            leverage = (element.get("assessed_dimensions") or {}).get("leverage")
+            if leverage is not None:
+                _inc(quality["leverage_assessment_counts"], leverage)
+            if element.get("status") == "OK" and leverage == "NOT_ASSESSED":
+                quality["quality_ok_with_leverage_not_assessed"] += 1
+            if element.get("status") == "OK" and leverage == "PARTIALLY_ASSESSED":
+                quality["quality_ok_with_leverage_partially_assessed"] += 1
+            for flag in element.get("flags") or []:
+                _inc(quality["flag_counts"], flag)
         tier2 = (stages.get("debt_tiers") or {}).get("total_debt_including_finance_leases")
         if isinstance(tier2, dict):
             _inc(debt_tier2["by_status"], tier2.get("status") or KEY_ABSENT)
@@ -346,6 +373,7 @@ def build_coverage(
         },
         "data_sufficiency": sufficiency,
         "debt_tiers": {"total_debt_including_finance_leases": debt_tier2},
+        "quality": quality,
         "notes": [
             "Execution OK means the pipeline returned; it does not mean metric data is OK.",
             "R1/R2 apply to normalized metrics only. No thresholds are applied.",
@@ -430,6 +458,23 @@ def render_coverage_markdown(coverage: dict) -> str:
     ]
     for name, b in sorted(coverage["data_sufficiency"].items()):
         lines.append(f"| {name} | {_fmt_counts(b['by_calculation_status'])} | {_fmt_counts(b['by_reason_code'])} |")
+    qc = coverage.get("quality")
+    if isinstance(qc, dict):
+        lines += [
+            "",
+            "## Quality (v0.2)",
+            "",
+            f"Element: {_fmt_counts(qc['element_status_counts'])}; non-OK reason codes: {_fmt_counts(qc['element_reason_code_counts'])}",
+            f"Leverage assessment: {_fmt_counts(qc['leverage_assessment_counts'])}; "
+            f"OK with leverage not assessed: {qc['quality_ok_with_leverage_not_assessed']}; "
+            f"OK with leverage partially assessed: {qc['quality_ok_with_leverage_partially_assessed']}; "
+            f"flags: {_fmt_counts(qc['flag_counts'])}",
+            "",
+            "| Component | Status | Non-OK reason codes |",
+            "|---|---|---|",
+        ]
+        for name, b in sorted(qc["components"].items()):
+            lines.append(f"| {name} | {_fmt_counts(b['by_status'])} | {_fmt_counts(b['by_reason_code'])} |")
     t2 = coverage["debt_tiers"]["total_debt_including_finance_leases"]
     lines += [
         "",

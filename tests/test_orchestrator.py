@@ -974,3 +974,39 @@ def test_normalized_data_validation_hard_structural_raise_is_unaffected():
     }
     with pytest.raises(ValueError):
         validate_normalized_data(malformed)
+
+
+# ============================================================
+# P2 QUALITY v0.2 STAGE (additive; CI-only like the rest of this file)
+# ============================================================
+
+def test_quality_v02_stage_is_added_after_derived_metrics_and_factor_stays_not_wired():
+    result = _run("2026-09-28")
+    stages = result["stages"]
+    names = list(stages)
+    assert names.index("quality") == names.index("derived_metrics") + 1
+    stage = stages["quality"]
+    assert stage["status"] == STAGE_OK
+    quality = stage["quality"]
+    assert quality["schema_version"] == "quality_v0.2"
+    assert quality["evaluation_date"] == "2026-09-28"
+    assert quality["element"]["status"] in {"OK", "MISSING", "NOT_APPLICABLE"}
+    from src.fundamentals.quality import validate_quality_v02
+    assert validate_quality_v02(quality) == []
+    assert stages["factor"]["status"] == STAGE_NOT_WIRED
+    assert "percentile_score" not in stages["factor"]
+
+
+def test_quality_v02_stage_reads_but_does_not_change_earlier_stages():
+    import json as _json
+    from src.fundamentals.quality import calculate_quality_v02
+    result = _run("2026-09-28")
+    stages = result["stages"]
+    normalized = stages["normalization"]["normalized"]
+    derived = stages["derived_metrics"]["derived"]
+    before = _json.dumps([normalized, derived], sort_keys=True, default=str)
+    recomputed = calculate_quality_v02(normalized, derived, evaluation_date="2026-09-28")
+    assert _json.dumps([normalized, derived], sort_keys=True, default=str) == before
+    assert _json.dumps(recomputed, sort_keys=True, default=str) == _json.dumps(
+        stages["quality"]["quality"], sort_keys=True, default=str
+    )
