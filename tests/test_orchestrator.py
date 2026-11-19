@@ -980,11 +980,12 @@ def test_normalized_data_validation_hard_structural_raise_is_unaffected():
 # P2 QUALITY v0.2 STAGE (additive; CI-only like the rest of this file)
 # ============================================================
 
-def test_quality_v02_stage_is_added_after_derived_metrics_and_factor_stays_not_wired():
+def test_quality_v02_stage_runs_after_d4_relabel_and_factor_stays_not_wired():
     result = _run("2026-09-28")
     stages = result["stages"]
     names = list(stages)
-    assert names.index("quality") == names.index("derived_metrics") + 1
+    # F-2 fix: Quality is computed after the DEC-055 D4 relabel, i.e. after data_sufficiency (the last relabelled stage)
+    assert names.index("quality") == names.index("data_sufficiency") + 1
     stage = stages["quality"]
     assert stage["status"] == STAGE_OK
     quality = stage["quality"]
@@ -1068,3 +1069,48 @@ def test_quality_base_exception_propagates(monkeypatch):
 def test_quality_normal_path_has_no_error_key():
     stage = _run("2026-09-28")["stages"]["quality"]
     assert set(stage) == {"status", "quality"} and stage["status"] == STAGE_OK
+
+
+def _checker_module():
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path as _P
+    path = _P(__file__).resolve().parents[1] / "scripts" / "step23_checker_v2_3.py"
+    spec = importlib.util.spec_from_file_location("checker_v2_9_orch", path)
+    mod = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _withheld_row(metric):
+    return {"ticker": "ORCL", "cik": ORCL_CIK, "metric": metric, "outcome": "2", "governance_status": "WITHHELD",
+            "use_scope": None, "effective_from": "2026-09-01", "effective_to": None,
+            "eligibility_available_date": "2026-09-01", "reviewed_at_utc": "2026-09-01T00:00:00Z",
+            "policy_version": "METRIC_ELIGIBILITY_V1", "decision_ref": "TEST", "rationale": "test"}
+
+
+def test_quality_reads_governance_final_inputs_after_d4_relabel():
+    """F-2 regression (confirmation run 44632163881): with a withheld input, every upstream_inputs entry Quality records
+    must equal the item as PUBLISHED in the same result (derived dependents relabelled WITHHELD, never their
+    pre-relabel MISSING), and Checker v2.9's per-component rules (I7 copy / precedence) find nothing."""
+    result = _run("2026-09-28", metric_eligibility_rows=[_withheld_row("cfo")])
+    stages = result["stages"]
+    assert stages["eligibility_gate"]["status"] == STAGE_OK and stages["eligibility_gate"]["withheld"] == ["cfo"]
+    normalized = stages["normalization"]["normalized"]["metrics"]
+    derived = stages["derived_metrics"]["derived"]["derived_metrics"]
+    quality = stages["quality"]["quality"]
+    seen_derived_withheld = 0
+    for name, comp in quality["components"].items():
+        for item in comp["upstream_inputs"]:
+            published = derived.get(item["metric"]) if item["metric"] in derived else normalized.get(item["metric"])
+            published = published or {}
+            assert (item["status"], item["reason_code"]) == (published.get("status"), published.get("reason_code")), (name, item)
+            if item["metric"] in derived and item["status"] == "WITHHELD":
+                seen_derived_withheld += 1
+    assert seen_derived_withheld > 0                      # the relabelled dependents (fcf, fcf_margin) are really exercised
+    ck = _checker_module()
+    for name, comp in quality["components"].items():
+        assert ck.q_component_problems("ORCL", result, name, comp) == [], name
+    fail, _review, _info = ck.q_leak_problems("ORCL", result, [])
+    assert fail == []
