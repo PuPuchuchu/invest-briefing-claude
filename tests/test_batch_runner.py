@@ -267,8 +267,11 @@ def test_real_reference_data_gating(tmp_path, evaluation_date, expected_ok):
 
 
 def test_quality_summary_reads_quality_stage_and_reports_absence():
-    from src.fundamentals.batch_runner import _quality_summary
-    assert _quality_summary({"stages": {}}) == {"_available": False}
+    from src.fundamentals.batch_runner import QUALITY_SUMMARY_KEYS, _quality_summary
+    absent = _quality_summary({"stages": {}})
+    assert tuple(absent) == QUALITY_SUMMARY_KEYS and len(absent) == 13
+    assert absent["_available"] is False and absent["flags"] == [] and absent["stage_status"] is None
+    assert all(absent[k] is None for k in QUALITY_SUMMARY_KEYS if k not in ("_available", "flags"))
     result = {"stages": {"quality": {"status": "OK", "quality": {
         "schema_version": "quality_v0.2",
         "element": {
@@ -280,3 +283,61 @@ def test_quality_summary_reads_quality_stage_and_reports_absence():
     s = _quality_summary(result)
     assert s["_available"] is True and s["status"] == "OK" and s["stars"] == 4
     assert s["leverage_assessment"] == "NOT_ASSESSED" and s["schema_version"] == "quality_v0.2"
+
+
+
+# ---------------------------------------------------------------- P2 N3: Quality stage ERROR isolation (13-key summary)
+_Q_ELEMENT = {"status": "OK", "reason_code": None, "score": 4.2, "stars": 4, "scored_weight_fraction": 0.7777777777777778,
+              "rated_count": 4, "not_meaningful_count": 1,
+              "assessed_dimensions": {"profitability": "ASSESSED", "cash_conversion": "ASSESSED", "leverage": "PARTIALLY_ASSESSED"},
+              "flags": ["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"]}
+_Q_OK = {"status": "OK", "quality": {"schema_version": "quality_v0.2", "element": _Q_ELEMENT, "components": {}}}
+_Q_ERROR = {"status": "ERROR", "quality": None, "error": {"type": "RuntimeError"}}
+_Q_NO_ELEMENT = {"status": "OK", "quality": {"schema_version": "quality_v0.2", "element": None}}
+
+
+def test_quality_summary_thirteen_keys_per_state():
+    from src.fundamentals.batch_runner import QUALITY_SUMMARY_KEYS, _quality_summary
+    assert len(QUALITY_SUMMARY_KEYS) == 13 and len(set(QUALITY_SUMMARY_KEYS)) == 13
+    ok = _quality_summary({"stages": {"quality": _Q_OK}})
+    err = _quality_summary({"stages": {"quality": _Q_ERROR}})
+    none = _quality_summary({"stages": {"quality": _Q_NO_ELEMENT}})
+    for s in (ok, err, none):
+        assert tuple(s) == QUALITY_SUMMARY_KEYS
+    assert ok == {"_available": True, "schema_version": "quality_v0.2", "status": "OK", "reason_code": None, "score": 4.2,
+                  "stars": 4, "scored_weight_fraction": 0.7777777777777778, "rated_count": 4, "not_meaningful_count": 1,
+                  "leverage_assessment": "PARTIALLY_ASSESSED", "flags": ["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"],
+                  "stage_status": "OK", "error_type": None}
+    assert type(ok["stars"]) is int and type(ok["score"]) is float
+    assert err == {**{k: None for k in QUALITY_SUMMARY_KEYS}, "_available": False, "flags": [], "stage_status": "ERROR",
+                   "error_type": "RuntimeError"}
+    assert none == {**{k: None for k in QUALITY_SUMMARY_KEYS}, "_available": False, "flags": [], "stage_status": "OK"}
+    ok["flags"].append("x")                                     # the summary owns its list
+    assert _Q_ELEMENT["flags"] == ["NONPOSITIVE_FCF_LEVERAGE_UNASSESSED"]
+
+
+def _quality_pipeline(stage_by_ticker):
+    inner = _fake_pipeline([])
+    def pipeline(**kwargs):
+        result = inner(**kwargs)
+        result["stages"]["quality"] = json.loads(json.dumps(stage_by_ticker[kwargs["ticker"]]))
+        return result
+    return pipeline
+
+
+def test_quality_error_ticker_stays_ok_and_others_unaffected(tmp_path):
+    out = tmp_path / "out"
+    summary = run_batch(
+        evaluation_date="2026-10-27", company_type_rows=CT_ROWS, membership_rows=MEMBERS,
+        pipeline_fn=_quality_pipeline({"AAA": _Q_OK, "BBB": _Q_ERROR}), fetch_fn=_fake_fetch([]),
+        raw_dir=tmp_path / "raw", output_dir=out,
+    )
+    by = {r["ticker"]: r for r in summary["records"]}
+    assert by["AAA"]["status"] == STATUS_OK and by["BBB"]["status"] == STATUS_OK
+    assert by["BBB"]["stage_statuses"]["quality"] == "ERROR" and by["AAA"]["stage_statuses"]["quality"] == "OK"
+    assert by["BBB"]["quality"]["error_type"] == "RuntimeError" and by["BBB"]["quality"]["_available"] is False
+    assert by["AAA"]["quality"]["_available"] is True and by["AAA"]["quality"]["stars"] == 4
+    for t in ("AAA", "BBB"):
+        doc = json.loads((out / f"{t}.json").read_text(encoding="utf-8"))
+        assert doc["stages"]["quality"]["status"] == ("ERROR" if t == "BBB" else "OK")
+    assert json.loads((out / "BBB.json").read_text(encoding="utf-8"))["stages"]["quality"] == _Q_ERROR
