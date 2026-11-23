@@ -533,10 +533,13 @@ class ProfileNone(unittest.TestCase):
 
 
 class MappingDrift(unittest.TestCase):
-    def _registry(self, tmp, derived=None, growth=None, raw=None):
+    def _registry(self, tmp, derived=None, growth=None, raw=None, composite_tail=None):
         d = os.path.join(tmp, "src", "fundamentals"); os.makedirs(d)
+        # v2.10: the production registry also carries the F-7 composite constants (M3 reads them)
+        tail = composite_tail if composite_tail is not None else (
+            f"COMPOSITE_GOVERNED_METRICS = {dict(ck.COMPOSITE_COMPONENTS)!r}\nCOMPOSITE_WITHHELD_BASIS = {ck.COMPOSITE_WITHHELD_BASIS!r}\n")
         text = raw if raw is not None else (f"DERIVED_DEPENDENCIES = {derived if derived is not None else dict(ck.DERIVED_DEPS)!r}\n"
-                                            f"GROWTH_DEPENDENCIES = {growth if growth is not None else dict(ck.GROWTH_DEPS)!r}\n")
+                                            f"GROWTH_DEPENDENCIES = {growth if growth is not None else dict(ck.GROWTH_DEPS)!r}\n" + tail)
         with open(os.path.join(d, "metric_eligibility_registry.py"), "w") as fh: fh.write(text)
         return tmp
 
@@ -1812,7 +1815,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.9")             # P2 Quality v0.2 stage checks (explicit revision; was v2.8)
+        self.assertEqual(ck.VERSION, "checker_v2.10")            # F-7 composite closure checks (explicit revision; was v2.9)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -2920,6 +2923,19 @@ V28_BODY_SHA = {"profile": "4aef2f0c4fc75fa009c5fed1cfa845aa65d4dd71ae7a96781b38
                 "none": "83f9e9b12d4cb60b122262e5a70a56f84de7c4fc0e919b44e61eea4e97fc560c"}
 
 
+V210_ADDED_IDS = ("B8", "F2", "M3")
+
+
+def v28_view(out):
+    """v2.10 only ADDS check lines (B8, F2, M3). The v2.8 view of an output: those lines removed and the OVERALL line
+    recounted from the remaining verdicts; every other line (padding included) must stay byte-identical."""
+    keep = [l for l in out.splitlines()[3:] if not ((m := VERDICT_RE.match(l)) and m.group(3) in V210_ADDED_IDS)]
+    vs = [m.group(1) for l in keep if (m := VERDICT_RE.match(l))]
+    nf, nr = vs.count("FAIL"), vs.count("REVIEW")
+    overall = f"OVERALL {'FAIL' if nf else ('REVIEW' if nr else 'PASS')}: PASS {vs.count('PASS')} / FAIL {nf} / REVIEW {nr} / INFO {vs.count('INFO')}"
+    return "\n".join(overall if l.startswith("OVERALL ") else l for l in keep)
+
+
 class CharacterizationV28(unittest.TestCase):
     """Pinned before any v2.9 change: a pair without any Quality output must produce byte-identical check lines
     (header aside), and D7 keeps its exact v2.8 allow-list when no summary expected_patch entry exists."""
@@ -2927,7 +2943,7 @@ class CharacterizationV28(unittest.TestCase):
     def test_no_quality_output_identical_to_v28(self):
         for key, prof in (("profile", PROFILE), ("none", None)):
             code, out = run_pair(Pair(), profile=prof)
-            body = "\n".join(out.splitlines()[3:])
+            body = v28_view(out)
             repo = ck.default_repo_root()
             self.assertTrue(repo and body.count(repo) == 1, out)          # exactly the M1 detail; nothing else normalized
             self.assertEqual(code, 0, out)
@@ -3135,7 +3151,8 @@ class QualityCleanV29(unittest.TestCase):
         for c in ("D2", "D7", "D9"): self.assertEqual(verdict(out, c), "PASS", out)
         self.assertIsNone(verdict(out, "Q0"))
 
-    def test_component_debt_gap_is_review(self):
+    def test_component_debt_gap_fails(self):
+        # v2.10 (F-7 decided): a withheld debt component with total_debt still in use is a policy violation, not a gap
         p = QPair()
         for lab in ("NEW", "BASE"):
             g = p.res[lab]["GE"]["stages"]["eligibility_gate"]
@@ -3143,7 +3160,11 @@ class QualityCleanV29(unittest.TestCase):
             g["unmasked_originals"]["current_debt"] = metric("current_debt", 5_000)
             p.res[lab]["GE"]["stages"]["normalization"]["normalized"]["metrics"]["current_debt"] = {"metric": "current_debt", "status": "WITHHELD", "value": None}
         out = run_pair(p, profile=None)[1]
-        self.assertEqual(qv(out, "Q5"), "REVIEW", out)
+        self.assertEqual(qv(out, "Q5"), "FAIL", out)
+        self.assertIn("composite closure violated", out)
+        for lab in ("NEW", "BASE"):
+            self.assertEqual(verdict(out, "B8", lab), "FAIL", out)
+            self.assertEqual(verdict(out, "F2", lab), "FAIL", out)      # total_debt.components.current_debt still carries it
 
 
 def p2_profile(base_files, new_files, tickers):
@@ -3607,3 +3628,194 @@ class ValidP0V29(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+
+# ---------------------------------------------------------------- v2.10: F-7 composite closure (B8), in-ticker leak (F2), M3
+def close_debt(r, parts=("current_debt",), composite=True, **mask_extra):
+    """Apply the F-7 gate outcome to one fixture ticker: parts withheld (masked, originals kept) and, if composite,
+    total_debt masked with the composite basis (moved out of the other lists, original kept)."""
+    st = r["stages"]; g = st["eligibility_gate"]; nm = st["normalization"]["normalized"]["metrics"]
+    for x in parts:
+        g["withheld"].append(x); g["unmasked_originals"][x] = metric(x, 5_000 if x == "current_debt" else 15_000)
+        nm[x] = {"metric": x, "status": "WITHHELD", "value": None}
+    if composite:
+        for k in ("scoped", "no_record", "not_yet_available"):
+            if "total_debt" in g[k]: g[k].remove("total_debt")
+        g["unmasked_originals"]["total_debt"] = nm["total_debt"]; g["withheld"].append("total_debt")
+        e = {"governance_status": "WITHHELD", "basis": ck.COMPOSITE_WITHHELD_BASIS,
+             "withheld_components": [x for x in ("current_debt", "noncurrent_debt") if x in parts]}
+        e.update(mask_extra)
+        nm["total_debt"] = {"status": "WITHHELD", "value": None, "unit": "USD", "reason": "composite", "eligibility": e, "original_status": "OK"}
+    return nm
+
+
+def b8_pair(fn, labs=("NEW", "BASE"), t="GE"):
+    p = Pair()
+    for lab in labs: fn(p.res[lab][t])
+    return run_pair(p, profile=None)[1]
+
+
+class CompositeClosureV210(unittest.TestCase):
+    def test_clean_pair_passes_and_counts(self):
+        out = run_pair(Pair(), profile=None)[1]
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "B8", lab), "PASS", out)
+        self.assertIn("3 ticker(s) checked, 0 composite mask(s); excluded: none", out)
+
+    def test_closure_each_part_passes(self):
+        for parts in (("current_debt",), ("noncurrent_debt",), ("current_debt", "noncurrent_debt")):
+            out = b8_pair(lambda r: close_debt(r, parts))
+            for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "B8", lab), "PASS", f"{parts}\n{out}")
+            self.assertIn("1 composite mask(s)", out)
+            self.assertNotIn("composite closure violated", out)
+
+    def test_c1_component_without_composite_fails(self):
+        out = b8_pair(lambda r: close_debt(r, ("noncurrent_debt",), composite=False))
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "B8", lab), "FAIL", out)
+        self.assertIn("C1 total_debt not withheld while component(s) ['noncurrent_debt'] are withheld", out)
+
+    def test_violation_in_base_only_fails_base(self):
+        out = b8_pair(lambda r: close_debt(r, composite=False), labs=("BASE",))
+        self.assertEqual(verdict(out, "B8", "BASE"), "FAIL", out); self.assertEqual(verdict(out, "B8", "NEW"), "PASS", out)
+
+    def test_c2_withheld_components_must_match_in_order(self):
+        both = ("current_debt", "noncurrent_debt")
+        for parts, wc in ((("current_debt",), ["noncurrent_debt"]), (both, ["noncurrent_debt", "current_debt"]),
+                          (both, ["current_debt"]), (("current_debt",), []), (("current_debt",), "current_debt"), (("current_debt",), None)):
+            out = b8_pair(lambda r: close_debt(r, parts, withheld_components=wc))
+            self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", f"{parts} {wc}\n{out}"); self.assertIn("C2 total_debt withheld_components", out)
+
+    def test_c2_row_references_on_composite_mask_fail(self):
+        for k in ck.COMPOSITE_MASK_ROW_REFS:
+            out = b8_pair(lambda r: close_debt(r, **{k: "X"}))
+            self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", out); self.assertIn(f"composite mask carries row reference(s) ['{k}']", out)
+
+    def test_c3_basis_only_on_withheld_composite_with_known_value(self):
+        out = b8_pair(lambda r: close_debt(r, basis="SOMETHING_ELSE"))
+        self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", out); self.assertIn("C3 total_debt", out)
+        def basis_on_eligible(r):   # total_debt stays ELIGIBLE (no component withheld) but carries a composite basis
+            r["stages"]["normalization"]["normalized"]["metrics"]["total_debt"]["eligibility"]["basis"] = ck.COMPOSITE_WITHHELD_BASIS
+        out = b8_pair(basis_on_eligible)
+        self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", out); self.assertIn("C3 total_debt", out)
+        def basis_on_cfo(r):
+            r["stages"]["normalization"]["normalized"]["metrics"]["cfo"]["eligibility"] = {"governance_status": "WITHHELD", "basis": ck.COMPOSITE_WITHHELD_BASIS}
+        out = b8_pair(basis_on_cfo)
+        self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", out); self.assertIn("C3 cfo", out)
+
+    def test_c4_masked_record_keeping_components_fails(self):
+        def keep(r):
+            nm = close_debt(r); nm["total_debt"]["components"] = {"current_debt": {"status": "WITHHELD", "value": None},
+                                                                  "noncurrent_debt": {"status": "WITHHELD", "value": None}}
+        out = b8_pair(keep)
+        self.assertEqual(verdict(out, "B8", "NEW"), "FAIL", out); self.assertIn("C4 total_debt masked record keeps components", out)
+
+    def test_own_row_withheld_total_debt_passes(self):
+        def own(r):
+            st = r["stages"]; g = st["eligibility_gate"]; nm = st["normalization"]["normalized"]["metrics"]
+            g["scoped"].remove("total_debt"); g["withheld"].append("total_debt"); g["unmasked_originals"]["total_debt"] = nm["total_debt"]
+            nm["total_debt"] = {"status": "WITHHELD", "value": None, "unit": "USD", "reason": "row",
+                                "eligibility": {"governance_status": "WITHHELD", "outcome": "3", "decision_ref": "D", "policy_version": "V1"}}
+        out = b8_pair(own)
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "B8", lab), "PASS", out)
+
+    def test_exclusions_are_counted_not_passed(self):
+        out = b8_pair(lambda r: r["stages"]["eligibility_gate"].pop("relabelled"), t="LLY")
+        self.assertEqual(verdict(out, "B0", "NEW"), "FAIL", out)
+        self.assertIn("2 ticker(s) checked, 0 composite mask(s); excluded: gate malformed (B0) 1", out)
+
+    def test_nothing_checked_is_info_not_pass(self):
+        p = Pair()
+        for lab in ("NEW", "BASE"):
+            for t in p.tickers: p.res[lab][t]["stages"]["eligibility_gate"]["status"] = "BROKEN"
+        out = run_pair(p, profile=None)[1]
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "B8", lab), "INFO", out)
+        self.assertIn("0 ticker(s) checked, 0 composite mask(s); excluded: gate status not OK 3", out)
+
+    def test_unit_problems_name_rules_and_metrics_only(self):
+        r = ticker("GE", "V2"); close_debt(r, composite=False)
+        p = ck.composite_closure_problems(r)
+        self.assertEqual(p, ["C1 total_debt not withheld while component(s) ['current_debt'] are withheld"])
+        self.assertFalse(any(ch.isdigit() for ch in __import__("re").sub(r"\bC[1-4]\b", "", "".join(p))))   # rule ids aside: no amounts
+
+
+class TickerLeakV210(unittest.TestCase):
+    def test_clean_pair_passes_with_targets(self):
+        out = run_pair(Pair(), profile=None)[1]
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "F2", lab), "PASS", out)
+        self.assertIn("1 ticker(s) with originals, 3 amount(s) scanned", out)
+
+    def test_audit_copy_is_the_only_exclusion(self):
+        r = ticker("GE", "V2"); before = copy.deepcopy(r)
+        self.assertEqual(ck.ticker_leak_scan("GE", r), ([], [], 3))       # targets live only in the audit copy
+        self.assertEqual(r, before)                                       # the scan never mutates the result
+        r["stages"]["eligibility_gate"]["note"] = {"value": SECRET["cfo"]}
+        self.assertEqual(ck.ticker_leak_scan("GE", r)[0], ["/stages/eligibility_gate/note/value"])
+        r = ticker("GE", "V2"); r["stages"]["unmasked_originals"] = {"cfo": metric("cfo", SECRET["cfo"])}   # same key elsewhere
+        self.assertEqual(ck.ticker_leak_scan("GE", r)[0], ["/stages/unmasked_originals/cfo/value"])
+
+    def test_no_originals_is_not_scanned(self):
+        self.assertIsNone(ck.ticker_leak_scan("AAPL", ticker("AAPL", "V2")))
+
+    def test_nested_component_leak_fails_location_only(self):
+        out = b8_pair(lambda r: close_debt(r, composite=False))
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "F2", lab), "FAIL", out)
+        line = next(l for l in out.splitlines() if " F2 " in l and "NEW" in l)
+        self.assertIn("GE/stages/normalization/normalized/metrics/total_debt/components/current_debt/value", line)
+        self.assertNotIn("5000", line.replace(",", ""))
+
+    def test_composite_mask_removes_the_leak(self):
+        out = b8_pair(lambda r: close_debt(r))
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "F2", lab), "PASS", out)
+
+    def test_other_ticker_value_is_not_attributed(self):
+        def aapl(r): r["stages"]["normalization"]["normalized"]["metrics"]["cfo"] = metric("cfo", SECRET["cfo"])
+        out = b8_pair(aapl, t="AAPL")
+        for lab in ("NEW", "BASE"): self.assertEqual(verdict(out, "F2", lab), "PASS", out)
+
+    def test_precision_boundaries_reuse_scan_json_rules(self):
+        def scan(target, doc_value, key="value", where="cfo_yoy"):
+            r = ticker("GE", "V2"); r["stages"]["eligibility_gate"]["unmasked_originals"] = {"cfo": metric("cfo", target)}
+            r["stages"]["probe"] = {where: {key: doc_value}}
+            f, rv, _ = ck.ticker_leak_scan("GE", r); return ("FAIL" if f else "REVIEW" if rv else "PASS")
+        self.assertEqual(scan(5_123_000_000, 5_123_000_000.4), "FAIL")       # large: rounded display (+-0.5) matches
+        self.assertEqual(scan(5_123_000_000, 5_123_000_000.6), "PASS")
+        self.assertEqual(scan(5_123_000_000, "5,123,000,000"), "FAIL")      # formatted string
+        self.assertEqual(scan(-1_234_000_000, -1_234_000_000.0), "FAIL")    # int target vs float token
+        self.assertEqual(scan(7, 7.0), "FAIL")                              # small, value key, path names the metric
+        self.assertEqual(scan(7, 7.0000001), "PASS")                        # small values: exact only
+        self.assertEqual(scan(7, 7, key="count", where="misc"), "REVIEW")   # small elsewhere: ambiguous
+        self.assertEqual(scan(0, 0, key="count", where="misc"), "PASS")     # zero elsewhere is never flagged
+
+
+class CompositeMapV210(unittest.TestCase):
+    _registry = MappingDrift._registry
+
+    def _m3(self, tail):
+        with tempfile.TemporaryDirectory() as tmp:
+            return ck.composite_mapping_drift(self._registry(tmp, composite_tail=tail))
+
+    def test_identical_passes_and_real_checkout_passes(self):
+        self.assertEqual(self._m3(None)[0], "PASS")
+        self.assertEqual(ck.composite_mapping_drift(ck.default_repo_root())[0], "PASS")   # production b5bcb27+ registry
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = run_pair(Pair(), extra=("--repo-root", MappingDrift._registry(self, tmp)))
+        self.assertEqual(verdict(out, "M3"), "PASS", out)
+
+    def test_no_repo_is_review(self):
+        self.assertEqual(ck.composite_mapping_drift(None)[0], "REVIEW")
+
+    def test_drift_and_unverifiable_are_review(self):
+        b = repr(ck.COMPOSITE_WITHHELD_BASIS)
+        cases = {
+            "parts order": f"COMPOSITE_GOVERNED_METRICS = {{'total_debt': ('noncurrent_debt', 'current_debt')}}\nCOMPOSITE_WITHHELD_BASIS = {b}\n",
+            "extra composite": f"COMPOSITE_GOVERNED_METRICS = {{'total_debt': ('current_debt', 'noncurrent_debt'), 'x': ('a',)}}\nCOMPOSITE_WITHHELD_BASIS = {b}\n",
+            "basis": "COMPOSITE_GOVERNED_METRICS = {'total_debt': ('current_debt', 'noncurrent_debt')}\nCOMPOSITE_WITHHELD_BASIS = 'OTHER'\n",
+            "missing": f"COMPOSITE_WITHHELD_BASIS = {b}\n",
+            "non-literal": f"COMPOSITE_GOVERNED_METRICS = dict(total_debt=('current_debt', 'noncurrent_debt'))\nCOMPOSITE_WITHHELD_BASIS = {b}\n",
+            "basis type": "COMPOSITE_GOVERNED_METRICS = {'total_debt': ('current_debt', 'noncurrent_debt')}\nCOMPOSITE_WITHHELD_BASIS = 3\n",
+            "parts type": f"COMPOSITE_GOVERNED_METRICS = {{'total_debt': 'current_debt'}}\nCOMPOSITE_WITHHELD_BASIS = {b}\n",
+            "duplicate": f"COMPOSITE_GOVERNED_METRICS = {{}}\nCOMPOSITE_GOVERNED_METRICS = {{}}\nCOMPOSITE_WITHHELD_BASIS = {b}\n",
+        }
+        for name, tail in cases.items():
+            v, d = self._m3(tail)
+            self.assertEqual(v, "REVIEW", f"{name}: {d}")

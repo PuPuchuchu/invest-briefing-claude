@@ -60,7 +60,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.9"
+VERSION = "checker_v2.10"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -608,6 +608,13 @@ RELABEL_STAGES = ("derived", "growth", "data_sufficiency")
 # sec_normalizer.calculate_total_debt() is the only composite: it always returns exactly these two components
 # (observed: 90/90 total_debt records in 5 batches; no other metric ever carries "components").
 COMPOSITE_COMPONENTS = {"total_debt": ("current_debt", "noncurrent_debt")}
+# v2.10 (F-7, production b5bcb27): the gate masks a composite whenever one of its components is WITHHELD. Such a mask
+# carries eligibility.basis = COMPOSITE_WITHHELD_BASIS and withheld_components (the withheld parts, in part order) and
+# no row references (no row decided it). M3 compares both constants with the production registry by static parse.
+COMPOSITE_WITHHELD_BASIS = "COMPOSITE_COMPONENT_WITHHELD"
+COMPOSITE_MASK_ROW_REFS = ("outcome", "decision_ref", "policy_version")
+COMPOSITE_SOURCE = {"names": {"COMPOSITE_COMPONENTS": "COMPOSITE_GOVERNED_METRICS", "COMPOSITE_WITHHELD_BASIS": "COMPOSITE_WITHHELD_BASIS"},
+                    "commit": "b5bcb27fc756f5e2f60f56002ca7c8594c384547"}
 GATE_SKIPPED_KEYS = {"status", "reason"}         # orchestrator: {"status": SKIPPED, "reason": "..."}
 POLICY_NOT_APPLIED = "NO_METRIC_ELIGIBILITY_GATE"     # batch_runner: the gate did not run (eligibility rows not supplied)
 SEC_ACCESSION_RE = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
@@ -683,6 +690,33 @@ def gate_wellformed(r) -> bool:
     """The gate fields B2-B7 rely on have the production structure (validated and reported by B0)."""
     g = gate(r)
     return g.get("status") == "OK" and not gate_structure_problems(g)
+
+
+def composite_closure_problems(r) -> list[str]:
+    """B8 (v2.10, F-7) for one ticker whose gate is applied and well formed. Metric names and rule ids only, never values.
+    C1 a withheld component forces its composite into withheld; C2 a composite mask names exactly the withheld parts
+       (in part order) and no row reference; C3 eligibility.basis appears only on a withheld composite and only with
+       COMPOSITE_WITHHELD_BASIS; C4 no masked (withheld) record keeps nested components."""
+    g, nm, p = gate(r), metrics(r), []
+    W = set(_l(g.get("withheld")))
+    for comp, parts in COMPOSITE_COMPONENTS.items():
+        hit = [x for x in parts if x in W]
+        if hit and comp not in W: p.append(f"C1 {comp} not withheld while component(s) {hit} are withheld")
+        e = _d(nm.get(comp)).get("eligibility")
+        if comp in W and isinstance(e, dict) and e.get("basis") == COMPOSITE_WITHHELD_BASIS:
+            wc = e.get("withheld_components")
+            if not (isinstance(wc, list) and wc and wc == hit):
+                p.append(f"C2 {comp} withheld_components {wc if isinstance(wc, list) and all(isinstance(x, str) for x in wc) else type(wc).__name__} != withheld parts {hit}")
+            refs = [k for k in COMPOSITE_MASK_ROW_REFS if k in e]
+            if refs: p.append(f"C2 {comp} composite mask carries row reference(s) {refs}")
+    for m, item in sorted(nm.items()):
+        e = _d(item).get("eligibility") if isinstance(item, dict) else None
+        if isinstance(e, dict) and "basis" in e:
+            if m not in COMPOSITE_COMPONENTS or m not in W or e["basis"] != COMPOSITE_WITHHELD_BASIS:
+                p.append(f"C3 {m} eligibility.basis not a composite mask basis on a withheld composite")
+    for m in sorted(W):
+        if isinstance(nm.get(m), dict) and "components" in nm[m]: p.append(f"C4 {m} masked record keeps components")
+    return p
 
 
 def schema_problems(r) -> list[str]:
@@ -848,13 +882,16 @@ NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?")
 def withheld_targets(run: Run) -> list[dict]:
     """Every amount inside every unmasked original, nested ones included (e.g. stale_observation.value).
     Magnitude is not filtered: small values and 0 are targets too."""
+    return [x for t, r in run.results.items() for x in _ticker_targets(t, r)]
+
+
+def _ticker_targets(t, r) -> list[dict]:
     out = []
-    for t, r in run.results.items():
-        for m, o in _d(gate(r).get("unmasked_originals")).items():
-            names = {m} | {n for deps in (DERIVED_DEPS, GROWTH_DEPS) for n, d in deps.items() if m in d}
-            for p, v in flat(o).items():
-                if parent_and_key(p)[1] in VALUE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
-                    out.append({"ticker": t, "metric": m, "value": v if isinstance(v, int) else float(v), "names": names})
+    for m, o in _d(gate(r).get("unmasked_originals")).items():
+        names = {m} | {n for deps in (DERIVED_DEPS, GROWTH_DEPS) for n, d in deps.items() if m in d}
+        for p, v in flat(o).items():
+            if parent_and_key(p)[1] in VALUE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
+                out.append({"ticker": t, "metric": m, "value": v if isinstance(v, int) else float(v), "names": names})
     return out
 
 
@@ -905,6 +942,20 @@ def scan_json(obj, targets):
             elif t["value"] != 0:
                 review.add(path)
     return sorted(fail), sorted(review)
+
+
+def ticker_leak_scan(t, r):
+    """F2 (v2.10) -> (fail, review, n_targets) or None when the ticker has no numeric original. Targets are this
+    ticker's amounts from stages.eligibility_gate.unmasked_originals (the audit copy); exactly that subtree is left out
+    of the scan, so a target is never matched against the record it was read from. Everything else in the ticker
+    result is scanned with the F1/AUX rules (scan_json); the targets themselves are never written anywhere."""
+    targets = _ticker_targets(t, r)
+    if not targets: return None
+    doc = copy.deepcopy(r)
+    g = _d(_d(doc.get("stages")).get("eligibility_gate"))
+    g.pop("unmasked_originals", None)
+    f, rv = scan_json(doc, targets)
+    return f, rv, len(targets)
 
 
 def scan_text(txt, targets):
@@ -1332,7 +1383,7 @@ def q_leak_problems(t, r, targets) -> tuple[list, list, list]:
         if (it.get("status") == "WITHHELD") != (gi in W): fail.append(f"{t}: L0 {gi} gate/status mismatch")
         if gi in W and it.get("value") is not None: fail.append(f"{t}: L0 {gi} withheld but valued")
     if set(W) & set(Q_DEBT_COMPONENTS) and "total_debt" not in W:
-        review.append(f"{t}: total_debt used while a debt component is withheld (gate policy gap, owner decision)")
+        fail.append(f"{t}: composite closure violated: total_debt not withheld while a debt component is withheld (F-7)")
     if q is None or q["company_type"] == "FINANCIAL": return fail, review, info
     comps, ws = q["components"], set(W) & set(Q_GOVERNED_INPUTS)
     tainted = set()
@@ -1680,6 +1731,8 @@ class Checker:
     def check_profile(self):
         v, d = mapping_drift(self.repo_root)
         self.add("MAP", "M1 checker dependency maps = production registry (static parse)", v, d)
+        v, d = composite_mapping_drift(self.repo_root)
+        self.add("MAP", "M3 composite map/basis = production registry (static parse)", v, d)
         if self.profile is None:
             self.add("INFO", "P0 profile", "INFO", "--profile none: run-specific numbers and per-ticker expectations disabled; generic checks run")
             return
@@ -1734,6 +1787,21 @@ class Checker:
                 if sorted(g["unmasked_originals"]) != sorted(lists["withheld"]): bad.append(f"{t}: unmasked_originals keys != withheld")
             self.add(run.label, "B0 gate exact structure, lists disjoint, unmasked_originals = withheld (every ticker)", "PASS" if not bad else "FAIL",
                      "; ".join(bad[:10]) or f"{len(run.results)} tickers" + (f" ({skipped} SKIPPED under {POLICY_NOT_APPLIED})" if skipped else ""))
+        # B8 (v2.10, F-7) composite closure, every ticker whose gate is applied and well formed; exclusions are counted
+        for run in (self.new, self.base):
+            bad, checked, masks, excluded = [], 0, 0, {}
+            for t, r in sorted(run.results.items()):
+                g = gate(r)
+                why = ("gate SKIPPED" if g.get("status") == "SKIPPED" else "gate status not OK") if g.get("status") != "OK" \
+                    else ("gate malformed (B0)" if gate_structure_problems(g) else None)
+                if why: excluded[why] = excluded.get(why, 0) + 1; continue
+                checked += 1
+                masks += sum(_d(_d(metrics(r).get(c)).get("eligibility")).get("basis") == COMPOSITE_WITHHELD_BASIS for c in COMPOSITE_COMPONENTS)
+                bad += [f"{t}: {x}" for x in composite_closure_problems(r)]
+            ex = ", ".join(f"{k} {v}" for k, v in sorted(excluded.items())) or "none"
+            v = "FAIL" if bad else ("PASS" if checked else "INFO")
+            self.add(run.label, "B8 composite closure (debt component withheld => total_debt)", v,
+                     "; ".join(bad[:10]) or f"{checked} ticker(s) checked, {masks} composite mask(s); excluded: {ex}")
         # B1 exact gate sets (profile)
         for t, exp in (prof.get("gate") or {}).items():
             g = gate(self.new.results.get(t))
@@ -2308,6 +2376,18 @@ class Checker:
             self.add(run.label, "F1 no WITHHELD original in coverage/summary (json+md)", v,
                      f"{len(targets)} original amount(s) scanned, {small} small (exact match + context rules); "
                      f"leak locations={fail[:10]}; ambiguous small-value matches={review[:10]}")
+        # F2 (v2.10): inside each ticker result, outside the gate's audit copy (the only place the targets come from)
+        for run in (self.new, self.base):
+            fail, review, scanned, n_t = [], [], 0, 0
+            for t, r in sorted(run.results.items()):
+                res = ticker_leak_scan(t, r)
+                if res is None: continue
+                scanned += 1; n_t += res[2]
+                fail += [f"{t}{p}" for p in res[0]]; review += [f"{t}{p}" for p in res[1]]
+            v = "FAIL" if fail else ("REVIEW" if review else "PASS")
+            self.add(run.label, "F2 no WITHHELD original inside ticker results (audit copy excluded)", v,
+                     f"{scanned} ticker(s) with originals, {n_t} amount(s) scanned; leak locations={fail[:10]}; "
+                     f"ambiguous small-value matches={review[:10]}" if scanned else "no WITHHELD originals: nothing to scan")
 
     def run(self):
         """Every check group runs in isolation: an unexpected exception on malformed input becomes a FAIL for that
@@ -2545,6 +2625,35 @@ def mapping_drift(repo_root):
     if diffs:
         return "REVIEW", f"checker maps are stale vs {MAPPING_SOURCE['file']} (copied at {MAPPING_SOURCE['commit'][:7]}); update {', '.join(MAPPING_SOURCE['names'])}: " + "; ".join(diffs)
     return "PASS", f"{', '.join(MAPPING_SOURCE['names'].values())} equal to {MAPPING_SOURCE['file']} in {repo_root}"
+
+
+def composite_mapping_drift(repo_root):
+    """M3 (v2.10): (verdict, detail). PASS only when production's COMPOSITE_GOVERNED_METRICS and
+    COMPOSITE_WITHHELD_BASIS parse as literals of the expected types and equal the checker's copies (parts order
+    included). Anything not statically verifiable is REVIEW, never PASS."""
+    src = MAPPING_SOURCE["file"]
+    if not repo_root:
+        return "REVIEW", f"production registry not available (no --repo-root); composite map is the copy of {COMPOSITE_SOURCE['commit'][:7]}"
+    path = os.path.join(repo_root, *src.split("/"))
+    prod = {}
+    for local_name, prod_name in COMPOSITE_SOURCE["names"].items():
+        try:
+            prod[local_name] = static_dict(path, prod_name)
+        except (OSError, SyntaxError, ValueError, TypeError, UnicodeDecodeError) as e:
+            return "REVIEW", f"{src}: {prod_name} not statically verifiable ({type(e).__name__}: {e})"
+    pm, pb = prod["COMPOSITE_COMPONENTS"], prod["COMPOSITE_WITHHELD_BASIS"]
+    if not (isinstance(pm, dict) and all(isinstance(k, str) and isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v) for k, v in pm.items())):
+        return "REVIEW", f"{src}: COMPOSITE_GOVERNED_METRICS is not a dict of str -> sequence of str"
+    if not isinstance(pb, str):
+        return "REVIEW", f"{src}: COMPOSITE_WITHHELD_BASIS is not a string literal"
+    diffs = []
+    norm = {k: tuple(v) for k, v in pm.items()}
+    for k in sorted(set(norm) | set(COMPOSITE_COMPONENTS)):
+        if norm.get(k) != COMPOSITE_COMPONENTS.get(k): diffs.append(f"COMPOSITE_GOVERNED_METRICS[{k!r}]: production {norm.get(k)} vs checker {COMPOSITE_COMPONENTS.get(k)}")
+    if pb != COMPOSITE_WITHHELD_BASIS: diffs.append(f"COMPOSITE_WITHHELD_BASIS: production {pb!r} vs checker {COMPOSITE_WITHHELD_BASIS!r}")
+    if diffs:
+        return "REVIEW", f"checker composite constants are stale vs {src} (copied at {COMPOSITE_SOURCE['commit'][:7]}): " + "; ".join(diffs)
+    return "PASS", f"{', '.join(COMPOSITE_SOURCE['names'].values())} equal to {src}"
 
 
 def default_repo_root():
