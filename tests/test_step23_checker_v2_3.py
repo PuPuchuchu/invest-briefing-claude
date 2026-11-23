@@ -3886,9 +3886,34 @@ class QualityParityV211(unittest.TestCase):
         v, d = ck.quality_parity(ck.default_repo_root())
         self.assertEqual(v, "PASS", d); self.assertIn("44 comparison(s) equal", d)
         self.assertEqual(m2()[0], "PASS")
-        for mod in ("src.fundamentals.quality", "src.fundamentals.batch_runner", "src.fundamentals.company_type_registry",
-                    "src.fundamentals.metric_eligibility_registry", "src.fundamentals.sec_history"):
-            self.assertNotIn(mod, sys.modules)                              # read as text only
+
+    # "No production import" is checked in a fresh interpreter with every `src` import blocked: in the full suite
+    # other test files import production modules into this process, so a global sys.modules check is not meaningful.
+    _M2_NO_IMPORT_PROBE = r"""
+import importlib.util, json, sys
+attempts = []
+class _BlockSrc:
+    def find_spec(self, name, path=None, target=None):
+        if name == "src" or name.startswith("src."):
+            attempts.append(name)
+            raise ImportError("production import blocked: " + name)
+        return None
+sys.meta_path.insert(0, _BlockSrc())
+spec = importlib.util.spec_from_file_location("step23_checker_v2_3", sys.argv[1])
+ck = importlib.util.module_from_spec(spec); sys.modules[spec.name] = ck; spec.loader.exec_module(ck)
+v, d = ck.quality_parity(sys.argv[2])
+print(json.dumps({"verdict": v, "attempts": attempts,
+                  "src_modules": sorted(m for m in sys.modules if m == "src" or m.startswith("src."))}))
+"""
+
+    def test_parity_reads_production_as_text_only(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:                     # neutral cwd; -I: isolated, no cwd on sys.path
+            r = subprocess.run([sys.executable, "-I", "-c", self._M2_NO_IMPORT_PROBE, str(REPO / "scripts" / "step23_checker_v2_3.py"), str(REPO)],
+                               cwd=tmp, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(got, {"verdict": "PASS", "attempts": [], "src_modules": []})
 
     def test_emitted_only_with_quality(self):
         out = run_pair(QPair(), profile=None)[1]
