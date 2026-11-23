@@ -222,6 +222,7 @@ from src.fundamentals.finance_lease_evidence_registry import (
     resolve_lease_scope_mismatch_with_evidence,
 )
 from src.fundamentals.growth import calculate_growth
+from src.fundamentals.quality import calculate_quality_v02
 from src.fundamentals import per_share_comparatives
 from src.fundamentals.peer_classification import get_peer_mapping_as_of
 from src.fundamentals.point_in_time import (
@@ -329,6 +330,8 @@ STAGE_SKIPPED = "SKIPPED"
 STAGE_OK = "OK"
 STAGE_PROVIDED = "PROVIDED"
 STAGE_FETCHED_LIVE = "FETCHED_LIVE"
+# P2 N3: a stage whose own computation raised; only the Quality stage uses it (type recorded, never the message).
+STAGE_ERROR = "ERROR"
 
 
 # ============================================================
@@ -1054,6 +1057,45 @@ def run_fundamentals_pipeline(
         )
 
     # --------------------------------------------------------
+    # STAGE: QUALITY (P2, Quality v0.2 -- design v3 + v3.1)
+    #
+    # Runs AFTER the DEC-055 D4 relabel above, so it reads the governance-
+    # final inputs: the eligibility-gated normalized result and the derived
+    # metrics with withheld dependents already relabelled WITHHELD (never
+    # their pre-relabel MISSING; F-2 confirmation run 44632163881). It
+    # fetches nothing and changes neither. Writes only
+    # this new stage. The factor stage below stays NOT_WIRED: a Quality
+    # element score is an individual factor result, not a Factor/Composite
+    # score or a buy/sell signal.
+    #
+    # P2 N3 (alternative A): an exception raised by calculate_quality_v02()
+    # -- including its own fail-closed output validation -- is isolated to
+    # this stage: status ERROR, quality null and the exception CLASS NAME
+    # only. The message, traceback and inputs are never recorded (an
+    # unexpected Python error message can carry raw input values). Every
+    # other stage, the stage order and the ticker's OK status are
+    # unchanged. Only Exception is caught; BaseException (KeyboardInterrupt,
+    # SystemExit, ...) still propagates.
+    # --------------------------------------------------------
+    try:
+        quality_result = calculate_quality_v02(
+            normalized,
+            derived,
+            evaluation_date=eval_date,
+        )
+    except Exception as exc:  # noqa: BLE001 -- N3: isolate the Quality stage only
+        stages["quality"] = {
+            "status": STAGE_ERROR,
+            "quality": None,
+            "error": {"type": type(exc).__name__},
+        }
+    else:
+        stages["quality"] = {
+            "status": STAGE_OK,
+            "quality": quality_result,
+        }
+
+    # --------------------------------------------------------
     # STAGE: PEER_GROUP (optional)
     # --------------------------------------------------------
 
@@ -1152,5 +1194,6 @@ __all__ = [
     "STAGE_OK",
     "STAGE_PROVIDED",
     "STAGE_FETCHED_LIVE",
+    "STAGE_ERROR",
     "run_fundamentals_pipeline",
 ]
