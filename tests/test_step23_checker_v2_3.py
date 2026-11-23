@@ -1815,7 +1815,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.10")            # F-7 composite closure checks (explicit revision; was v2.9)
+        self.assertEqual(ck.VERSION, "checker_v2.11")            # M2 Quality constants parity (explicit revision; was v2.10)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -3819,3 +3819,173 @@ class CompositeMapV210(unittest.TestCase):
         for name, tail in cases.items():
             v, d = self._m3(tail)
             self.assertEqual(v, "REVIEW", f"{name}: {d}")
+
+
+
+# ---------------------------------------------------------------- v2.11: M2 Quality v0.2 production constants parity
+M2_FILES = tuple(ck.QUALITY_PARITY_SOURCES.values())
+
+
+def m2_repo(tmp, edits=(), drop=()):
+    """Copy the four production sources (read as text, never imported) into tmp; apply edits
+    (file, anchor, old, new): the first `old` after `anchor` (which must occur exactly once) becomes `new`."""
+    texts = {f: (REPO / f).read_text(encoding="utf-8") for f in M2_FILES}
+    for f, anchor, old, new in edits:
+        t = texts[f]; assert t.count(anchor) == 1, (f, anchor)
+        i = t.index(anchor); j = t.index(old, i)
+        texts[f] = t[:j] + new + t[j + len(old):]
+    for f, t in texts.items():
+        if f in drop: continue
+        d = os.path.join(tmp, os.path.dirname(f)); os.makedirs(d, exist_ok=True)
+        with open(os.path.join(tmp, f), "w", encoding="utf-8") as fh: fh.write(t)
+    return tmp
+
+
+def m2(edits=(), drop=()):
+    with tempfile.TemporaryDirectory() as tmp:
+        return ck.quality_parity(m2_repo(tmp, edits, drop))
+
+
+QF, BF, CF, EF = M2_FILES
+M2_DRIFTS = {   # one per comparison row; the detail must name the constant
+    "schema": ((QF, "QUALITY_V02_SCHEMA_VERSION = ", '"quality_v0.2"', '"quality_v0.3"'), "QUALITY_V02_SCHEMA_VERSION"),
+    "base weight value": ((QF, "_QUALITY_V02_BASE_WEIGHTS = {", '"net_margin": 0.10', '"net_margin": 0.11'), "_QUALITY_V02_BASE_WEIGHTS['net_margin']"),
+    "base weight key": ((QF, "_QUALITY_V02_BASE_WEIGHTS = {", '"debt_to_cash": 0.05,', '"debt_to_cash": 0.05, "roe": 0.0,'), "_QUALITY_V02_BASE_WEIGHTS['roe']"),
+    "independent order": ((QF, "QUALITY_V02_INDEPENDENT_METRICS = (", '"operating_margin",\n    "net_margin",', '"net_margin",\n    "operating_margin",'), "QUALITY_V02_INDEPENDENT_METRICS"),
+    "informational": ((QF, "QUALITY_V02_INFORMATIONAL_METRICS = {", '"fcf_conversion"', '"fcf_margin"'), "QUALITY_V02_INFORMATIONAL_METRICS['profit_to_cash_consistency']"),
+    "dimensions": ((QF, "QUALITY_V02_DIMENSIONS = {", '("fcf_conversion",)', '("fcf_conversion", "net_margin")'), "QUALITY_V02_DIMENSIONS['cash_conversion']"),
+    "min rated": ((QF, "QUALITY_V02_MIN_RATED = 3", "= 3", "= 2"), "QUALITY_V02_MIN_RATED:"),
+    "min rated type": ((QF, "QUALITY_V02_MIN_RATED = 3", "= 3", "= 3.0"), "QUALITY_V02_MIN_RATED:"),
+    "min rated + nm": ((QF, "QUALITY_V02_MIN_RATED_PLUS_NOT_MEANINGFUL = 4", "= 4", "= 5"), "QUALITY_V02_MIN_RATED_PLUS_NOT_MEANINGFUL"),
+    "reason code added": ((QF, "QUALITY_REASON_CODES = frozenset({", '"COMPANY_TYPE_FINANCIAL",', '"COMPANY_TYPE_FINANCIAL",\n    "STALE_INPUT",'), "QUALITY_REASON_CODES: production-only ['STALE_INPUT']"),
+    "reason code removed": ((QF, "QUALITY_REASON_CODES = frozenset({", '    "FLOW_UNIT_MISMATCH",\n', ''), "checker-only ['FLOW_UNIT_MISMATCH']"),
+    "flags": ((QF, "QUALITY_V02_FLAGS = frozenset({", '"NONPOSITIVE_FCF_LEVERAGE_UNASSESSED",', '"NONPOSITIVE_FCF_LEVERAGE_UNASSESSED", "X_FLAG",'), "QUALITY_V02_FLAGS"),
+    "liquidity basis": ((QF, "LIQUIDITY_BASIS_CASH_ONLY = ", '"CASH_AND_CASH_EQUIVALENTS_ONLY"', '"CASH_AND_SHORT_TERM_INVESTMENTS"'), "LIQUIDITY_BASIS_CASH_ONLY"),
+    "flow basis": ((QF, "FLOW_BASIS_ANNUAL_FY = ", '"ANNUAL_FY"', '"TTM"'), "FLOW_BASIS_ANNUAL_FY"),
+    "component statuses": ((QF, "_V02_COMPONENT_STATUSES = frozenset({", '"NOT_MEANINGFUL",', '"NOT_MEANINGFUL", "STALE",'), "_V02_COMPONENT_STATUSES"),
+    "flow inputs order": ((QF, "_FLOW_INPUTS = (", '"revenue", "operating_income"', '"operating_income", "revenue"'), "_FLOW_INPUTS"),
+    "flow signature order": ((QF, "_FLOW_SIGNATURE_KEYS = (", '"period_start", "period_end"', '"period_end", "period_start"'), "_FLOW_SIGNATURE_KEYS"),
+    "inputs normalized": ((QF, "_V02_INPUTS = {", '"debt_to_cash": (("total_debt", "cash")', '"debt_to_cash": (("total_debt", "cash", "revenue")'), "_V02_INPUTS['debt_to_cash'][0]"),
+    "inputs derived": ((QF, "_V02_INPUTS = {", '("debt_to_cash",), False', '("debt_to_cash", "net_debt"), False'), "_V02_INPUTS['debt_to_cash'][1]"),
+    "inputs uses flow": ((QF, "_V02_INPUTS = {", '("debt_to_cash",), False', '("debt_to_cash",), True'), "_V02_INPUTS['debt_to_cash'][2]"),
+    "metric set": ((QF, "_V02_INPUTS = {", '    "net_margin": (', '    "roe": (("net_income",), (), True, False),\n    "net_margin": ('), "_V02_INPUTS keys (Q_METRICS, order)"),
+    "upstream order": ((QF, "_UPSTREAM_PRECEDENCE = (", '"WITHHELD", "INVALID"', '"INVALID", "WITHHELD"'), "_UPSTREAM_PRECEDENCE"),
+    "upstream map": ((QF, "_UPSTREAM_TO_V02 = {", '"INCOMPLETE": ("MISSING"', '"INCOMPLETE": ("INVALID"'), "_UPSTREAM_TO_V02['INCOMPLETE']"),
+    "star threshold": ((QF, "def _stars_from_rating(", "rating >= 3.5", "rating >= 3.0"), "_stars_from_rating bands"),
+    "star stars": ((QF, "def _stars_from_rating(", "return 4", "return 3"), "_stars_from_rating bands"),
+    "star floor": ((QF, "def _stars_from_rating(", "    return 1\n", "    return 0\n"), "_stars_from_rating floor"),
+    "summary keys order": ((BF, "QUALITY_SUMMARY_KEYS = (", '"stage_status", "error_type"', '"error_type", "stage_status"'), "QUALITY_SUMMARY_KEYS"),
+    "company types": ((CF, "COMPANY_TYPE_VALUES = frozenset({", '"FINANCIAL"})', '"FINANCIAL", "REIT"})'), "COMPANY_TYPE_VALUES"),
+    "governed inputs": ((EF, "GOVERNED_METRICS = (", '"total_debt",\n)', '"total_debt",\n    "revenue",\n)'), "Q_GOVERNED_INPUTS"),
+    "debt components": ((EF, "COMPOSITE_GOVERNED_METRICS = ", '("current_debt", "noncurrent_debt")', '("noncurrent_debt", "current_debt")'), "Q_DEBT_COMPONENTS"),
+}
+
+
+class QualityParityV211(unittest.TestCase):
+    def test_real_checkout_passes_every_comparison(self):
+        v, d = ck.quality_parity(ck.default_repo_root())
+        self.assertEqual(v, "PASS", d); self.assertIn("44 comparison(s) equal", d)
+        self.assertEqual(m2()[0], "PASS")
+
+    # "No production import" is checked in a fresh interpreter with every `src` import blocked: in the full suite
+    # other test files import production modules into this process, so a global sys.modules check is not meaningful.
+    _M2_NO_IMPORT_PROBE = r"""
+import importlib.util, json, sys
+attempts = []
+class _BlockSrc:
+    def find_spec(self, name, path=None, target=None):
+        if name == "src" or name.startswith("src."):
+            attempts.append(name)
+            raise ImportError("production import blocked: " + name)
+        return None
+sys.meta_path.insert(0, _BlockSrc())
+spec = importlib.util.spec_from_file_location("step23_checker_v2_3", sys.argv[1])
+ck = importlib.util.module_from_spec(spec); sys.modules[spec.name] = ck; spec.loader.exec_module(ck)
+v, d = ck.quality_parity(sys.argv[2])
+print(json.dumps({"verdict": v, "attempts": attempts,
+                  "src_modules": sorted(m for m in sys.modules if m == "src" or m.startswith("src."))}))
+"""
+
+    def test_parity_reads_production_as_text_only(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:                     # neutral cwd; -I: isolated, no cwd on sys.path
+            r = subprocess.run([sys.executable, "-I", "-c", self._M2_NO_IMPORT_PROBE, str(REPO / "scripts" / "step23_checker_v2_3.py"), str(REPO)],
+                               cwd=tmp, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(got, {"verdict": "PASS", "attempts": [], "src_modules": []})
+
+    def test_emitted_only_with_quality(self):
+        out = run_pair(QPair(), profile=None)[1]
+        self.assertEqual(verdict(out, "M2", "MAP"), "PASS", out)
+        self.assertEqual(sum(1 for l in out.splitlines() if (m := VERDICT_RE.match(l)) and m.group(3) == "M2"), 1)
+        self.assertIsNone(verdict(run_pair(Pair(), profile=None)[1], "M2"))
+
+    def test_each_drift_is_review_and_named(self):
+        for name, (edit, needle) in M2_DRIFTS.items():
+            v, d = m2((edit,))
+            self.assertEqual(v, "REVIEW", f"{name}: {d}"); self.assertIn(needle, d, name)
+
+    def test_unverifiable_is_review(self):
+        cases = {
+            "name absent": ((QF, "QUALITY_V02_FLAGS = ", "QUALITY_V02_FLAGS = ", "QUALITY_V02_FLAGZ = "),),
+            "duplicate": ((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3\nQUALITY_V02_MIN_RATED = 3"),),
+            "augmented": ((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3\nQUALITY_V02_MIN_RATED += 0"),),
+            "unpacking": ((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3\n_A, QUALITY_V02_MIN_RATED = 1, 3"),),
+            "annotation only": ((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3\nQUALITY_V02_MIN_RATED: int"),),
+            "frozenset(name)": ((QF, "QUALITY_V02_FLAGS = frozenset({", "frozenset({", "frozenset(_FLAGS or {"),),
+            "dict(...) call, same value": ((QF, "QUALITY_V02_INFORMATIONAL_METRICS = {", '{\n    "profit_to_cash_consistency": "fcf_conversion",\n}',
+                                            'dict(profit_to_cash_consistency="fcf_conversion")'),),
+            "name reference": ((QF, "LIQUIDITY_BASIS_CASH_ONLY = ", '"CASH_AND_CASH_EQUIVALENTS_ONLY"', "FLOW_BASIS_ANNUAL_FY"),),
+            "wrong type str->int": ((QF, "QUALITY_V02_SCHEMA_VERSION = ", '"quality_v0.2"', "2"),),
+            "wrong type set->tuple": ((QF, "QUALITY_V02_FLAGS = frozenset({", "frozenset({", "tuple(("), (QF, "QUALITY_V02_FLAGS = tuple((", "})", "))")),
+            "_V02_INPUTS shape": ((QF, "_V02_INPUTS = {", '("debt_to_cash",), False, True)', '("debt_to_cash",), False)'),),
+            "star: > not >=": ((QF, "def _stars_from_rating(", "rating >= 2.5", "rating > 2.5"),),
+            "star: elif chain": ((QF, "def _stars_from_rating(", "\n    if rating >= 3.5:", "\n    elif rating >= 3.5:"),),
+            "star: other name": ((QF, "def _stars_from_rating(", "rating >= 1.5", "2 * rating >= 3.0"),),
+            "star: return variable": ((QF, "def _stars_from_rating(", "return 5", "return rating"),),
+            "star: float return": ((QF, "def _stars_from_rating(", "return 5", "return 5.0"),),
+            "star: else branch, same bands": ((QF, "def _stars_from_rating(", "        return 5\n", "        return 5\n    else:\n        pass\n"),),
+            "star: extra statement": ((QF, "def _stars_from_rating(", "    if rating >= 4.5:", "    rating = rating\n    if rating >= 4.5:"),),
+            "star: duplicate def": ((QF, "def _rating_from_thresholds(", "def _rating_from_thresholds(", "def _stars_from_rating(rating):\n    return 1\n\n\ndef _rating_from_thresholds("),),
+        }
+        for name, edits in cases.items():
+            v, d = m2(edits)
+            self.assertEqual(v, "REVIEW", f"{name}: {d}")
+        for f in M2_FILES:
+            v, d = m2(drop=(f,)); self.assertEqual(v, "REVIEW", f"missing {f}: {d}"); self.assertIn("not statically verifiable", d)
+        self.assertEqual(ck.quality_parity(None)[0], "REVIEW")
+
+    def test_tolerated_forms_still_pass(self):
+        v, d = m2(((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = _MR_ALIAS = 3"),))
+        self.assertEqual(v, "PASS", d)                                       # several targets on one plain assignment
+        v, d = m2(((QF, "def _rating_from_thresholds(", "def _rating_from_thresholds(",
+                    "def _local_only():\n    QUALITY_V02_MIN_RATED = 9\n    return QUALITY_V02_MIN_RATED\n\n\ndef _rating_from_thresholds("),))
+        self.assertEqual(v, "PASS", d)                                       # a function local is not a module binding
+        v, d = m2(((QF, "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED = 3", "QUALITY_V02_MIN_RATED: int = 3"),))
+        self.assertEqual(v, "PASS", d)                                       # annotated plain binding
+
+    def test_ok_cond_boundary_three_rated_is_ok(self):
+        # exactly Q_MIN_RATED rated (+2 NOT_MEANINGFUL): production marks the element OK; the Checker must agree
+        def mod(doc):
+            st = doc["stages"]; nm = st["normalization"]["normalized"]["metrics"]; dm = st["derived_metrics"]["derived"]["derived_metrics"]
+            nm["net_income"] = metric("net_income", -2_000); dm["net_margin"] = ok(-0.02)
+            nm["operating_income"] = {"metric": "operating_income", "status": "MISSING", "value": None}; dm["operating_margin"] = {"status": "MISSING", "value": None}
+            nm["cfo"] = metric("cfo", 1_000); dm["fcf"] = ok(-4_000); dm["fcf_margin"] = ok(-0.04); dm["net_debt"] = ok(-30_000); dm["debt_to_cash"] = ok(0.4)
+        p = QPair(with_quality=())
+        for lab in ("NEW", "BASE"):
+            mod(p.res[lab]["AAPL"])
+            for d in p.res[lab].values(): add_quality(d)
+        p.with_quality = ("NEW", "BASE")
+        e = q_of(p.res["NEW"], "AAPL")["element"]
+        self.assertEqual((e["status"], e["rated_count"], e["not_meaningful_count"]), ("OK", 3, 2))
+        code, out = run_pair(p, profile=None)
+        self.assertEqual(code, 0, out)
+        for c in Q_IDS: self.assertEqual(qv(out, c), "PASS", f"{c}\n{out}")
+
+    def test_q_band_and_ok_cond_behaviour_unchanged(self):
+        old = lambda x: 5 if x >= 4.5 else 4 if x >= 3.5 else 3 if x >= 2.5 else 2 if x >= 1.5 else 1   # v2.10 q_band, verbatim
+        for x in (5, 4.5, 4.4999, 4.49999999999, 3.5, 3.4999, 2.5, 2.4999, 1.5, 1.4999, 0, -1, 0.0, float("nan"), float("inf"), float("-inf")):
+            self.assertEqual(ck.q_band(x), old(x), x)
+        self.assertEqual((ck.Q_MIN_RATED, ck.Q_MIN_RATED_PLUS_NM), (3, 4))
+        self.assertEqual(ck.static_star_bands(str(REPO / QF)), (ck.Q_STAR_BANDS, ck.Q_STAR_FLOOR))
