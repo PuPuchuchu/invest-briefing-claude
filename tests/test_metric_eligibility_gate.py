@@ -393,3 +393,117 @@ def test_batch_runner_without_rows_keeps_old_note(tmp_path):
     assert "metric_eligibility_rows" not in calls[0]
     assert "eligibility" not in summary["records"][0]
     assert summary["eligibility_note"] == ELIGIBILITY_NOTE
+
+
+# ------------------------------------------------------------------
+# F-7: D2 composite closure (total_debt = current_debt + noncurrent_debt)
+# ------------------------------------------------------------------
+SENTINEL_CURRENT = 7_314_159_001
+SENTINEL_NONCURRENT = 8_271_828_002
+
+
+def _norm_with_components():
+    ok = lambda v, **kw: {"status": "OK", "value": v, "unit": "USD", "concept": "X", "namespace": "us-gaap", **kw}
+    cur, non = ok(SENTINEL_CURRENT, period_end="2026-09-30"), ok(SENTINEL_NONCURRENT, period_end="2026-09-30")
+    return {"metrics": {
+        "cfo": ok(100), "capex": ok(-20), "operating_income": ok(30),
+        "current_debt": copy.deepcopy(cur), "noncurrent_debt": copy.deepcopy(non),
+        "total_debt": {"metric": "total_debt", "status": "OK", "value": SENTINEL_CURRENT + SENTINEL_NONCURRENT, "unit": "USD",
+                       "components": {"current_debt": copy.deepcopy(cur), "noncurrent_debt": copy.deepcopy(non)}},
+        "revenue": ok(500),
+    }}
+
+
+def _gate_lists(gate):
+    return {k: gate[k] for k in ("withheld", "scoped", "no_record", "not_yet_available")}
+
+
+def _assert_disjoint(gate):
+    flat = [m for v in _gate_lists(gate).values() for m in v]
+    assert len(flat) == len(set(flat)), _gate_lists(gate)
+
+
+@pytest.mark.parametrize("withheld_parts", [["current_debt"], ["noncurrent_debt"], ["current_debt", "noncurrent_debt"]])
+def test_composite_component_withheld_masks_total_debt(withheld_parts):
+    norm = _norm_with_components()
+    original_total = copy.deepcopy(norm["metrics"]["total_debt"])
+    rows = [_row(p, "2", "WITHHELD") for p in withheld_parts]
+    gate = reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05", rows)
+    td = norm["metrics"]["total_debt"]
+    assert td["status"] == "WITHHELD" and td["value"] is None and td["unit"] == "USD"
+    assert "components" not in td
+    assert td["eligibility"] == {"governance_status": "WITHHELD", "basis": reg.COMPOSITE_WITHHELD_BASIS,
+                                 "withheld_components": withheld_parts}
+    assert td["original_status"] == "OK"
+    assert gate["withheld"] == withheld_parts + ["total_debt"]
+    assert gate["withheld"].count("total_debt") == 1
+    assert gate["unmasked_originals"]["total_debt"] == original_total
+    assert sorted(gate["unmasked_originals"]) == sorted(gate["withheld"])
+    _assert_disjoint(gate)
+
+
+def test_composite_no_leak_of_component_amounts():
+    norm = _norm_with_components()
+    gate = reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05", [_row("current_debt", "2", "WITHHELD")])
+    masked = json.dumps(norm["metrics"]["total_debt"]) + json.dumps(norm["metrics"]["current_debt"])
+    for s in (SENTINEL_CURRENT, SENTINEL_NONCURRENT, SENTINEL_CURRENT + SENTINEL_NONCURRENT):
+        assert str(s) not in masked
+    originals = json.dumps(gate["unmasked_originals"])
+    assert str(SENTINEL_CURRENT) in originals and str(SENTINEL_CURRENT + SENTINEL_NONCURRENT) in originals
+
+
+def test_composite_total_debt_already_withheld_is_not_duplicated():
+    norm = _norm_with_components()
+    original_total = copy.deepcopy(norm["metrics"]["total_debt"])
+    gate = reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05",
+                                             [_row("current_debt", "2", "WITHHELD"), _row("total_debt", "3", "WITHHELD")])
+    assert gate["withheld"] == ["current_debt", "total_debt"]
+    td = norm["metrics"]["total_debt"]
+    assert td["eligibility"]["outcome"] == "3" and "basis" not in td["eligibility"]       # its own row's mask is kept
+    assert gate["unmasked_originals"]["total_debt"] == original_total
+    _assert_disjoint(gate)
+
+
+@pytest.mark.parametrize("total_row,bucket", [
+    (lambda: _row("total_debt", "1", "ELIGIBLE", use_scope="CONSOLIDATED_REPORTED"), "scoped"),
+    (lambda: None, "no_record"),
+    (lambda: _row("total_debt", "1", "ELIGIBLE", eligibility_available_date="2026-11-20"), "not_yet_available"),
+])
+def test_composite_moves_total_debt_out_of_other_lists(total_row, bucket):
+    norm = _norm_with_components()
+    original_total = copy.deepcopy(norm["metrics"]["total_debt"])
+    rows = [_row("current_debt", "2", "WITHHELD")] + ([total_row()] if total_row() else [])
+    gate = reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05", rows)
+    assert "total_debt" not in gate[bucket]
+    assert gate["withheld"] == ["current_debt", "total_debt"]
+    assert gate["unmasked_originals"]["total_debt"] == original_total       # pre-gate copy (no scoped tag captured)
+    _assert_disjoint(gate)
+
+
+@pytest.mark.parametrize("rows", [
+    [_row("current_debt", "1", "ELIGIBLE"), _row("noncurrent_debt", "1", "ELIGIBLE")],
+    [],
+    [_row("cfo", "2", "WITHHELD")],
+])
+def test_composite_unchanged_without_withheld_component(rows):
+    norm = _norm_with_components()
+    before = copy.deepcopy(norm["metrics"]["total_debt"])
+    gate = reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05", rows)
+    assert norm["metrics"]["total_debt"] == before
+    assert "total_debt" not in gate["withheld"] and "total_debt" not in gate["unmasked_originals"]
+    _assert_disjoint(gate)
+
+
+def test_composite_masked_total_debt_gives_incomplete_tier2_and_no_flag():
+    """debt_tiers contract unchanged: a WITHHELD total_debt is 'not OK' -> tier 2 INCOMPLETE / TIER1_INCOMPLETE,
+    value None, and no finance-lease flag is attached."""
+    from src.fundamentals.finance_lease_evidence_registry import (
+        compute_total_debt_including_finance_leases,
+        finance_lease_flag_for_total_debt,
+    )
+    norm = _norm_with_components()
+    reg.apply_metric_eligibility_gate(norm, CIK, "2026-11-05", [_row("current_debt", "2", "WITHHELD")])
+    tier2 = compute_total_debt_including_finance_leases(norm["metrics"]["total_debt"], CIK, "2026-11-05", [])
+    assert tier2["status"] == "INCOMPLETE" and tier2["reason_code"] == "TIER1_INCOMPLETE" and tier2["value"] is None
+    assert finance_lease_flag_for_total_debt(tier2) is None
+    assert str(SENTINEL_CURRENT) not in json.dumps(tier2)

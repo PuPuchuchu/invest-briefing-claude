@@ -1114,3 +1114,41 @@ def test_quality_reads_governance_final_inputs_after_d4_relabel():
         assert ck.q_component_problems("ORCL", result, name, comp) == [], name
     fail, _review, _info = ck.q_leak_problems("ORCL", result, [])
     assert fail == []
+
+
+# ============================================================
+# F-7: D2 composite closure end to end (CI-only like the rest of this file)
+# ============================================================
+
+def test_withheld_debt_component_masks_total_debt_and_propagates():
+    import json as _json
+    normal = _run("2026-09-28")
+    result = _run("2026-09-28", metric_eligibility_rows=[_withheld_row("current_debt")])
+    stages = result["stages"]
+    gate = stages["eligibility_gate"]
+    assert gate["status"] == STAGE_OK and gate["withheld"] == ["current_debt", "total_debt"]
+    td = stages["normalization"]["normalized"]["metrics"]["total_debt"]
+    assert td["status"] == "WITHHELD" and td["value"] is None and "components" not in td
+    assert td["eligibility"]["basis"] == "COMPOSITE_COMPONENT_WITHHELD"
+    derived = stages["derived_metrics"]["derived"]["derived_metrics"]
+    for name in ("net_debt", "debt_to_cash"):                      # D4 relabel of total_debt's dependents
+        assert derived[name]["status"] == "WITHHELD" and derived[name]["reason_code"] == "GOVERNANCE_WITHHELD", name
+        assert "total_debt" in derived[name]["withheld_inputs"]
+    quality = stages["quality"]["quality"]["components"]
+    for name in ("net_debt_to_fcf", "debt_to_cash"):
+        assert quality[name]["status"] == "WITHHELD" and quality[name]["value"] is None, name
+        assert quality[name]["reason_code"] == "INPUT_WITHHELD:total_debt", name
+    names = list(stages)
+    assert names.index("quality") == names.index("data_sufficiency") + 1           # Quality still after the relabel
+    # nothing else moved: every other derived item and every growth component is as in the ungoverned run
+    nd = normal["stages"]["derived_metrics"]["derived"]["derived_metrics"]
+    for name in set(nd) | set(derived):
+        if name in ("net_debt", "debt_to_cash"):
+            continue
+        assert _json.dumps(nd.get(name), sort_keys=True, default=str) == _json.dumps(derived.get(name), sort_keys=True, default=str), name
+    assert _json.dumps(normal["stages"]["growth"], sort_keys=True, default=str) == _json.dumps(stages["growth"], sort_keys=True, default=str)
+    ck = _checker_module()
+    for name, comp in stages["quality"]["quality"]["components"].items():
+        assert ck.q_component_problems("ORCL", result, name, comp) == [], name
+    fail, review, _info = ck.q_leak_problems("ORCL", result, [])
+    assert fail == [] and review == []             # the component-gap REVIEW can no longer arise
