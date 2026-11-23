@@ -61,6 +61,11 @@ GOVERNED_METRICS = (
 )
 
 USE_SCOPES = frozenset({"CONSOLIDATED_REPORTED"})
+# F-7 (D2 composite closure): a governed metric computed from other governed metrics is masked whenever one of its
+# components is WITHHELD, so a withheld component can neither feed it nor stay readable inside it. The components
+# are exactly the ones sec_normalizer.calculate_total_debt() sums (current_debt + noncurrent_debt).
+COMPOSITE_GOVERNED_METRICS = {"total_debt": ("current_debt", "noncurrent_debt")}
+COMPOSITE_WITHHELD_BASIS = "COMPOSITE_COMPONENT_WITHHELD"
 
 # B-1.C-R1: Outcome 1 is eligible; Outcomes 2, 3 and 4 are withheld.
 OUTCOME_STATUS = {"1": STATUS_ELIGIBLE, "2": STATUS_WITHHELD, "3": STATUS_WITHHELD, "4": STATUS_WITHHELD}
@@ -240,6 +245,9 @@ def apply_metric_eligibility_gate(normalized: dict, cik: Any, evaluation_date: A
 
     withheld, scoped, no_record, pending = [], [], [], []
     originals: dict[str, Any] = {}
+    # composite originals as they were before this gate touched anything (a scoped tag below would otherwise be
+    # captured into the audit copy)
+    pre_gate = {c: copy.deepcopy(metrics.get(c)) for c in COMPOSITE_GOVERNED_METRICS}
     for metric in GOVERNED_METRICS:
         lookup = get_metric_eligibility_as_of(cik, metric, evaluation_date, rows)
         status = lookup["lookup_status"]
@@ -269,6 +277,31 @@ def apply_metric_eligibility_gate(normalized: dict, cik: Any, evaluation_date: A
             pending.append(metric)
         else:
             no_record.append(metric)
+
+    # F-7 D2 composite closure (after every row lookup): a WITHHELD component masks its composite.
+    for composite, parts in COMPOSITE_GOVERNED_METRICS.items():
+        hit = [p for p in parts if p in withheld]
+        if not hit or composite in withheld:
+            continue
+        for bucket in (scoped, no_record, pending):
+            if composite in bucket:
+                bucket.remove(composite)
+        original = pre_gate[composite]
+        originals[composite] = original
+        unit = original.get("unit") if isinstance(original, dict) else None
+        metrics[composite] = {
+            "status": STATUS_WITHHELD,
+            "value": None,
+            "unit": unit,
+            "reason": "Governance eligibility WITHHELD: computed from withheld component(s) " + ", ".join(hit) + ".",
+            "eligibility": {
+                "governance_status": STATUS_WITHHELD,
+                "basis": COMPOSITE_WITHHELD_BASIS,
+                "withheld_components": hit,
+            },
+            "original_status": original.get("status") if isinstance(original, dict) else None,
+        }
+        withheld.append(composite)
 
     return {
         "status": "OK",
@@ -388,6 +421,8 @@ __all__ = [
     "LOOKUP_NO_RECORD",
     "LOOKUP_NOT_YET_AVAILABLE",
     "GOVERNED_METRICS",
+    "COMPOSITE_GOVERNED_METRICS",
+    "COMPOSITE_WITHHELD_BASIS",
     "USE_SCOPES",
     "DEPENDENT_REASON_WITHHELD",
     "DERIVED_DEPENDENCIES",
