@@ -60,7 +60,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.10"
+VERSION = "checker_v2.11"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -279,6 +279,12 @@ Q_EVALUATED_COMPANY_TYPE = "NON_FINANCIAL"
 # metric_eligibility_registry.GOVERNED_METRICS intersected with Quality's normalized inputs (Checker design r5 §2)
 Q_GOVERNED_INPUTS = ("operating_income", "cfo", "capex", "total_debt")
 Q_DEBT_COMPONENTS = ("current_debt", "noncurrent_debt")
+# v2.11 (M2): values that were literals inside Checker logic, named so M2 can compare them with production
+Q_MIN_RATED = 3                 # quality.QUALITY_V02_MIN_RATED
+Q_MIN_RATED_PLUS_NM = 4         # quality.QUALITY_V02_MIN_RATED_PLUS_NOT_MEANINGFUL
+Q_STAR_BANDS = ((4.5, 5), (3.5, 4), (2.5, 3), (1.5, 2))   # quality._stars_from_rating: `if rating >= c: return n`, in order
+Q_STAR_FLOOR = 1                # its final `return`
+Q_COMPANY_TYPES = frozenset({"NON_FINANCIAL", "FINANCIAL"})   # company_type_registry.COMPANY_TYPE_VALUES
 Q_TOL = 1e-12          # Quality v0.2 records unrounded floats; production's own validator uses the same tolerance
 Q_LIMITATIONS = ("liquidity_basis", "roic", "roe", "relative_evaluation", "historical_evaluation", "staleness_policy")
 Q_KEYS_COMMON = frozenset({"metric", "status", "value", "rating", "stars", "weight", "reason_code", "upstream_reason_code",
@@ -1054,8 +1060,10 @@ def q_doc(r):
 def _num(x) -> bool: return isinstance(x, (int, float)) and not isinstance(x, bool)
 def _int(x) -> bool: return isinstance(x, int) and not isinstance(x, bool)
 def q_band(x) -> int:
-    """quality._stars_from_rating thresholds (copied)."""
-    return 5 if x >= 4.5 else 4 if x >= 3.5 else 3 if x >= 2.5 else 2 if x >= 1.5 else 1
+    """quality._stars_from_rating thresholds (Q_STAR_BANDS / Q_STAR_FLOOR; M2 compares them with production)."""
+    for c, n in Q_STAR_BANDS:
+        if x >= c: return n
+    return Q_STAR_FLOOR
 def q_upstream_class(status):
     if status == "OK": return None
     return status if status in ("MISSING", "INCOMPLETE", "WITHHELD", "INVALID") else "INVALID"
@@ -1248,7 +1256,7 @@ def q_invariant_problems(t, r) -> list[str]:
     nmc = [m for m in Q_INDEP if comps[m]["status"] == "NOT_MEANINGFUL"]
     if e["rated_count"] != len(rated) or e["not_meaningful_count"] != len(nmc) or e["independent_total"] != len(Q_INDEP):
         p.append(f"{t}: I8 counts")
-    ok_cond = len(rated) >= 3 and len(rated) + len(nmc) >= 4
+    ok_cond = len(rated) >= Q_MIN_RATED and len(rated) + len(nmc) >= Q_MIN_RATED_PLUS_NM
     if ok_cond:
         if e["status"] != "OK" or e["reason_code"] is not None: p.append(f"{t}: I8 element must be OK")
         f, w, sc = e["scored_weight_fraction"], e["normalized_score_weights"], e["score"]
@@ -1760,6 +1768,8 @@ class Checker:
                      f"{len(valid)} valid: {valid[:20]}" if valid else "P2 migration run has no evaluated non-FINANCIAL Quality ticker")
         for run in (self.new, self.base):
             for row in q_check_run(run, self.targets): self.add(*row)
+        v, d = quality_parity(self.repo_root)     # M2 (v2.11): only where Q runs, so pairs without Quality keep v2.10 output
+        self.add("MAP", "M2 Quality v0.2 constants = production (static parse)", v, d)
 
     # ---------- B: governance (both runs, each by its own policy)
     def check_governance(self):
@@ -2569,6 +2579,75 @@ def allowance_problems(al) -> list[str]:
     return p
 
 
+_STATIC_CALLS = {"frozenset": frozenset, "set": set, "tuple": tuple}
+
+
+def _static_eval(node):
+    """A literal, or frozenset/set/tuple applied to exactly one literal (no keywords). Anything else: ValueError."""
+    if isinstance(node, ast.Call):
+        if not (isinstance(node.func, ast.Name) and node.func.id in _STATIC_CALLS and len(node.args) == 1 and not node.keywords):
+            raise ValueError("call is not frozenset/set/tuple of one literal")
+        return _STATIC_CALLS[node.func.id](ast.literal_eval(node.args[0]))
+    return ast.literal_eval(node)
+
+
+def _names_in(target):
+    if isinstance(target, ast.Name): return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)): return [n for e in target.elts for n in _names_in(e)]
+    if isinstance(target, ast.Starred): return _names_in(target.value)
+    return []
+
+
+def static_value(path, name):
+    """v2.11: value of the single module-level binding of `name`, by AST (no import, no execution). Module level
+    only (function locals never count). Every top-level binding counts: Assign (each of several targets), AnnAssign,
+    AugAssign, and names inside tuple/list unpacking -- more than one binding, or a binding that is not a plain
+    `name = <value>` (unpacking, augmented), is unverifiable (ValueError), as is any value _static_eval rejects."""
+    with open(path, encoding="utf-8") as fh: tree = ast.parse(fh.read(), filename=path)
+    plain, other = [], 0
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == name: plain.append(n.value)
+                elif name in _names_in(t): other += 1
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+            if n.value is None: other += 1
+            else: plain.append(n.value)
+        elif isinstance(n, ast.AugAssign) and name in _names_in(n.target):
+            other += 1
+    if other or len(plain) != 1: raise ValueError(f"{name}: {len(plain)} plain and {other} other top-level binding(s)")
+    return _static_eval(plain[0])
+
+
+def static_star_bands(path, func="_stars_from_rating"):
+    """v2.11: ((threshold, stars), ...), floor) from the body of the single module-level `func(<arg>)`, which must be
+    exactly: optional docstring, then `if <arg> >= <number>: return <int>` (no else) repeated, then `return <int>`.
+    Any other shape is unverifiable (ValueError); nothing is guessed."""
+    with open(path, encoding="utf-8") as fh: tree = ast.parse(fh.read(), filename=path)
+    fs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == func]
+    if len(fs) != 1: raise ValueError(f"{func}: {len(fs)} module-level definitions")
+    f = fs[0]; a = f.args
+    if isinstance(f, ast.AsyncFunctionDef) or len(a.args) != 1 or a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg:
+        raise ValueError(f"{func}: not a plain one-argument function")
+    arg, body = a.args[0].arg, list(f.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    def num(n, ints=False):
+        return isinstance(n, ast.Constant) and not isinstance(n.value, bool) and isinstance(n.value, int if ints else (int, float))
+    def ret_int(n): return isinstance(n, ast.Return) and n.value is not None and num(n.value, ints=True)
+    if not body or not ret_int(body[-1]): raise ValueError(f"{func}: does not end with `return <int>`")
+    bands = []
+    for st in body[:-1]:
+        ok = (isinstance(st, ast.If) and not st.orelse and isinstance(st.test, ast.Compare)
+              and isinstance(st.test.left, ast.Name) and st.test.left.id == arg
+              and len(st.test.ops) == 1 and isinstance(st.test.ops[0], ast.GtE)
+              and len(st.test.comparators) == 1 and num(st.test.comparators[0])
+              and len(st.body) == 1 and ret_int(st.body[0]))
+        if not ok: raise ValueError(f"{func}: statement at line {st.lineno} is not `if {arg} >= <number>: return <int>`")
+        bands.append((st.test.comparators[0].value, st.body[0].value.value))
+    return tuple(bands), body[-1].value.value
+
+
 def static_dict(path, name):
     """Literal value of a top-level `name = {...}` assignment, by AST (no import, no execution)."""
     with open(path, encoding="utf-8") as fh: tree = ast.parse(fh.read(), filename=path)
@@ -2625,6 +2704,89 @@ def mapping_drift(repo_root):
     if diffs:
         return "REVIEW", f"checker maps are stale vs {MAPPING_SOURCE['file']} (copied at {MAPPING_SOURCE['commit'][:7]}); update {', '.join(MAPPING_SOURCE['names'])}: " + "; ".join(diffs)
     return "PASS", f"{', '.join(MAPPING_SOURCE['names'].values())} equal to {MAPPING_SOURCE['file']} in {repo_root}"
+
+
+QUALITY_PARITY_SOURCES = {"quality": "src/fundamentals/quality.py", "batch_runner": "src/fundamentals/batch_runner.py",
+                          "company_type": "src/fundamentals/company_type_registry.py", "eligibility": MAPPING_SOURCE["file"]}
+_UNVERIFIED = object()
+
+
+def quality_parity(repo_root):
+    """M2 (v2.11): (verdict, detail). Quality v0.2 constants the Q checks copy, compared with production by static
+    parse (no import). dict: keys and values; tuple: order; set: members; str: exact; int: type and value; booleans
+    in _V02_INPUTS: type and value. PASS only when every item was read and equal; any drift or anything not
+    statically verifiable is REVIEW (names the constant and the key)."""
+    if not repo_root:
+        return "REVIEW", "production sources not available (no --repo-root); Quality constants are the Checker's copies"
+    probs, checked = [], []
+    def path(src): return os.path.join(repo_root, *QUALITY_PARITY_SOURCES[src].split("/"))
+    def get(src, name):
+        try:
+            return static_value(path(src), name)
+        except (OSError, SyntaxError, ValueError, TypeError, UnicodeDecodeError) as e:
+            probs.append(f"{QUALITY_PARITY_SOURCES[src]}:{name} not statically verifiable ({type(e).__name__})"); return _UNVERIFIED
+    def same(label, prod, local, kind):
+        if prod is _UNVERIFIED: return
+        checked.append(label)
+        if kind == "set":
+            if not isinstance(prod, (set, frozenset)): probs.append(f"{label}: production is {type(prod).__name__}, not a set"); return
+            if set(prod) != set(local): probs.append(f"{label}: production-only {sorted(set(prod) - set(local))}, checker-only {sorted(set(local) - set(prod))}")
+        elif kind == "dict":
+            if not isinstance(prod, dict): probs.append(f"{label}: production is {type(prod).__name__}, not a dict"); return
+            for k in sorted(set(prod) | set(local), key=str):
+                pv, lv = prod.get(k, "<absent>"), local.get(k, "<absent>")
+                if type(pv) is not type(lv) or pv != lv: probs.append(f"{label}[{k!r}]: production {pv!r} vs checker {lv!r}")
+        else:   # exact: same type and value (tuple order included; int is never float/bool)
+            if type(prod) is not type(local) or prod != local: probs.append(f"{label}: production {prod!r} vs checker {local!r}")
+    same("QUALITY_V02_SCHEMA_VERSION", get("quality", "QUALITY_V02_SCHEMA_VERSION"), Q_SCHEMA_VERSION, "exact")
+    same("_QUALITY_V02_BASE_WEIGHTS", get("quality", "_QUALITY_V02_BASE_WEIGHTS"), Q_BASE_WEIGHTS, "dict")
+    same("QUALITY_V02_INDEPENDENT_METRICS", get("quality", "QUALITY_V02_INDEPENDENT_METRICS"), Q_INDEP, "exact")
+    same("QUALITY_V02_INFORMATIONAL_METRICS", get("quality", "QUALITY_V02_INFORMATIONAL_METRICS"), Q_INFO, "dict")
+    same("QUALITY_V02_DIMENSIONS", get("quality", "QUALITY_V02_DIMENSIONS"), Q_DIMS, "dict")
+    same("QUALITY_V02_MIN_RATED", get("quality", "QUALITY_V02_MIN_RATED"), Q_MIN_RATED, "exact")
+    same("QUALITY_V02_MIN_RATED_PLUS_NOT_MEANINGFUL", get("quality", "QUALITY_V02_MIN_RATED_PLUS_NOT_MEANINGFUL"), Q_MIN_RATED_PLUS_NM, "exact")
+    same("QUALITY_REASON_CODES", get("quality", "QUALITY_REASON_CODES"), Q_REASON_CODES, "set")
+    same("QUALITY_V02_FLAGS", get("quality", "QUALITY_V02_FLAGS"), {Q_FLAG}, "set")
+    same("LIQUIDITY_BASIS_CASH_ONLY", get("quality", "LIQUIDITY_BASIS_CASH_ONLY"), Q_LIQUIDITY_BASIS, "exact")
+    same("FLOW_BASIS_ANNUAL_FY", get("quality", "FLOW_BASIS_ANNUAL_FY"), Q_FLOW_BASIS, "exact")
+    same("_V02_COMPONENT_STATUSES", get("quality", "_V02_COMPONENT_STATUSES"), Q_COMPONENT_STATUSES, "set")
+    same("_FLOW_INPUTS", get("quality", "_FLOW_INPUTS"), Q_FLOW_INPUTS, "exact")
+    same("_FLOW_SIGNATURE_KEYS", get("quality", "_FLOW_SIGNATURE_KEYS"), Q_FLOW_SIG, "exact")
+    vi = get("quality", "_V02_INPUTS")
+    if vi is not _UNVERIFIED:
+        if not (isinstance(vi, dict) and all(isinstance(v, tuple) and len(v) == 4 for v in vi.values())):
+            probs.append("_V02_INPUTS: not a dict of 4-tuples")
+        else:
+            same("_V02_INPUTS keys (Q_METRICS, order)", tuple(vi), Q_METRICS, "exact")
+            for m in Q_METRICS:
+                if m not in vi: continue
+                same(f"_V02_INPUTS[{m!r}][0] normalized inputs", vi[m][0], Q_INPUTS[m][0], "exact")
+                same(f"_V02_INPUTS[{m!r}][1] derived inputs", vi[m][1], Q_INPUTS[m][1], "exact")
+                same(f"_V02_INPUTS[{m!r}][2] uses flow", vi[m][2], Q_USES_FLOW[m], "exact")
+    same("_UPSTREAM_PRECEDENCE", get("quality", "_UPSTREAM_PRECEDENCE"), Q_UPSTREAM_ORDER, "exact")
+    same("_UPSTREAM_TO_V02", get("quality", "_UPSTREAM_TO_V02"), Q_UPSTREAM_MAP, "dict")
+    try:
+        bands, floor = static_star_bands(path("quality"))
+        same("_stars_from_rating bands", bands, Q_STAR_BANDS, "exact")
+        same("_stars_from_rating floor", floor, Q_STAR_FLOOR, "exact")
+    except (OSError, SyntaxError, ValueError, TypeError, UnicodeDecodeError) as e:
+        probs.append(f"{QUALITY_PARITY_SOURCES['quality']}:_stars_from_rating not statically verifiable ({type(e).__name__}: {e})")
+    same("QUALITY_SUMMARY_KEYS", get("batch_runner", "QUALITY_SUMMARY_KEYS"), Q_SUMMARY_KEYS, "exact")
+    same("COMPANY_TYPE_VALUES", get("company_type", "COMPANY_TYPE_VALUES"), Q_COMPANY_TYPES, "set")
+    if Q_EVALUATED_COMPANY_TYPE not in Q_COMPANY_TYPES: probs.append(f"Q_EVALUATED_COMPANY_TYPE {Q_EVALUATED_COMPANY_TYPE!r} not a company type")
+    gm = get("eligibility", "GOVERNED_METRICS")
+    if gm is not _UNVERIFIED:
+        if not (isinstance(gm, tuple) and all(isinstance(x, str) for x in gm)): probs.append("GOVERNED_METRICS: not a tuple of names")
+        else:
+            q_norm = {x for m in Q_METRICS for x in Q_INPUTS[m][0]}
+            same("GOVERNED_METRICS x Quality inputs (Q_GOVERNED_INPUTS)", tuple(x for x in gm if x in q_norm), Q_GOVERNED_INPUTS, "exact")
+    cg = get("eligibility", "COMPOSITE_GOVERNED_METRICS")
+    if cg is not _UNVERIFIED:
+        if not (isinstance(cg, dict) and isinstance(cg.get("total_debt"), (tuple, list))): probs.append("COMPOSITE_GOVERNED_METRICS['total_debt']: absent or not a sequence")
+        else: same("COMPOSITE_GOVERNED_METRICS['total_debt'] (Q_DEBT_COMPONENTS)", tuple(cg["total_debt"]), Q_DEBT_COMPONENTS, "exact")
+    if probs:
+        return "REVIEW", f"{len(probs)} problem(s): " + "; ".join(probs)
+    return "PASS", f"{len(checked)} comparison(s) equal across {', '.join(QUALITY_PARITY_SOURCES.values())}"
 
 
 def composite_mapping_drift(repo_root):
