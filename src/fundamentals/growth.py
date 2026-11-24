@@ -486,6 +486,12 @@ def calculate_cagr_3y(
 # QUARTER PAIR SELECTION
 # ============================================================
 
+# F2 (DEC-060): a prior-year comparable quarter ends 365 +- 14 days before the
+# latest one (52-week year: 364, 53-week year: 371; calendar: 365/366).
+_PRIOR_YEAR_MIN_DAYS = 351
+_PRIOR_YEAR_MAX_DAYS = 379
+
+
 def _select_latest_quarter_pair(
     history: Any,
 ) -> tuple[
@@ -496,9 +502,19 @@ def _select_latest_quarter_pair(
     Select latest quarterly observation and prior-year
     comparable quarter.
 
-    Priority:
-        1. Same quarter + prior fiscal year
-        2. Same calendar year-offset period
+    Priority (F2, DEC-060, 2026-11-24):
+        1. Same quarter label + prior fiscal-year label, and the period
+           ends are one year apart: 351 <= (latest_end - prior_end).days
+           <= 379 (365 +- 14 days, both ends included; covers 52- and
+           53-week fiscal years).
+        2. Otherwise the single earlier record whose period end is in
+           that same 351-379-day window.
+
+    No pair (None) when no candidate qualifies or when the qualifying
+    candidates are not one unambiguous record: a wrong comparison
+    quarter is worse than a missing one. The previous fallback (the
+    record nearest the latest date within the prior calendar year) could
+    pair a quarter with a different quarter, e.g. Q1 with the prior Q4.
     """
 
     records = _valid_history_records(
@@ -519,28 +535,6 @@ def _select_latest_quarter_pair(
     latest_quarter = _quarter_value(latest)
     latest_fy = _year_value(latest)
 
-    candidates = []
-
-    for record in records[:-1]:
-        record_quarter = _quarter_value(record)
-        record_fy = _year_value(record)
-
-        if (
-            latest_quarter is not None
-            and record_quarter == latest_quarter
-            and latest_fy is not None
-            and record_fy == latest_fy - 1
-        ):
-            candidates.append(record)
-
-    if candidates:
-        previous = sorted(
-            candidates,
-            key=lambda x: _record_period_end(x) or "",
-        )[-1]
-
-        return latest, previous
-
     latest_end = _record_period_end(latest)
 
     if not latest_end:
@@ -553,42 +547,67 @@ def _select_latest_quarter_pair(
     except ValueError:
         return latest, None
 
-    target_year = latest_date.year - 1
-
-    year_candidates = []
-
-    for record in records[:-1]:
+    def _one_year_earlier(record: dict[str, Any]) -> bool:
         period_end = _record_period_end(record)
 
         if not period_end:
-            continue
+            return False
 
         try:
             record_date = date.fromisoformat(
                 period_end
             )
         except ValueError:
-            continue
+            return False
 
-        if record_date.year == target_year:
-            year_candidates.append(record)
+        return (
+            _PRIOR_YEAR_MIN_DAYS
+            <= (latest_date - record_date).days
+            <= _PRIOR_YEAR_MAX_DAYS
+        )
 
-    if not year_candidates:
+    def _unique(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+        # The same period reported twice with the same value is one
+        # candidate; anything else is ambiguous and is never resolved by
+        # list order or by "nearest".
+        identities = {
+            (
+                _record_period_end(record),
+                record.get("value"),
+            )
+            for record in candidates
+        }
+
+        if len(identities) != 1:
+            return None
+
+        return candidates[-1]
+
+    labelled = [
+        record
+        for record in records[:-1]
+        if (
+            latest_quarter is not None
+            and _quarter_value(record) == latest_quarter
+            and latest_fy is not None
+            and _year_value(record) == latest_fy - 1
+            and _one_year_earlier(record)
+        )
+    ]
+
+    if labelled:
+        return latest, _unique(labelled)
+
+    window = [
+        record
+        for record in records[:-1]
+        if _one_year_earlier(record)
+    ]
+
+    if not window:
         return latest, None
 
-    previous = min(
-        year_candidates,
-        key=lambda x: abs(
-            (
-                date.fromisoformat(
-                    _record_period_end(x)
-                )
-                - latest_date
-            ).days
-        ),
-    )
-
-    return latest, previous
+    return latest, _unique(window)
 
 
 # ============================================================
