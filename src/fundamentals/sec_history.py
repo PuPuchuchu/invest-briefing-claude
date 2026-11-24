@@ -1093,6 +1093,104 @@ def _select_one_observation(
     )
 
 
+def _with_fp(
+    observations: list[dict],
+    fp: str,
+) -> list[dict]:
+    """
+    F1 (DEC-060, 2026-11-24): keep only observations whose SEC "fp"
+    names the YTD stage being selected (Q1 -> the Q1 slot, Q2 -> H1,
+    Q3 -> 9M). A 70-110-day 10-Q fact from a Q2/Q3 filing (its own
+    current quarter or a comparative) must never occupy the Q1 slot:
+    with no Q1 filing (IPO year, missing Q1 tag) or Q1/Q2 10-Qs filed
+    the same day, the old length-only selection put the Q2 value in the
+    Q1 slot and derived "Q2 = H1 - Q1" with period_start > period_end.
+    The direct-only EPS path already requires an exact fp match.
+    """
+    return [
+        observation
+        for observation in observations
+        if observation.get("fp") == fp
+    ]
+
+
+def _reconstruction_operands_consistent(
+    current_observation: dict,
+    previous_observation: dict,
+) -> bool:
+    """
+    B1 (DEC-060, 2026-11-24): a standalone quarter is derived by
+    subtraction only when both cumulative operands describe the same
+    fiscal year to date -- same SEC fy label, same "start" date, same
+    unit -- and the derived period [previous end + 1, current end] is a
+    real quarter: start <= end and 70-110 days inclusive
+    (DURATION_RANGES["q1"]). Both operands come from the same concept by
+    construction (one concept per call). Anything else is not
+    reconstructed: the quarter is simply absent, the same "absent = not
+    available" semantics this module already uses for every other gap.
+    """
+    if current_observation.get("fy") != previous_observation.get("fy"):
+        return False
+
+    current_start = _parse_date(
+        current_observation.get("start")
+    )
+    previous_start = _parse_date(
+        previous_observation.get("start")
+    )
+
+    if (
+        current_start is None
+        or previous_start is None
+        or current_start != previous_start
+    ):
+        return False
+
+    if current_observation.get("_unit") != previous_observation.get("_unit"):
+        return False
+
+    current_end = _parse_date(
+        current_observation.get("end")
+    )
+    previous_end = _parse_date(
+        previous_observation.get("end")
+    )
+
+    if current_end is None or previous_end is None:
+        return False
+
+    derived_start = previous_end + timedelta(days=1)
+
+    if derived_start > current_end:
+        return False
+
+    days = (current_end - derived_start).days + 1
+    min_days, max_days = DURATION_RANGES["q1"]
+
+    return min_days <= days <= max_days
+
+
+def _drop_duplicate_period_ends(
+    records: list[dict],
+) -> list[dict]:
+    """
+    Two standalone quarters of one concept can never share a period_end.
+    If they do, the data does not say which one is right, so every
+    record on that period_end is dropped (fail-closed) rather than
+    letting a downstream consumer pick one by list order.
+    """
+    counts: dict[Any, int] = defaultdict(int)
+
+    for record in records:
+        counts[record.get("period_end")] += 1
+
+    return [
+        record
+        for record in records
+        if counts[record.get("period_end")] == 1
+    ]
+
+
 def reconstruct_standalone_quarters(
     observations: list[dict],
     concept_name: str | None = None,
@@ -1189,17 +1287,17 @@ def reconstruct_standalone_quarters(
     for fy in sorted(fiscal_years):
 
         q1 = _select_one_observation(
-            classified["q1"],
+            _with_fp(classified["q1"], "Q1"),
             fy,
         )
 
         h1 = _select_one_observation(
-            classified["ytd_6m"],
+            _with_fp(classified["ytd_6m"], "Q2"),
             fy,
         )
 
         ytd9 = _select_one_observation(
-            classified["ytd_9m"],
+            _with_fp(classified["ytd_9m"], "Q3"),
             fy,
         )
 
@@ -1238,6 +1336,10 @@ def reconstruct_standalone_quarters(
                 h1,
                 q1,
             )
+            and _reconstruction_operands_consistent(
+                h1,
+                q1,
+            )
         ):
 
             reconstructed_q2 = (
@@ -1261,6 +1363,10 @@ def reconstruct_standalone_quarters(
             ytd9 is not None
             and h1 is not None
             and _same_fiscal_year(
+                ytd9,
+                h1,
+            )
+            and _reconstruction_operands_consistent(
                 ytd9,
                 h1,
             )
@@ -1292,6 +1398,10 @@ def reconstruct_standalone_quarters(
                 fy_observation,
                 ytd9,
             )
+            and _reconstruction_operands_consistent(
+                fy_observation,
+                ytd9,
+            )
         ):
 
             reconstructed_q4 = (
@@ -1310,6 +1420,8 @@ def reconstruct_standalone_quarters(
     # --------------------------------------------------------
     # Chronological order.
     # --------------------------------------------------------
+
+    result = _drop_duplicate_period_ends(result)
 
     result.sort(
         key=lambda observation: (
