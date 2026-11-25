@@ -1191,6 +1191,96 @@ def _drop_duplicate_period_ends(
     ]
 
 
+# F5 (2026-11-25): SEC fy-label collision. Latest period ends of two
+# filings that carry the same (fy, fp) label and are one fiscal year
+# apart (inclusive bounds; 52/53-week years and calendar drift fit).
+FY_LABEL_COLLISION_DAYS = (330, 400)
+
+
+def _relabel_fiscal_year_collisions(
+    observations: list[dict],
+) -> list[dict]:
+    """
+    F5 (2026-11-25): repair a 10-Q filing whose SEC "fy" label repeats
+    the label of the same fiscal quarter one year earlier.
+
+    The fiscal year of a quarter is taken from the SEC fy label only
+    (filing-level: every fact of a filing, comparatives included,
+    carries the filing's fy). When a later 10-Q repeats last year's
+    (fy, fp) label -- e.g. ORCL's FY2027 Q1 10-Q (period ending
+    2026-08-31) filed with fy=2026 like the FY2026 Q1 10-Q -- both
+    filings fall into one fiscal-year group, the earlier filing wins
+    the selection and the newest quarter is silently dropped.
+
+    Rule (one concept per call, 10-Q observations only): if exactly two
+    filings (accn) carry the same (fy, fp) label and their latest
+    period ends are FY_LABEL_COLLISION_DAYS apart, every observation of
+    the later filing is relabelled fy + 1 -- unless some filing already
+    carries (fy + 1, fp). Anything else (three or more filings, another
+    gap, an occupied target, a missing accn or end date) is left
+    unchanged, i.e. today's behaviour. Relabelled observations are
+    copies; the input is never mutated and no other field changes.
+    """
+    if not isinstance(observations, list):
+        return observations
+
+    groups: dict[tuple, dict] = defaultdict(lambda: defaultdict(list))
+    unusable: set[tuple] = set()
+
+    for observation in observations:
+        if not isinstance(observation, dict) or observation.get("form") != "10-Q":
+            continue
+
+        fy = observation.get("fy")
+
+        if not isinstance(fy, int) or isinstance(fy, bool):
+            continue
+
+        key = (fy, observation.get("fp"))
+        accn = observation.get("accn")
+        end = _parse_date(observation.get("end"))
+
+        if not isinstance(accn, str) or not accn or end is None:
+            unusable.add(key)
+            continue
+
+        groups[key][accn].append(end)
+
+    min_days, max_days = FY_LABEL_COLLISION_DAYS
+    relabel: dict[str, int] = {}
+
+    for (fy, fp), filings in groups.items():
+        if (fy, fp) in unusable or len(filings) != 2:
+            continue
+
+        (_, earlier_end), (later_accn, later_end) = sorted(
+            ((accn, max(ends)) for accn, ends in filings.items()),
+            key=lambda item: (item[1], item[0]),
+        )
+
+        if not min_days <= (later_end - earlier_end).days <= max_days:
+            continue
+
+        if groups.get((fy + 1, fp)) or (fy + 1, fp) in unusable:
+            continue
+
+        relabel[later_accn] = fy + 1
+
+    if not relabel:
+        return observations
+
+    return [
+        dict(observation, fy=relabel[observation["accn"]])
+        if (
+            isinstance(observation, dict)
+            and observation.get("form") == "10-Q"
+            and observation.get("accn") in relabel
+        )
+        else observation
+        for observation in observations
+    ]
+
+
 def reconstruct_standalone_quarters(
     observations: list[dict],
     concept_name: str | None = None,
@@ -1226,6 +1316,10 @@ def reconstruct_standalone_quarters(
     count differs between the two periods (buybacks, issuances,
     convertible-dilution changes).
     """
+    observations = _relabel_fiscal_year_collisions(
+        observations
+    )
+
     if concept_name in NON_ADDITIVE_PER_SHARE_CONCEPTS:
         return _reconstruct_direct_only_quarters(
             observations
