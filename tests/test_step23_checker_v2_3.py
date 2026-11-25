@@ -1815,7 +1815,7 @@ def comp(p, lab, t, m): return p.res[lab][t]["stages"]["growth"]["growth"]["comp
 
 class MigrationAllowanceV24(unittest.TestCase):
     def test_version_is_current(self):
-        self.assertEqual(ck.VERSION, "checker_v2.11")            # M2 Quality constants parity (explicit revision; was v2.10)
+        self.assertEqual(ck.VERSION, "checker_v2.12")            # F5 migration (explicit revision; was v2.11)
 
     def test_exact_expected_additions_pass(self):
         code, out = run_pair(mig_pair(), profile=mig_profile())
@@ -2337,7 +2337,8 @@ class ExpectedPatchStep246N(unittest.TestCase):
     def test_registered_and_mirror_updated_with_production(self):
         self.assertIn(N_MIG, ck.PATCH_MIGRATIONS)
         # v2.9 (explicit revision): the registry gains P2_QUALITY_V02_STAGE; the two earlier migrations are unchanged
-        self.assertEqual(sorted(ck.PATCH_MIGRATIONS), sorted([P25_MIG, N_MIG, "P2_QUALITY_V02_STAGE"]))
+        # v2.12 (explicit revision): the registry gains F5_FY_LABEL_COLLISION; the earlier migrations are unchanged
+        self.assertEqual(sorted(ck.PATCH_MIGRATIONS), sorted([P25_MIG, N_MIG, "P2_QUALITY_V02_STAGE", "F5_FY_LABEL_COLLISION"]))
         # N-P1 (explicit revision of the N-P0 test): the mirror gains the code together with production growth.py
         self.assertIn(N_UNAVAILABLE, ck.GROWTH_REASON_CODES)
         self.assertEqual(len(ck.GROWTH_REASON_CODES), 9)
@@ -3626,9 +3627,6 @@ class ValidP0V29(unittest.TestCase):
                 self.assertFalse(ck.q_valid_p0(d))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 
 # ---------------------------------------------------------------- v2.10: F-7 composite closure (B8), in-ticker leak (F2), M3
@@ -3989,3 +3987,175 @@ print(json.dumps({"verdict": v, "attempts": attempts,
             self.assertEqual(ck.q_band(x), old(x), x)
         self.assertEqual((ck.Q_MIN_RATED, ck.Q_MIN_RATED_PLUS_NM), (3, 4))
         self.assertEqual(ck.static_star_bands(str(REPO / QF)), (ck.Q_STAR_BANDS, ck.Q_STAR_FLOOR))
+
+
+
+# ---------------------------------------------------------------- v2.12: F5 SEC fy-label collision (synthetic)
+F5_MIG = "F5_FY_LABEL_COLLISION"
+SUFF = "/stages/data_sufficiency/sufficiency"
+
+
+def f5_comp(metric, value, stars, cur, prev, basis=None):
+    c = {"status": "OK", "metric": metric, "value": value, "source": ["historical", "quarterly"],
+         "current_period_end": cur, "previous_period_end": prev, "stars": stars}
+    if basis: c["previous_value_basis"] = basis
+    return c
+
+
+def f5_pair(mode="recover"):
+    """BASE: AAPL carries the ORCL 2026-11-17 shape (latest quarter dropped: revenue / operating income on 2026-05-31,
+    EPS on 2026-02-28). NEW: mode="recover" -- the relabelled filing brings back 2026-08-31 for the three components
+    and the aggregate moves; mode="missing" -- the recovered latest revenue quarter has no prior-year pair (OK -> MISSING,
+    with the aggregate, sufficiency and coverage cascade)."""
+    p = Pair()
+    for t in ("AAPL", "LLY"):
+        st = p.res["BASE"][t]["stages"]; g = st["growth"]["growth"]
+        g["components"]["revenue_yoy"] = f5_comp("revenue_yoy", 0.2063132742, 5, "2026-05-31", "2025-05-31")
+        g["components"]["operating_income_yoy"] = f5_comp("operating_income_yoy", 0.2004306126, 4, "2026-05-31", "2025-05-31")
+        g["components"]["eps_yoy"] = f5_comp("eps_yoy", 0.2450980392, 4, "2026-02-28", "2025-02-28", "same_filing_comparative")
+        g["growth"] = {"status": "OK", "score": 4.3125, "stars": 4, "available_components": 4, "valid_components": 4,
+                       "total_components": 5, "coverage": 0.8}
+        g["warnings"] = []; g["limitations"] = {}
+        for m in ("revenue_yoy", "operating_income_yoy", "eps_yoy"):
+            st["data_sufficiency"]["sufficiency"][m] = {"metric": m, "calculation_status": "OK", "reason_code": None, "detail": None}
+    p.res["NEW"] = copy.deepcopy(p.res["BASE"]); p.policy["NEW"] = ck.POLICY_V1; p.raw["NEW"] = copy.deepcopy(p.raw["BASE"])
+    st = p.res["NEW"]["AAPL"]["stages"]; g = st["growth"]["growth"]
+    if mode == "recover":
+        g["components"]["revenue_yoy"] = f5_comp("revenue_yoy", 0.2960605655, 5, "2026-08-31", "2025-08-31")
+        g["components"]["operating_income_yoy"] = f5_comp("operating_income_yoy", 0.5730652326, 5, "2026-08-31", "2025-08-31")
+        g["components"]["eps_yoy"] = f5_comp("eps_yoy", 0.5445544554, 5, "2026-08-31", "2025-08-31", "same_filing_comparative")
+        g["growth"].update(score=4.6, stars=5)
+    elif mode == "missing":
+        g["components"]["revenue_yoy"] = {"status": "MISSING", "metric": "revenue_yoy", "value": None,
+                                          "reason": "No prior-year comparable quarter found.", "stars": None}
+        g["growth"].update(score=4.0, stars=4, available_components=3, valid_components=3, coverage=0.6)
+        st["data_sufficiency"]["sufficiency"]["revenue_yoy"].update(calculation_status="MISSING", reason_code="CONCEPT_NOT_FOUND")
+    return p
+
+
+def f5_profile(entries, mig=F5_MIG):
+    return n_profile(entries, mig=mig)
+
+
+class F5MigrationV212(unittest.TestCase):
+    def _run(self, p, entries, mig=F5_MIG):
+        return run_pair(p, profile=f5_profile(entries, mig))
+
+    def test_registered(self):
+        self.assertIn(F5_MIG, ck.PATCH_MIGRATIONS)
+        self.assertNotIn("summary", ck.PATCH_MIGRATIONS[F5_MIG])
+        self.assertNotIn(F5_MIG, ck.GOVERNED_PATCH_SCOPE); self.assertNotIn(F5_MIG, ck.GOVERNED_PATCH_STAGE)
+
+    def test_exact_patch_passes_for_each_mode(self):
+        for mode in ("recover", "missing"):
+            with self.subTest(mode=mode):
+                p = f5_pair(mode); E = p25_entries(p)
+                self.assertTrue(E)
+                code, out = self._run(p, E)
+                self.assertEqual(code, 0, out)
+                for c in ("D2", "D9", "C3", "P0"): self.assertEqual(verdict(out, c), "PASS", out)
+                self.assertIn(f"expected_patch {F5_MIG}", out)
+
+    def test_oracle_contents(self):
+        rec = {(e["file"], e["path"], e["op"]) for e in p25_entries(f5_pair("recover"))}
+        for m in ("revenue_yoy", "operating_income_yoy", "eps_yoy"):
+            self.assertIn(("AAPL.json", f"{G}/components/{m}/current_period_end", "replace"), rec)
+            self.assertIn(("AAPL.json", f"{G}/components/{m}/value", "replace"), rec)
+        self.assertIn(("AAPL.json", f"{G}/growth/score", "replace"), rec)
+        self.assertFalse(any(f == "coverage.json" for f, _, _ in rec))           # OK -> OK: no counter moves
+        mis = {(e["file"], e["path"], e["op"]) for e in p25_entries(f5_pair("missing"))}
+        for leaf, op in ((f"{G}/components/revenue_yoy/reason", "add"), (f"{G}/components/revenue_yoy/source[0]", "remove"),
+                         (f"{G}/components/revenue_yoy/current_period_end", "remove"),
+                         (f"{SUFF}/revenue_yoy/calculation_status", "replace"), (f"{SUFF}/revenue_yoy/reason_code", "replace")):
+            self.assertIn(("AAPL.json", leaf, op), mis)
+        self.assertTrue(any(f == "coverage.json" and "/revenue_yoy/by_status/MISSING" in pa for f, pa, _ in mis))
+
+    def test_unregistered_or_omitted_change_fails(self):
+        p = f5_pair(); E = [e for e in p25_entries(p) if not e["path"].endswith("eps_yoy/previous_period_end")]
+        code, out = self._run(p, E)
+        self.assertEqual(code, 1, out); self.assertEqual(verdict(out, "D2"), "FAIL", out)
+        p = f5_pair(); E = p25_entries(p)
+        comp(p, "NEW", "LLY", "revenue_yoy")["current_period_end"] = "2026-08-31"    # another ticker moved, not registered
+        code, out = self._run(p, E)
+        self.assertEqual(code, 1, out); self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    def test_value_mismatch_fails(self):
+        p = f5_pair(); E = p25_entries(p)
+        e = next(x for x in E if x["path"] == f"{G}/components/revenue_yoy/value"); e["new"] = 0.3
+        code, out = self._run(p, E)
+        self.assertEqual(code, 1, out); self.assertIn("NEW leaf differs", out)
+
+    def test_paths_outside_the_f5_grammar_are_input_errors(self):
+        bad = [("AAPL.json", f"{G}/components/revenue_cagr_3y/value"), ("AAPL.json", f"{G}/components/revenue_cagr_3y/status"),
+               ("AAPL.json", f"{G}/components/fcf_yoy/input_scope/capex/current_period/basis"),
+               ("AAPL.json", f"{G}/components/fcf_yoy/peer_comparison_eligibility"),
+               ("AAPL.json", f"{G}/components/revenue_yoy/previous_value_basis"), ("AAPL.json", f"{G}/components/revenue_yoy/source[2]"),
+               ("AAPL.json", f"{G}/components/revenue_yoy"), ("AAPL.json", f"{G}/growth/total_components"),
+               ("AAPL.json", f"{G}/warnings[3]"), ("AAPL.json", f"{G}/limitations/revenue_cagr_3y"),
+               ("AAPL.json", f"{SUFF}/revenue_cagr_3y/calculation_status"), ("AAPL.json", f"{SUFF}/revenue_yoy/metric"),
+               ("AAPL.json", "/stages/quality/quality/element/score"), ("AAPL.json", "/stages/derived_metrics/derived/derived_metrics/fcf/value"),
+               ("AAPL.json", "/stages/annual_history/history/revenue[0]/fy"),
+               ("coverage.json", "/growth/components/revenue_cagr_3y/by_status/OK"),
+               ("coverage.json", "/growth/components/revenue_yoy/by_status/WITHHELD"),
+               ("coverage.json", "/growth/components/revenue_yoy/by_status"),
+               ("coverage.json", "/growth/components/eps_yoy/by_reason_code/GOVERNANCE_WITHHELD"),
+               ("coverage.json", "/growth/withheld_component_counts/fcf_yoy"), ("coverage.json", "/quality/flag_counts"),
+               ("coverage.json", "/data_sufficiency/revenue_cagr_3y/by_calculation_status/OK"),
+               ("coverage.json", "/growth/components/eps_yoy/by_reason_code/OTHER_CODE"),
+               ("coverage.json", "/data_sufficiency/eps_yoy/by_reason_code/OTHER_CODE"),
+               ("coverage.json", "/data_sufficiency/eps_yoy/by_reason_code/GOVERNANCE_WITHHELD"),
+               ("summary.json", "/records[0]/quality/score"), ("summary.json", "/generated_at_utc")]
+        p = f5_pair()
+        for f, pa in bad:
+            with self.subTest(file=f, path=pa):
+                code, out = self._run(p, [{"file": f, "path": pa, "op": "replace", "base": 1, "new": 2}])
+                self.assertEqual(code, 3, out); self.assertIn("[INPUT ERROR]", out); self.assertNotIn("Traceback", out)
+
+    def test_every_allowed_leaf_family_is_accepted(self):
+        bind = dict(P25_BIND)
+        ok = [("AAPL.json", f"{G}/components/{m}/{leaf}") for m in ("revenue_yoy", "operating_income_yoy", "eps_yoy", "fcf_yoy")
+              for leaf in ("status", "value", "stars", "reason", "reason_code", "current_period_end", "previous_period_end",
+                           "source[0]", "source[1]")]
+        ok += [("AAPL.json", f"{G}/components/eps_yoy/previous_value_basis"), ("AAPL.json", f"{G}/warnings[2]")]
+        ok += [("AAPL.json", f"{G}/growth/{k}") for k in ("status", "score", "stars", "available_components", "valid_components", "coverage")]
+        ok += [("AAPL.json", f"{G}/limitations/{m}") for m in ("revenue_yoy", "operating_income_yoy", "eps_yoy", "fcf_yoy")]
+        ok += [("AAPL.json", f"{SUFF}/{m}/{k}") for m in ("revenue_yoy", "fcf_yoy") for k in ("calculation_status", "reason_code", "detail")]
+        ok += [("coverage.json", f"/growth/components/{m}/by_status/{s}") for m in ("revenue_yoy", "fcf_yoy") for s in ("OK", "INVALID", "MISSING")]
+        ok += [("coverage.json", f"/growth/components/eps_yoy/by_reason_code/{c}") for c in
+               ("NONPOSITIVE_PRIOR_BASE", "NONPOSITIVE_CURRENT", "NO_REASON_CODE", "SAME_FILING_COMPARATIVE_UNAVAILABLE")]
+        ok += [("coverage.json", f"/growth/aggregate_status_counts/{s}") for s in ("OK", "MISSING")]
+        ok += [("coverage.json", f"/data_sufficiency/fcf_yoy/by_calculation_status/{s}") for s in ("OK", "INVALID", "MISSING")]
+        ok += [("coverage.json", f"/data_sufficiency/eps_yoy/by_reason_code/{c}") for c in ("NO_REASON_CODE", "CONCEPT_NOT_FOUND", "INSUFFICIENT_HISTORY")]
+        for f, pa in ok:
+            with self.subTest(file=f, path=pa):
+                pt = {"migration_id": F5_MIG, "binding": bind, "entries": [{"file": f, "path": pa, "op": "replace", "base": 1, "new": 2}]}
+                self.assertEqual(ck.patch_problems(pt), [])
+
+    def test_governed_ticker_cannot_be_patched(self):
+        p = f5_pair()
+        p.res["BASE"]["GE"]["stages"]["growth"]["growth"]["growth"]["score"] = 1.0
+        p.res["NEW"]["GE"]["stages"]["growth"]["growth"]["growth"]["score"] = 2.0
+        E = p25_entries(p)
+        self.assertTrue(any(e["file"] == "GE.json" for e in E))
+        code, out = self._run(p, E)
+        self.assertEqual(code, 1, out); self.assertIn("governed ticker", out)
+
+    def test_migrations_are_isolated(self):
+        p = f5_pair(); E = p25_entries(p)
+        for other in (P25_MIG, N_MIG, "P2_QUALITY_V02_STAGE"):
+            with self.subTest(mig=other):
+                code, out = self._run(p, E, mig=other)
+                self.assertEqual(code, 3, out)
+
+    def test_without_patch_the_change_fails(self):
+        code, out = run_pair(f5_pair(), profile=P25_PROFILE)
+        self.assertEqual(code, 1, out); self.assertEqual(verdict(out, "D2"), "FAIL", out)
+
+    def test_clean_pair_output_has_no_f5_lines(self):
+        p = f5_pair(mode=None)
+        code, out = run_pair(p, profile=P25_PROFILE)
+        self.assertEqual(code, 0, out); self.assertNotIn(F5_MIG, out)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
