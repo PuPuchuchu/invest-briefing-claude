@@ -1,5 +1,11 @@
 """STEP 23 Checker v2.9 (read-only): DEC055 gate materialization + same-date batch pair comparison.
 
+v2.12 (F5, SEC fy-label collision): expected_patch migration F5_FY_LABEL_COLLISION -- a recovered latest quarter may
+move the four quarterly YoY components (revenue / operating income / EPS / FCF: status, value, stars, reason, reason
+code, periods, source, EPS previous_value_basis), the Growth aggregate, warnings, limitations, their data-sufficiency
+rows and the matching coverage counters. Not allowed: revenue_cagr_3y, the fcf_yoy input-scope block, any other
+stage, summary.json, governed tickers. Ops add / remove / replace. A pair without this migration prints v2.11 output.
+
 v2.9 (P2 Quality v0.2 stage; design r2-r5): expected_patch migration P2_QUALITY_V02_STAGE -- add-only, a grammar
 generated from P2_LIST_MAXLEN, empty containers only at exact registered paths, summary.json entries (D7 then accepts
 exactly the realized registered summary leaves), and governed tickers may carry entries only inside /stages/quality/.
@@ -60,7 +66,7 @@ from __future__ import annotations
 import argparse, ast, copy, hashlib, json, math, os, re, stat, sys, traceback, zipfile
 from datetime import date, timedelta
 
-VERSION = "checker_v2.11"
+VERSION = "checker_v2.12"
 # ---------------------------------------------------------------- policy constants
 # Copied from the production registry below; M1 compares them with the checkout by static parsing.
 MAPPING_SOURCE = {"file": "src/fundamentals/metric_eligibility_registry.py",
@@ -376,6 +382,33 @@ P2_MIGRATION = "P2_QUALITY_V02_STAGE"
 PATCH_MIGRATIONS[P2_MIGRATION] = dict(_p2_grammar(), ops=("add",), containers=_p2_containers())
 # A governed ticker may carry P2 entries only inside the Quality stage; their content is checked independently by Q5.
 GOVERNED_PATCH_STAGE = {P2_MIGRATION: Q_STAGE_PREFIX}
+
+# v2.12 (F5): a filing whose SEC fy label collides with the same fiscal quarter one year earlier is relabelled fy + 1 in
+# sec_history, so a dropped latest quarter can come back. Only the quarterly YoY components (and what is derived from
+# them) may move; revenue_cagr_3y (annual) and the fcf_yoy input-scope block are deliberately outside the grammar
+# (an F5 run that changes them fails closed and needs a new design). Governed tickers: no GOVERNED_PATCH_SCOPE entry,
+# so any F5 entry on a governed ticker is rejected.
+F5_MIGRATION = "F5_FY_LABEL_COLLISION"
+_F5Q = "(revenue_yoy|operating_income_yoy|eps_yoy|fcf_yoy)"
+_F5_STATUS = "(OK|INVALID|MISSING)"
+_F5_GROWTH_CODES = "(NONPOSITIVE_PRIOR_BASE|NONPOSITIVE_CURRENT|NO_REASON_CODE|SAME_FILING_COMPARATIVE_UNAVAILABLE)"
+_F5_SUFF_CODES = "(NO_REASON_CODE|CONCEPT_NOT_FOUND|INSUFFICIENT_HISTORY)"
+PATCH_MIGRATIONS[F5_MIGRATION] = {
+    "ticker": re.compile(
+        r"^/stages/growth/growth/components/" + _F5Q + r"/(status|value|stars|reason|reason_code|current_period_end"
+        r"|previous_period_end|source\[[01]\])$"
+        r"|^/stages/growth/growth/components/eps_yoy/previous_value_basis$"
+        r"|^/stages/growth/growth/growth/(status|score|stars|available_components|valid_components|coverage)$"
+        r"|^/stages/growth/growth/warnings(\[[0-2]\])?$"
+        r"|^/stages/growth/growth/limitations(/" + _F5Q + r")?$"
+        r"|^/stages/data_sufficiency/sufficiency/" + _F5Q + r"/(calculation_status|reason_code|detail)$"),
+    "coverage": re.compile(
+        r"^/growth/components/" + _F5Q + r"/by_status/" + _F5_STATUS + r"$"
+        r"|^/growth/components/" + _F5Q + r"/by_reason_code(/" + _F5_GROWTH_CODES + r")?$"
+        r"|^/growth/aggregate_status_counts/(OK|MISSING)$"
+        r"|^/data_sufficiency/" + _F5Q + r"/by_calculation_status/" + _F5_STATUS + r"$"
+        r"|^/data_sufficiency/" + _F5Q + r"/by_reason_code(/" + _F5_SUFF_CODES + r")?$"),
+}
 SUMMARY_FILE = "summary.json"
 SUMMARY_RUN_PATHS = re.compile(r"^/(generated_at_utc|reproducibility(/.*)?|records\[\d+\]/raw_input/(fetched_at_utc|loaded_at_utc|sha256|size_bytes))$")
 
