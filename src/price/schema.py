@@ -149,6 +149,7 @@ class Reason:
     QC_NONPOSITIVE_DENOMINATOR = "QC_NONPOSITIVE_DENOMINATOR"
     QC_OUT_OF_INTERVAL = "QC_OUT_OF_INTERVAL"
     QC_NO_OVERLAP = "QC_NO_OVERLAP"
+    SYMBOL_REQUIRED = "SYMBOL_REQUIRED"
     FACTOR_CROSSCHECK_UNVERIFIED = "FACTOR_CROSSCHECK_UNVERIFIED"
     # corporate actions (R3)
     SPLIT_EVENT_MISSING = "SPLIT_EVENT_MISSING"
@@ -164,6 +165,7 @@ class Reason:
     QC_BLOCKS_MOMENTUM = "QC_BLOCKS_MOMENTUM"
     WEEK_FINAL_BAR_MISSING = "WEEK_FINAL_BAR_MISSING"
     ZERO_REFERENCE = "ZERO_REFERENCE"
+    LATEST_SESSION_BAR_MISSING = "LATEST_SESSION_BAR_MISSING"
     # valuation
     CLASS_MAPPING_MISSING = "CLASS_MAPPING_MISSING"
     CLASS_SET_MISMATCH = "CLASS_SET_MISMATCH"
@@ -182,6 +184,17 @@ class Reason:
     NI_TTM_ATTRIBUTION_UNCLEAR = "NI_TTM_ATTRIBUTION_UNCLEAR"
     NI_TTM_PERIOD_INVALID = "NI_TTM_PERIOD_INVALID"
     NI_TTM_NONPOSITIVE = "NI_TTM_NONPOSITIVE"
+    NI_TTM_UNVALIDATED = "NI_TTM_UNVALIDATED"
+    NI_TTM_QUARTERS_INCOMPLETE = "NI_TTM_QUARTERS_INCOMPLETE"
+    NI_TTM_QUARTER_DUPLICATE = "NI_TTM_QUARTER_DUPLICATE"
+    NI_TTM_QUARTERS_NOT_CONSECUTIVE = "NI_TTM_QUARTERS_NOT_CONSECUTIVE"
+    NI_TTM_QUARTER_LENGTH = "NI_TTM_QUARTER_LENGTH"
+    NI_TTM_PERIOD_GAP = "NI_TTM_PERIOD_GAP"
+    NI_TTM_PERIOD_OVERLAP = "NI_TTM_PERIOD_OVERLAP"
+    NI_TTM_SUM_MISMATCH = "NI_TTM_SUM_MISMATCH"
+    NI_TTM_PERIOD_ANOMALY = "NI_TTM_PERIOD_ANOMALY"
+    NI_TTM_PROVENANCE_MISSING = "NI_TTM_PROVENANCE_MISSING"
+    NI_TTM_ENTITY_MISMATCH = "NI_TTM_ENTITY_MISMATCH"
     # result
     FACT_NOT_ALLOWED = "FACT_NOT_ALLOWED"
 
@@ -345,13 +358,24 @@ class MetricResult:
 # Provider responses / coverage
 # ---------------------------------------------------------------------------
 
+COVERAGE_SOURCE_DOCUMENTED = "DOCUMENTED"
+
+
 @dataclass(frozen=True)
 class ProviderCoverage:
+    """
+    Documented history coverage. Corporate-action "no event" evidence is
+    accepted only when coverage_source == DOCUMENTED and BOTH splits bounds
+    are known (inclusive). For a rolling window (e.g. "2 years") the caller
+    computes both bounds for the evaluation date.
+    """
+
     provider_id: str
     schema_version: str
     bars_history_start: Optional[date]
     splits_history_start: Optional[date]
-    coverage_source: str  # e.g. "DOCUMENTED", "SYNTHETIC", "UNKNOWN"
+    coverage_source: str  # "DOCUMENTED" or anything else (= not usable)
+    splits_history_end: Optional[date] = None
 
 
 @dataclass(frozen=True)

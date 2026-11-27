@@ -20,14 +20,22 @@ from src.price.schema import (
 )
 from src.price.valuation import (
     NI_CONCEPT_COMMON, SCOPE_CONSOLIDATED_NO_DIMENSION, ClassPriceInput,
-    ClassSharesInput, NiTtmInput, compute_pe_ttm,
+    ClassSharesInput, NiTtmInput, TtmQuarter, compute_pe_ttm,
 )
+
+QS = tuple(TtmQuarter(fy, fq, s, e, D(30864), NI_CONCEPT_COMMON, "USD",
+                      SCOPE_CONSOLIDATED_NO_DIMENSION, date(2026, 10, 30),
+                      accession=f"acc-{fy}-{fq}", entity_id="CIK1")
+           for fy, fq, s, e in ((2025, 4, date(2025, 10, 1), date(2025, 12, 31)),
+                                (2026, 1, date(2026, 1, 1), date(2026, 3, 31)),
+                                (2026, 2, date(2026, 4, 1), date(2026, 6, 30)),
+                                (2026, 3, date(2026, 7, 1), date(2026, 9, 30))))
 
 MARKER = "987654.321"          # synthetic marker price -- must never leak
 TS = datetime(2026, 11, 24, 5, 10, tzinfo=timezone.utc)
 CAL = TradingCalendar(holidays=frozenset())
 COV = ProviderCoverage("synthetic", SCHEMA_VERSION, date(2024, 11, 1),
-                       date(2024, 11, 1), "SYNTHETIC")
+                       date(2024, 11, 1), "DOCUMENTED", date(2026, 11, 23))
 
 
 def weekdays_until(end, n):
@@ -51,7 +59,7 @@ def pipeline():
     days = weekdays_until(date(2026, 11, 23), 260)
     raw = marker_bars(Basis.RAW, days)
     adj = marker_bars(Basis.SPLIT_ADJUSTED, days)
-    qc = check_adjustment_qc(raw=raw, adjusted=adj, events=[],
+    qc = check_adjustment_qc(symbol="AAA", raw=raw, adjusted=adj, events=[],
                              raw_precision=D("0.001"), adjusted_precision=D("0.001"))
     ca = assess_corporate_actions(symbol="AAA", window_start=days[0],
                                   window_end=days[-1],
@@ -71,7 +79,8 @@ def pipeline():
         class_mapping_resolved=True, corporate_actions=ca,
         ni_ttm=NiTtmInput(D(123456), (NI_CONCEPT_COMMON,), "USD", date(2025, 10, 1),
                           date(2026, 9, 30), date(2026, 10, 30),
-                          SCOPE_CONSOLIDATED_NO_DIMENSION, "COMMON_STOCKHOLDERS"),
+                          SCOPE_CONSOLIDATED_NO_DIMENSION, "COMMON_STOCKHOLDERS", QS,
+                          entity_id="CIK1"),
         price_session=d0)
     fr = assess_freshness(calendar=CAL, now_utc=TS, latest_bar_date=d0,
                           availability_rule=midnight_et_after_session)
@@ -92,6 +101,8 @@ def test_result_shape_and_capture_class():
                       "config_version"}
     assert {f["metric"] for f in r["facts"]} == set(ALLOWED_FACTS)
     assert r["validation"]["data_success"] is True
+    pe_fact = [f for f in r["facts"] if f["metric"] == "PE_TTM"][0]
+    assert pe_fact["calc_status"] == "OK" and pe_fact["value"] is not None
     json.dumps(r)  # serialisable
 
 

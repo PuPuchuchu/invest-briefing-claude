@@ -9,7 +9,7 @@ from src.price.schema import (
 )
 
 COV = ProviderCoverage("synthetic", SCHEMA_VERSION, date(2024, 11, 27),
-                       date(2024, 11, 27), "SYNTHETIC")
+                       date(2024, 11, 27), "DOCUMENTED", date(2026, 11, 26))
 W0, W1 = date(2026, 1, 2), date(2026, 11, 25)
 OK = QCResult(Q.CONSISTENT, (), 10)
 BAD = QCResult(Q.INCONSISTENT, (Reason.QC_OUT_OF_INTERVAL,), 3)
@@ -120,3 +120,19 @@ def test_empty_response_is_evidence_only_if_complete():
         assert not a.momentum_eligible
     ok = run(None, response=resp([], symbols=("AAA",)))
     assert ok.status is S.NO_EVENT_VERIFIED
+
+
+def test_coverage_upper_and_lower_bounds():
+    def cov(start, end, source="DOCUMENTED"):
+        return ProviderCoverage("s", SCHEMA_VERSION, start, start, source, end)
+    c = date(2024, 11, 27)
+    cases_bad = [cov(c, date(2026, 11, 24)),            # window_end after coverage end
+                 cov(date(2026, 1, 3), W1),             # window_start before coverage
+                 cov(c, None),                          # end unknown
+                 cov(c, W1, source="UNKNOWN"),          # not documented
+                 cov(c, W1, source="SYNTHETIC")]
+    for cv in cases_bad:
+        r = run([], cov=cv)
+        assert r.status is S.UNVERIFIED and r.reasons == (Reason.COVERAGE_UNVERIFIED,)
+    # inclusive boundaries: window_start == coverage start, window_end == coverage end
+    assert run([], cov=cov(W0, W1)).status is S.NO_EVENT_VERIFIED

@@ -1,13 +1,14 @@
 """
 Data-freshness assessment (P3 v3 section 5, P3 v7).
 
-Outcomes:
-  NO_NEW_SESSION -- the expected latest session was already evaluated
-                    (caller passes `last_evaluated_session`); normal exit.
-  FRESH          -- latest bar date == expected latest session.
-  STALE          -- latest bar date is older than expected.
-  UNAVAILABLE    -- no bar at all, or a bar dated AFTER the expected
-                    session (calendar / provider anomaly).
+Decision order (first match wins):
+  1. no bar at all                         -> UNAVAILABLE
+  2. bar dated after the expected session  -> UNAVAILABLE (anomaly)
+  3. bar older than the expected session   -> STALE
+     (also when that older session was already evaluated: lagging or
+     regressed data is never masked as NO_NEW_SESSION)
+  4. bar == expected AND already evaluated -> NO_NEW_SESSION (idempotent exit)
+  5. bar == expected, not yet evaluated    -> FRESH
 
 Stale data is never presented as fresh. No retry count or retry time is
 fixed here: provider publication delay is unverified (PoC item), so
@@ -38,9 +39,8 @@ def assess_freshness(*, calendar: TradingCalendar, now_utc: datetime,
                      last_evaluated_session: Optional[date] = None
                      ) -> FreshnessResult:
     expected = expected_latest_session(calendar, now_utc, availability_rule)
-    if last_evaluated_session is not None and expected <= last_evaluated_session:
-        return FreshnessResult(Freshness.NO_NEW_SESSION, expected,
-                               latest_bar_date, Reason.NO_NEW_SESSION)
+    # Data anomalies are reported first so they are never hidden behind
+    # the idempotency outcome.
     if latest_bar_date is None:
         return FreshnessResult(Freshness.UNAVAILABLE, expected, None,
                                Reason.PRICE_UNAVAILABLE)
@@ -50,4 +50,8 @@ def assess_freshness(*, calendar: TradingCalendar, now_utc: datetime,
     if latest_bar_date < expected:
         return FreshnessResult(Freshness.STALE, expected, latest_bar_date,
                                Reason.PRICE_STALE)
+    # latest_bar_date == expected from here on
+    if last_evaluated_session is not None and latest_bar_date <= last_evaluated_session:
+        return FreshnessResult(Freshness.NO_NEW_SESSION, expected,
+                               latest_bar_date, Reason.NO_NEW_SESSION)
     return FreshnessResult(Freshness.FRESH, expected, latest_bar_date, None)

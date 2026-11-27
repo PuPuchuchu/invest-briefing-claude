@@ -27,17 +27,17 @@ def series(pre_raw="200.00", pre_adj="100.00"):
     return raw, adj
 
 
-def qc(raw, adj, events=(SPLIT,), rp=P, ap=P):
-    return check_adjustment_qc(raw=raw, adjusted=adj, events=list(events),
+def qc(raw, adj, events=(SPLIT,), rp=P, ap=P, symbol="AAA"):
+    return check_adjustment_qc(symbol=symbol, raw=raw, adjusted=adj, events=list(events),
                                raw_precision=rp, adjusted_precision=ap)
 
 
 def test_cumulative_factor_direction():
     ev = [SPLIT, SplitEvent("AAA", date(2026, 9, 1), D(10), D(1),
                             ActionType.REVERSE_SPLIT)]
-    assert cumulative_factor(date(2026, 5, 1), ev) == D(2) * D("0.1")
-    assert cumulative_factor(E, ev) == D("0.1")          # execution day is post-split
-    assert cumulative_factor(date(2026, 9, 1), ev) == D(1)
+    assert cumulative_factor(date(2026, 5, 1), ev, "AAA") == D(2) * D("0.1")
+    assert cumulative_factor(E, ev, "AAA") == D("0.1")    # execution day is post-split
+    assert cumulative_factor(date(2026, 9, 1), ev, "AAA") == D(1)
 
 
 def test_consistent_split():
@@ -96,3 +96,49 @@ def test_denominator_exactly_zero_after_rounding_band():
     adj = [bar(date(2026, 6, 1), "0.005", Basis.SPLIT_ADJUSTED)]
     r = qc(raw, adj, events=())
     assert r.reasons == (Reason.QC_NONPOSITIVE_DENOMINATOR,)
+
+
+BBB_SPLIT = SplitEvent("BBB", E, D(1), D(2), ActionType.FORWARD_SPLIT)
+
+
+def test_other_symbol_events_do_not_affect_factor():
+    assert cumulative_factor(date(2026, 5, 1), [BBB_SPLIT], "AAA") == D(1)
+    assert cumulative_factor(date(2026, 5, 1), [SPLIT, BBB_SPLIT], "AAA") == D(2)
+    import pytest
+    with pytest.raises(ValueError):
+        cumulative_factor(date(2026, 5, 1), [SPLIT], "")
+
+
+def test_qc_ignores_other_symbol_split_adversarial():
+    # AAA has NO split: raw == adj. A BBB 2:1 split must not make AAA inconsistent.
+    raw, adj = series(pre_raw="100.00", pre_adj="100.00")
+    assert qc(raw, adj, events=(BBB_SPLIT,)).status is PriceAdjustmentQC.CONSISTENT
+    # AAA has a split; adding BBB's split must not double-count.
+    assert qc(*series(), events=(SPLIT, BBB_SPLIT)).status is PriceAdjustmentQC.CONSISTENT
+    # Only BBB's event supplied while AAA really split -> missing event detected.
+    assert qc(*series(), events=(BBB_SPLIT,)).status is PriceAdjustmentQC.INCONSISTENT
+    # Evaluating as BBB with AAA's event list -> AAA event ignored.
+    raw, adj = series(pre_raw="100.00", pre_adj="100.00")
+    assert qc(raw, adj, events=(SPLIT,), symbol="BBB").status is PriceAdjustmentQC.CONSISTENT
+
+
+def test_qc_requires_symbol():
+    r = qc(*series(), symbol="")
+    assert r.status is PriceAdjustmentQC.NOT_AVAILABLE
+    assert r.reasons == (Reason.SYMBOL_REQUIRED,)
+
+
+def test_multiple_same_symbol_events_accumulate():
+    rev = SplitEvent("AAA", date(2026, 6, 4), D(4), D(1), ActionType.REVERSE_SPLIT)
+    # 2:1 on 06-03 then 1:4 on 06-04: F before 06-03 = 2 * 0.25 = 0.5
+    raw = [bar(date(2026, 6, 2), "50.00", Basis.RAW), bar(date(2026, 6, 3), "50.00", Basis.RAW),
+           bar(date(2026, 6, 4), "200.00", Basis.RAW)]
+    adj = [bar(date(2026, 6, 2), "100.00", Basis.SPLIT_ADJUSTED),
+           bar(date(2026, 6, 3), "200.00", Basis.SPLIT_ADJUSTED),
+           bar(date(2026, 6, 4), "200.00", Basis.SPLIT_ADJUSTED)]
+    assert qc(raw, adj, events=(SPLIT, rev)).status is PriceAdjustmentQC.CONSISTENT
+
+
+def test_other_symbol_stock_dividend_does_not_block_qc():
+    bbb_sd = SplitEvent("BBB", E, D(100), D(105), ActionType.STOCK_DIVIDEND)
+    assert qc(*series(), events=(SPLIT, bbb_sd)).status is PriceAdjustmentQC.CONSISTENT

@@ -16,7 +16,8 @@ SUPPORTED in this round (GPT implementation instruction, section 9):
                is complete (not partial; adapters must mark incomplete
                pagination as partial), its requested range covers the whole
                window, it was not filtered to other symbols, and the window
-               lies inside documented coverage. Otherwise UNVERIFIED.
+               lies inside documented coverage (source DOCUMENTED, both
+               bounds known, inclusive). Otherwise UNVERIFIED.
 
 Fail-closed classifications that need no extra rules:
   * no event in window but QC INCONSISTENT -> CANDIDATE
@@ -47,6 +48,7 @@ from typing import Optional, Sequence
 
 from src.price.adjustment_qc import QCResult
 from src.price.schema import (
+    COVERAGE_SOURCE_DOCUMENTED,
     ActionType,
     CorporateActionStatus,
     PriceAdjustmentQC,
@@ -115,7 +117,10 @@ def assess_corporate_actions(
                        [Reason.SPLIT_FETCH_FAILED], 0, True, "15")
 
     cov_start = coverage.splits_history_start
-    if cov_start is None or window_start < cov_start:
+    cov_end = coverage.splits_history_end
+    if coverage.coverage_source != COVERAGE_SOURCE_DOCUMENTED \
+            or cov_start is None or cov_end is None \
+            or window_start < cov_start or window_end > cov_end:
         return _result(CorporateActionStatus.UNVERIFIED,
                        [Reason.COVERAGE_UNVERIFIED], 0, True, "13")
 

@@ -46,3 +46,24 @@ def test_no_new_session_after_weekend():
 def test_new_session_when_last_evaluated_older():
     r = run(date(2026, 11, 27), now=NOW_MON, last=date(2026, 11, 25))
     assert r.status is Freshness.FRESH
+
+
+def test_anomalies_not_masked_by_no_new_session():
+    r = run(None, now=NOW_MON, last=date(2026, 11, 27))
+    assert r.status is Freshness.UNAVAILABLE and r.reason == Reason.PRICE_UNAVAILABLE
+    r = run(date(2026, 11, 30), now=NOW_MON, last=date(2026, 11, 27))
+    assert r.status is Freshness.UNAVAILABLE
+    assert r.reason == Reason.BAR_AFTER_EXPECTED_SESSION
+    # lagging data whose session was already evaluated -> STALE, not hidden
+    r = run(date(2026, 11, 25), now=NOW_MON, last=date(2026, 11, 25))
+    assert r.status is Freshness.STALE
+    # data regressed below an already evaluated expected session -> STALE
+    r = run(date(2026, 11, 25), now=NOW_MON, last=date(2026, 11, 27))
+    assert r.status is Freshness.STALE
+
+
+def test_no_new_session_requires_fresh_data():
+    r = run(date(2026, 11, 27), now=NOW_MON, last=date(2026, 11, 27))
+    assert r.status is Freshness.NO_NEW_SESSION
+    r = run(date(2026, 11, 27), now=NOW_MON, last=date(2026, 11, 25))
+    assert r.status is Freshness.FRESH

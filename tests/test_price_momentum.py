@@ -154,3 +154,46 @@ def test_gating_is_independent_of_valuation_and_fail_closed():
     assert run(bars, ca=pending)["RSI_14D"].calc_status is CalcStatus.INVALID
     bad = QCResult(PriceAdjustmentQC.INCONSISTENT, (Reason.QC_OUT_OF_INTERVAL,), 1)
     assert run(bars, qc=bad)["RSI_14D"].reasons == (Reason.QC_BLOCKS_MOMENTUM,)
+
+
+def test_input_contract_rejects_bad_series():
+    days = weekdays(date(2025, 6, 2), 30)
+    good = adj_bars(days, [100] * 30)
+    raw_basis = [NormalizedBar(b.date, b.open, b.high, b.low, b.close, 1, Basis.RAW,
+                               "synthetic", TS) for b in good]
+    cases = {
+        Reason.BASIS_MIXED: raw_basis,
+        Reason.DATES_NOT_ASCENDING: good[:10] + [good[12], good[11]] + good[13:],
+        Reason.DUPLICATE_DATE: good[:10] + [good[9]] + good[10:],
+    }
+    for reason, bars in cases.items():
+        out = compute_momentum(adjusted_bars=bars, adjusted_status=AdjustedPriceStatus.OK,
+                               corporate_actions=CA_OK, qc=OKQC, calendar=CAL,
+                               as_of_session=days[-1])
+        assert all(m.calc_status is CalcStatus.INVALID for m in out.values()), reason
+        assert out["RSI_14D"].reasons == (reason,)
+
+
+def test_bar_after_as_of_is_rejected_not_dropped():
+    days = weekdays(date(2025, 6, 2), 30)
+    bars = adj_bars(days, [100] * 30)
+    out = compute_momentum(adjusted_bars=bars, adjusted_status=AdjustedPriceStatus.OK,
+                           corporate_actions=CA_OK, qc=OKQC, calendar=CAL,
+                           as_of_session=days[-2])
+    assert out["RSI_14D"].calc_status is CalcStatus.INVALID
+    assert out["RSI_14D"].reasons == (Reason.FUTURE_DATE,)
+
+
+def test_latest_session_bar_missing_produces_no_value():
+    days = weekdays(date(2025, 6, 2), 30)
+    bars = adj_bars(days[:-1], [100] * 29)
+    out = compute_momentum(adjusted_bars=bars, adjusted_status=AdjustedPriceStatus.OK,
+                           corporate_actions=CA_OK, qc=OKQC, calendar=CAL,
+                           as_of_session=days[-1])
+    assert all(m.calc_status is CalcStatus.MISSING and m.value is None
+               for m in out.values())
+    assert out["RSI_14D"].reasons == (Reason.LATEST_SESSION_BAR_MISSING,)
+    empty = compute_momentum(adjusted_bars=[], adjusted_status=AdjustedPriceStatus.OK,
+                             corporate_actions=CA_OK, qc=OKQC, calendar=CAL,
+                             as_of_session=days[-1])
+    assert empty["RSI_14D"].reasons == (Reason.LATEST_SESSION_BAR_MISSING,)

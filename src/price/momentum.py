@@ -41,8 +41,10 @@ from src.price.schema import (
     MetricResult,
     NormalizedBar,
     PriceAdjustmentQC,
+    PriceDataValidationError,
     Reason,
     RsiState,
+    validate_series,
 )
 
 RSI_PERIOD = 14
@@ -147,13 +149,33 @@ MOMENTUM_METRICS = ("RSI_14D", "PRICE_VS_SMA50_PCT", "PRICE_VS_SMA200_PCT",
                     "PRICE_VS_SMA40W_PCT")
 
 
+def _all(status: CalcStatus, reasons: tuple[str, ...]) -> dict[str, MetricResult]:
+    return {m: MetricResult(m, status, reasons=reasons) for m in MOMENTUM_METRICS}
+
+
 def compute_momentum(*, adjusted_bars: Sequence[NormalizedBar],
                      adjusted_status: AdjustedPriceStatus,
                      corporate_actions: CorporateActionAssessment,
                      qc: QCResult,
                      calendar: TradingCalendar,
                      as_of_session: date) -> dict[str, MetricResult]:
-    """All momentum facts for one symbol, gated per module docstring."""
+    """
+    All momentum facts for one symbol, gated per module docstring.
+
+    Input contract (checked here, not only at the provider):
+      * every bar is SPLIT_ADJUSTED; dates strictly ascending, no duplicates
+      * no bar dated after as_of_session (explicitly rejected, not dropped)
+      * the last bar is exactly as_of_session -- otherwise no value is
+        produced (MISSING / LATEST_SESSION_BAR_MISSING)
+    Contract violations -> INVALID with the validation reason code.
+    """
+    if any(b.basis is not Basis.SPLIT_ADJUSTED for b in adjusted_bars):
+        return _all(CalcStatus.INVALID, (Reason.BASIS_MIXED,))
+    try:
+        validate_series(tuple(adjusted_bars), as_of=as_of_session)
+    except PriceDataValidationError as exc:
+        return _all(CalcStatus.INVALID, (exc.reason,))
+
     block: tuple[str, ...] = ()
     if adjusted_status is not AdjustedPriceStatus.OK:
         block = (Reason.ADJUSTED_PRICE_NOT_OK,)
@@ -161,20 +183,16 @@ def compute_momentum(*, adjusted_bars: Sequence[NormalizedBar],
         block = (Reason.CORPORATE_ACTION_BLOCKS_MOMENTUM,) + corporate_actions.reasons
     elif qc.status is PriceAdjustmentQC.INCONSISTENT:
         block = (Reason.QC_BLOCKS_MOMENTUM,)
-    elif any(b.basis is not Basis.SPLIT_ADJUSTED for b in adjusted_bars):
-        block = (Reason.BASIS_MIXED,)
     if block:
         status = (CalcStatus.MISSING
                   if adjusted_status is not AdjustedPriceStatus.OK
                   else CalcStatus.INVALID)
         return {m: MetricResult(m, status, reasons=block) for m in MOMENTUM_METRICS}
 
-    used = [b for b in adjusted_bars if b.date <= as_of_session]
+    used = list(adjusted_bars)
+    if not used or used[-1].date != as_of_session:
+        return _all(CalcStatus.MISSING, (Reason.LATEST_SESSION_BAR_MISSING,))
     closes = [b.close for b in used]
-    if not closes:
-        return {m: MetricResult(m, CalcStatus.MISSING,
-                                reasons=(Reason.INSUFFICIENT_HISTORY,))
-                for m in MOMENTUM_METRICS}
     last = closes[-1]
     return {
         "RSI_14D": rsi_wilder(closes),

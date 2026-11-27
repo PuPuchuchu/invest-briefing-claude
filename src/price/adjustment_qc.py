@@ -2,7 +2,7 @@
 PRICE_ADJUSTMENT_QC (P3 v7 section 2.3).
 
 For every trading date t present in BOTH the RAW and SPLIT_ADJUSTED
-series:
+series of ONE symbol (events of other symbols are ignored):
 
     F(t) = product(split_to / split_from  for events with execution_date > t)
 
@@ -53,10 +53,13 @@ class QCResult:
     factor_crosscheck: str = field(default=Reason.FACTOR_CROSSCHECK_UNVERIFIED)
 
 
-def cumulative_factor(t: date, events: Sequence[SplitEvent]) -> Decimal:
+def cumulative_factor(t: date, events: Sequence[SplitEvent], symbol: str) -> Decimal:
+    """Product of ratios of `symbol`'s events executed after t."""
+    if not symbol:
+        raise ValueError(Reason.SYMBOL_REQUIRED)
     f = Decimal(1)
     for e in events:
-        if e.execution_date > t:
+        if e.symbol == symbol and e.execution_date > t:
             f *= e.ratio
     return f
 
@@ -65,7 +68,8 @@ def _na(reason: str, checked: int = 0) -> QCResult:
     return QCResult(PriceAdjustmentQC.NOT_AVAILABLE, (reason,), checked)
 
 
-def check_adjustment_qc(*, raw: Sequence[NormalizedBar],
+def check_adjustment_qc(*, symbol: str,
+                        raw: Sequence[NormalizedBar],
                         adjusted: Sequence[NormalizedBar],
                         events: Sequence[SplitEvent],
                         raw_precision: Optional[Decimal],
@@ -73,6 +77,9 @@ def check_adjustment_qc(*, raw: Sequence[NormalizedBar],
                         price_field: str = "close") -> QCResult:
     if price_field not in QC_FIELDS:
         raise ValueError("UNKNOWN_PRICE_FIELD")
+    if not symbol:
+        return _na(Reason.SYMBOL_REQUIRED)
+    events = [e for e in events if e.symbol == symbol]
     if raw_precision is None or adjusted_precision is None \
             or raw_precision <= 0 or adjusted_precision <= 0:
         return _na(Reason.QC_PRECISION_UNKNOWN)
@@ -102,7 +109,7 @@ def check_adjustment_qc(*, raw: Sequence[NormalizedBar],
             return _na(Reason.QC_NONPOSITIVE_DENOMINATOR, checked)
         lower = (r - eps_r) / lo_den
         upper = (r + eps_r) / hi_den
-        f = cumulative_factor(t, events)
+        f = cumulative_factor(t, events, symbol)
         checked += 1
         if not (lower <= f <= upper):
             return QCResult(PriceAdjustmentQC.INCONSISTENT,
