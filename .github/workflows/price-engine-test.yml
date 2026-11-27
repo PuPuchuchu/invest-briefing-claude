@@ -1,17 +1,24 @@
 name: Price Engine Test
 
 # Synthetic-fixture tests for src/price (common price calculation engine v1).
-# No network data, no API keys, no secrets are used by these tests.
+# No network data, no API keys, no secrets are used by these tests
+# (the Massive adapter and runner are tested with a fake transport).
 
 on:
   push:
     paths:
       - "src/price/**"
+      - "src/price_providers/**"
+      - "scripts/run_price_briefing.py"
+      - "data/reference/us_market_calendar.csv"
       - "tests/test_price_*.py"
       - ".github/workflows/price-engine-test.yml"
   pull_request:
     paths:
       - "src/price/**"
+      - "src/price_providers/**"
+      - "scripts/run_price_briefing.py"
+      - "data/reference/us_market_calendar.csv"
       - "tests/test_price_*.py"
       - ".github/workflows/price-engine-test.yml"
   workflow_dispatch:
