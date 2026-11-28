@@ -150,8 +150,11 @@ def test_gating_is_independent_of_valuation_and_fail_closed():
     out = run(bars, ca=blocked)
     assert all(m.calc_status is CalcStatus.INVALID for m in out.values())
     assert Reason.CORPORATE_ACTION_BLOCKS_MOMENTUM in out["RSI_14D"].reasons
-    pending = CorporateActionAssessment(CorporateActionStatus.PENDING_SEC, (), 1, False, "2")
-    assert run(bars, ca=pending)["RSI_14D"].calc_status is CalcStatus.INVALID
+    # R3 row 2 (price-verified split awaiting SEC) is momentum-eligible
+    pending = CorporateActionAssessment(CorporateActionStatus.PENDING_SEC, (), 1, True, "2")
+    assert run(bars, ca=pending)["RSI_14D"].calc_status is CalcStatus.OK
+    candidate = CorporateActionAssessment(CorporateActionStatus.CANDIDATE, (), 1, True, None)
+    assert run(bars, ca=candidate)["RSI_14D"].calc_status is CalcStatus.INVALID
     bad = QCResult(PriceAdjustmentQC.INCONSISTENT, (Reason.QC_OUT_OF_INTERVAL,), 1)
     assert run(bars, qc=bad)["RSI_14D"].reasons == (Reason.QC_BLOCKS_MOMENTUM,)
 

@@ -269,3 +269,14 @@ def test_quarters_from_other_entity_rejected():
     assert r.calc_status is CalcStatus.INVALID
     assert Reason.NI_TTM_ENTITY_MISMATCH in r.reasons
     assert Reason.NI_TTM_ENTITY_MISMATCH in pe(ni=replace(NI, entity_id="")).reasons
+
+
+
+def test_pending_sec_split_blocks_valuation_even_with_valid_inputs():
+    pending = CorporateActionAssessment(CorporateActionStatus.PENDING_SEC,
+                                        (Reason.SPLIT_PENDING_SEC,), 1, True, "2")
+    assert pending.momentum_eligible and not pending.valuation_roll_eligible
+    r = pe(ca=pending)
+    assert r.calc_status is CalcStatus.INVALID
+    assert Reason.CORPORATE_ACTION_BLOCKS_VALUATION in r.reasons
+    assert pe().calc_status is CalcStatus.OK          # same inputs, NO_EVENT -> OK

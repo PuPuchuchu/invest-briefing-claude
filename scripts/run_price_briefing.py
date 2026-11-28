@@ -50,7 +50,8 @@ from src.price.momentum import compute_momentum  # noqa: E402
 from src.price.provider import ProviderError  # noqa: E402
 from src.price.result import ProviderMetadata, StatusBlock, build_result  # noqa: E402
 from src.price.schema import (  # noqa: E402
-    AdjustedPriceStatus, Basis, Freshness, RawPriceStatus, ShareCountStatus,
+    AdjustedPriceStatus, Basis, CorporateActionStatus, Freshness, RawPriceStatus,
+    ShareCountStatus,
 )
 from src.price.valuation import compute_pe_ttm  # noqa: E402
 from src.price_providers.calendar_io import load_calendar  # noqa: E402
@@ -106,7 +107,10 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
                              raw_precision=rp, adjusted_precision=ap)
     ca = assess_corporate_actions(symbol=symbol, window_start=start, window_end=expected,
                                   response=splits_resp, fetch_failed=splits_failed,
-                                  qc=qc, coverage=provider.coverage())
+                                  qc=qc, coverage=provider.coverage(),
+                                  raw_bars=raw.bars, calendar=calendar)
+    if ca.status is CorporateActionStatus.PENDING_SEC:
+        limitations.append("SPLIT_IN_WINDOW_PRICE_VERIFIED_SEC_PENDING")
     adj_status = AdjustedPriceStatus.OK if adj_fresh else (
         AdjustedPriceStatus.MISSING if adj.data_as_of is None else AdjustedPriceStatus.STALE)
     raw_status = RawPriceStatus.OK if raw_fresh else (
