@@ -176,18 +176,18 @@ def test_structure_check_has_no_prices(patch_provider, capsys):
 def test_structure_check_reports_failing_stage(patch_provider, monkeypatch, capsys):
     real = make_transport()
 
-    def fractional_volume(url, headers):
+    def bad_close(url, headers):
         st, body = real(url, headers)
         if b"adjusted=true" in url.encode():
-            body = body.replace(b'"v": 1000', b'"v": 1000.5')
+            body = body.replace(b'"c": ', b'"c": "x", "c_": ')
         return st, body
     real_cls = m.MassivePriceProvider
     monkeypatch.setattr(rpb, "MassivePriceProvider",
-                        lambda **a: real_cls(transport=fractional_volume,
+                        lambda **a: real_cls(transport=bad_close,
                                              sleep=lambda s: None, **a))
     rc, out, doc = run(capsys, "--structure-check")
     s = doc["structure"][0]
-    assert rc == 0 and s["errors"] == {"adjusted_bars": "MALFORMED_RESPONSE:VOLUME_FRACTIONAL"}
+    assert rc == 0 and s["errors"] == {"adjusted_bars": "MALFORMED_RESPONSE:CLOSE_TYPE"}
     assert "raw_bars" not in s and PRICE_MARK not in out
 
 

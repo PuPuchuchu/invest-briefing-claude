@@ -58,7 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Callable, Iterable, Optional, Protocol
 
 from src.price.calendar import NY_TZ
@@ -142,10 +142,16 @@ def _to_decimal(v: object, field: str = "NUMBER") -> Decimal:
 
 
 def _to_volume(v: object) -> int:
+    """Massive documents `v` as a number and does return fractional daily
+    volumes (fractional-share trades; PoC 2026-11-28, AAPL/NVDA/SMCI).
+    Volume is informational only -- no metric in src/price reads it -- and
+    the engine schema stores an int, so a finite non-negative value is
+    rounded half-even to the nearest share. Negative / non-finite values
+    still fail closed."""
     d = _to_decimal(v, "VOLUME")
-    if d != d.to_integral_value():
-        raise ProviderError(MALFORMED_RESPONSE + ":VOLUME_FRACTIONAL")
-    return int(d)
+    if not d.is_finite() or d < 0:
+        raise ProviderError(MALFORMED_RESPONSE + ":VOLUME_VALUE")
+    return int(d.to_integral_value(rounding=ROUND_HALF_EVEN))
 
 
 def _json_type(v: object) -> str:

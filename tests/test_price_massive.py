@@ -373,7 +373,8 @@ def _bar(**over):
 
 
 @pytest.mark.parametrize("payload,reason", [
-    (_bar(v=1000.5), "VOLUME_FRACTIONAL"),
+    (_bar(v=-1), "VOLUME_VALUE"),
+    (_bar(v=True), "VOLUME_TYPE"),
     (_bar(v=None), "VOLUME_MISSING"),
     (_bar(v="1000"), "VOLUME_TYPE"),
     (_bar(c=None), "CLOSE_MISSING"),
@@ -414,3 +415,10 @@ def test_describe_page_has_types_not_values():
     assert d["next_url_host"] == "api.massive.com" and d["status"] == "OK"
     txt = json.dumps(d)
     assert MARKER not in txt and "SECRETCURSOR" not in txt and "r1" not in txt
+
+
+@pytest.mark.parametrize("v,expected", [(1000.5, 1000), (1001.5, 1002), (7.0526e7, 70526000),
+                                        (123.4, 123), (0, 0)])
+def test_fractional_volume_rounded_half_even(v, expected):
+    p, _, _ = provider([(lambda u: True, 200, _bar(v=v))])
+    assert p.get_daily_bars("AAPL", D1, D2, Basis.RAW).bars[0].volume == expected
