@@ -45,7 +45,13 @@ ALLOWED_FACTS: dict[str, tuple[str, int]] = {
     "PRICE_VS_SMA50_PCT": ("PERCENT", 2),
     "PRICE_VS_SMA200_PCT": ("PERCENT", 2),
     "PRICE_VS_SMA40W_PCT": ("PERCENT", 2),
+    # EPS path (G6): PE_TTM = raw close / sum of four directly reported
+    # 3-month diluted EPS (or the FY value when it is exactly the TTM period);
+    # PE_FY = raw close / latest 10-K FY diluted EPS. Never reconstructed.
     "PE_TTM": ("RATIO", 2),
+    "PE_FY": ("RATIO", 2),
+    "EPS_TTM": ("USD_PER_SHARE", 2),
+    "EPS_FY": ("USD_PER_SHARE", 2),
 }
 ROUNDING_RULE = "ROUND_HALF_UP"
 
@@ -108,6 +114,7 @@ def build_result(*, ticker: str, evaluation_date: date,
             "rounding": f"{ROUNDING_RULE}:{places}",
             "state": m.state,
             "reasons": list(m.reasons),
+            **({"evidence": m.evidence} if m.evidence is not None else {}),
         })
         reason_codes.extend(m.reasons)
     if freshness.reason:

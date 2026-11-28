@@ -17,7 +17,10 @@ _LABELS = {
     "PRICE_VS_SMA50_PCT": "50일선 대비",
     "PRICE_VS_SMA200_PCT": "200일선 대비",
     "PRICE_VS_SMA40W_PCT": "40주선 대비",
-    "PE_TTM": "PER(TTM)",
+    "PE_TTM": "PER(TTM, 직접공시 4분기 EPS)",
+    "PE_FY": "PER(최근 회계연도 EPS)",
+    "EPS_TTM": "희석 EPS(TTM)",
+    "EPS_FY": "희석 EPS(회계연도)",
 }
 
 

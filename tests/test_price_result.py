@@ -99,7 +99,10 @@ def test_result_shape_and_capture_class():
     assert set(r) >= {"facts", "status", "freshness", "limitations", "validation",
                       "reason_codes", "provider", "calculation_version",
                       "config_version"}
-    assert {f["metric"] for f in r["facts"]} == set(ALLOWED_FACTS)
+    # G6 extended the allowlist (PE_FY, EPS_TTM, EPS_FY); this pipeline emits
+    # the five original metrics, all of which must be allowed.
+    assert {f["metric"] for f in r["facts"]} <= set(ALLOWED_FACTS)
+    assert {"PE_FY", "EPS_TTM", "EPS_FY", "PE_TTM"} <= set(ALLOWED_FACTS)
     assert r["validation"]["data_success"] is True
     pe_fact = [f for f in r["facts"] if f["metric"] == "PE_TTM"][0]
     assert pe_fact["calc_status"] == "OK" and pe_fact["value"] is not None

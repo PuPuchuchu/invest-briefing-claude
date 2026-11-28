@@ -101,8 +101,9 @@ def test_missing_precision_withholds_momentum(patch_provider, capsys):
 
 
 def momentum_statuses(result):
+    # momentum metrics only (valuation facts PE_TTM / PE_FY / EPS_* excluded)
     return {f["metric"]: f["calc_status"] for f in result["facts"]
-            if f["metric"] != "PE_TTM"}
+            if f["metric"] == "RSI_14D" or f["metric"].startswith("PRICE_VS_")}
 
 
 @pytest.mark.parametrize("bad", ["auto", "0", "-0.01", "NaN", "Infinity", "x"])
@@ -277,3 +278,54 @@ def test_r3_row2_event_without_raw_jump_stays_blocked(monkeypatch, capsys):
     aapl = doc["results"][0]
     assert aapl["status"]["corporate_action"] != "PENDING_SEC"
     assert "OK" not in momentum_statuses(aapl).values()
+
+
+# ------------------------------------------------------------------ G6 EPS path
+def _eps_row(start, end, val, filed, form="10-Q"):
+    return {"start": start, "end": end, "val": val, "accn": f"A-{end}", "fy": 2026,
+            "fp": "Q", "form": form, "filed": filed}
+
+
+GOOD_CF = {"facts": {"us-gaap": {"EarningsPerShareDiluted": {"units": {"USD/shares": [
+    _eps_row("2025-01-01", "2025-03-31", 0.9, "2025-04-30"),
+    _eps_row("2025-04-01", "2025-06-30", 1.0, "2025-07-30"),
+    _eps_row("2025-07-01", "2025-09-30", 1.0, "2025-10-30"),
+    _eps_row("2025-10-01", "2025-12-31", 1.1, "2026-02-10", "10-K"),
+    _eps_row("2025-01-01", "2025-12-31", 4.0, "2026-02-10", "10-K"),
+    _eps_row("2026-01-01", "2026-03-31", 1.2, "2026-04-30"),
+    _eps_row("2026-04-01", "2026-06-30", 1.3, "2026-07-30"),
+    _eps_row("2026-07-01", "2026-09-30", 1.4, "2026-10-30")]}}}}}
+
+
+def test_eps_path_per_ticker_isolation(monkeypatch, capsys, tmp_path):
+    (tmp_path / "AAPL_companyfacts.json").write_text(json.dumps(GOOD_CF), encoding="utf-8")
+    (tmp_path / "MSFT_companyfacts.json").write_text("{broken", encoding="utf-8")
+    _patch(monkeypatch, make_transport())
+    rc, out, doc = run(capsys, "--price-precision", "0.01", "--sec-raw-dir", str(tmp_path))
+    aapl, msft = doc["results"]
+    facts = {f["metric"]: f for f in aapl["facts"]}
+    assert facts["EPS_TTM"]["value"] == "5.00" and facts["EPS_FY"]["value"] == "4.00"
+    assert facts["PE_TTM"]["calc_status"] == "OK" and facts["PE_FY"]["calc_status"] == "OK"
+    assert facts["PE_TTM"]["evidence"]["method"] == "DIRECT_4Q"
+    assert len(facts["PE_TTM"]["evidence"]["periods"]) == 4
+    m = {f["metric"]: f for f in msft["facts"]}
+    assert m["PE_TTM"]["calc_status"] == "INVALID"
+    assert m["PE_TTM"]["reasons"] == ["EPS_SOURCE_MALFORMED"]
+    assert set(momentum_statuses(msft).values()) == {"OK"}        # rest of the ticker intact
+    assert PRICE_MARK not in out
+
+
+def test_eps_path_without_sec_dir_is_missing(monkeypatch, capsys):
+    _patch(monkeypatch, make_transport())
+    rc, out, doc = run(capsys, "--price-precision", "0.01")
+    f = {x["metric"]: x for x in doc["results"][0]["facts"]}
+    assert f["PE_TTM"]["calc_status"] == "MISSING"
+    assert f["PE_TTM"]["reasons"] == ["EPS_SOURCE_MISSING"]
+
+
+def test_eps_path_blocked_when_split_fetch_failed(monkeypatch, capsys, tmp_path):
+    (tmp_path / "AAPL_companyfacts.json").write_text(json.dumps(GOOD_CF), encoding="utf-8")
+    _patch(monkeypatch, make_transport(fail_splits=True))
+    rc, out, doc = run(capsys, "--price-precision", "0.01", "--sec-raw-dir", str(tmp_path))
+    f = {x["metric"]: x for x in doc["results"][0]["facts"]}
+    assert f["PE_TTM"]["reasons"] == ["EPS_SPLIT_BASIS_UNVERIFIED"]

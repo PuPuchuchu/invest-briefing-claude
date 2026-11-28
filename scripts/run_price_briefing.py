@@ -53,8 +53,9 @@ from src.price.schema import (  # noqa: E402
     AdjustedPriceStatus, Basis, CorporateActionStatus, Freshness, RawPriceStatus,
     ShareCountStatus,
 )
-from src.price.valuation import compute_pe_ttm  # noqa: E402
+from src.price.valuation import SplitBasisEvidence, compute_pe_eps  # noqa: E402
 from src.price_providers.calendar_io import load_calendar  # noqa: E402
+from src.price_providers.sec_eps import EpsSourceError, load_eps_source  # noqa: E402
 from src.price_providers.massive import (  # noqa: E402
     ADAPTER_SCHEMA_VERSION, MassivePriceProvider, observed_decimal_places,
 )
@@ -72,6 +73,8 @@ def _parse_args(argv):
     p.add_argument("--last-evaluated", default=None)
     p.add_argument("--now-utc", default=None, help="ISO datetime (tests only)")
     p.add_argument("--structure-check", action="store_true")
+    p.add_argument("--sec-raw-dir", default=None,
+                   help="cached SEC companyfacts dir (run_fundamentals_batch --raw-dir)")
     return p.parse_args(argv)
 
 
@@ -86,7 +89,8 @@ def _precision(arg):
 
 
 def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
-                    splits_resp, splits_failed, precision, last_evaluated):
+                    splits_resp, splits_failed, precision, last_evaluated,
+                    sec_raw_dir=None):
     limitations: list[str] = []
     raw = provider.get_daily_bars(symbol, start, expected, Basis.RAW)
     adj = provider.get_daily_bars(symbol, start, expected, Basis.SPLIT_ADJUSTED)
@@ -118,10 +122,9 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
     metrics = compute_momentum(adjusted_bars=adj.bars, adjusted_status=adj_status,
                                corporate_actions=ca, qc=qc, calendar=calendar,
                                as_of_session=expected)
-    # PE_TTM: no validated four-quarter NI_TTM evidence source yet (P4 G6).
-    metrics["PE_TTM"] = compute_pe_ttm(prices=[], shares=[], class_mapping_resolved=False,
-                                       corporate_actions=ca, ni_ttm=None,
-                                       price_session=expected)
+    # PE_TTM / PE_FY via directly reported diluted EPS (G6 EPS path).
+    metrics.update(_eps_metrics(symbol, raw, raw_status, expected, splits_resp,
+                                splits_failed, ca, sec_raw_dir))
     statuses = StatusBlock(ca.status, qc.status, ShareCountStatus.NOT_AVAILABLE,
                            raw_status, adj_status)
     meta = ProviderMetadata(provider.provider_id, ADAPTER_SCHEMA_VERSION,
@@ -138,6 +141,30 @@ def _stage(fn):
         return fn(), None
     except ProviderError as exc:
         return None, exc.reason
+
+
+def _eps_metrics(symbol, raw, raw_status, expected, splits_resp, splits_failed, ca,
+                 sec_raw_dir):
+    """EPS-path valuation; any source problem stays inside this ticker."""
+    close = (raw.bars[-1].close if raw.bars and raw.bars[-1].date == expected else None)
+    evidence = None
+    if not splits_failed and splits_resp is not None and not splits_resp.is_partial \
+            and ca.status is not CorporateActionStatus.CANDIDATE:
+        evidence = SplitBasisEvidence(
+            verified_from=splits_resp.requested_start,
+            verified_to=splits_resp.requested_end,
+            execution_dates=tuple(sorted({e.execution_date for e in splits_resp.events
+                                          if e.symbol == symbol})))
+    if sec_raw_dir is None:
+        return compute_pe_eps(raw_close=close, raw_status=raw_status, price_session=expected,
+                              facts=None, split_evidence=evidence)
+    try:
+        facts, shares = load_eps_source(Path(sec_raw_dir), symbol)
+    except EpsSourceError as exc:
+        return compute_pe_eps(raw_close=close, raw_status=raw_status, price_session=expected,
+                              facts=None, split_evidence=evidence, source_reason=exc.reason)
+    return compute_pe_eps(raw_close=close, raw_status=raw_status, price_session=expected,
+                          facts=facts, split_evidence=evidence, sec_shares=shares)
 
 
 def structure_check(provider, symbol, start, expected):
@@ -217,7 +244,8 @@ def main(argv=None) -> int:
     for t in tickers:
         try:
             r = evaluate_ticker(provider, calendar, t, start, expected, now_utc,
-                                splits_resp, splits_failed, precision, last_eval)
+                                splits_resp, splits_failed, precision, last_eval,
+                                sec_raw_dir=args.sec_raw_dir)
             results.append(r)
             briefing[t] = interpret(r)
         except ProviderError as exc:
