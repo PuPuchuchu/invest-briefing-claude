@@ -14,8 +14,9 @@ Usage (repository root on PYTHONPATH):
       [--auth proxy|env] [--price-precision 0.01] [--last-evaluated YYYY-MM-DD]
   python scripts/run_price_briefing.py --tickers AAPL --structure-check
 
---structure-check prints only structure facts for the PoC (counts, date
-coverage, decimal places, split-event counts, request count) -- no prices.
+--structure-check prints only structure facts for the PoC (per-stage error
+reasons, response key names and JSON types, counts, date coverage, decimal
+places, split-event counts, request count) -- no prices or volumes.
 
 Price precision: required for the split-adjustment QC and accepted ONLY as an
 explicit positive decimal (provider-documented or PoC-verified value). Until
@@ -128,12 +129,32 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
                         config_version=CONFIG_VERSION, extra_limitations=limitations)
 
 
+def _stage(fn):
+    try:
+        return fn(), None
+    except ProviderError as exc:
+        return None, exc.reason
+
+
 def structure_check(provider, symbol, start, expected):
-    raw = provider.get_daily_bars(symbol, start, expected, Basis.RAW)
-    adj = provider.get_daily_bars(symbol, start, expected, Basis.SPLIT_ADJUSTED)
-    sp = provider.get_split_events(start, expected, [symbol])
-    return {
-        "ticker": symbol,
+    """Per-stage structure facts (error reasons, key names and JSON types,
+    counts, dates, decimal places) -- never price, volume or other values."""
+    out = {"ticker": symbol}
+    shape, err = _stage(lambda: provider.probe_shape(
+        provider.bars_url(symbol, start, expected, Basis.RAW)))
+    out["raw_page_shape"] = shape if err is None else {"error": err}
+    shape, err = _stage(lambda: provider.probe_shape(
+        provider.splits_url(start, expected, (symbol,))))
+    out["splits_page_shape"] = shape if err is None else {"error": err}
+    raw, e1 = _stage(lambda: provider.get_daily_bars(symbol, start, expected, Basis.RAW))
+    adj, e2 = _stage(lambda: provider.get_daily_bars(symbol, start, expected,
+                                                     Basis.SPLIT_ADJUSTED))
+    sp, e3 = _stage(lambda: provider.get_split_events(start, expected, [symbol]))
+    out["errors"] = {k: v for k, v in (("raw_bars", e1), ("adjusted_bars", e2),
+                                       ("splits", e3)) if v}
+    if raw is None or adj is None or sp is None:
+        return out
+    return out | {
         "raw_bars": len(raw.bars), "adjusted_bars": len(adj.bars),
         "raw_first": None if raw.actual_start is None else raw.actual_start.isoformat(),
         "raw_last": None if raw.actual_end is None else raw.actual_end.isoformat(),

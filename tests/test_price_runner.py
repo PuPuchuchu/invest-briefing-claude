@@ -167,6 +167,28 @@ def test_structure_check_has_no_prices(patch_provider, capsys):
     s = doc["structure"][0]
     assert rc == 0 and s["dates_equal"] is True and s["raw_decimal_places"] == 3
     assert s["raw_last"] == "2026-11-23" and PRICE_MARK not in out
+    assert s["errors"] == {}
+    assert s["raw_page_shape"]["first_row"]["c"] == "float"
+    assert s["raw_page_shape"]["counts"]["resultsCount"] == s["raw_bars"]
+    assert s["splits_page_shape"]["top_level"]["results"] == "list"
+
+
+def test_structure_check_reports_failing_stage(patch_provider, monkeypatch, capsys):
+    real = make_transport()
+
+    def fractional_volume(url, headers):
+        st, body = real(url, headers)
+        if b"adjusted=true" in url.encode():
+            body = body.replace(b'"v": 1000', b'"v": 1000.5')
+        return st, body
+    real_cls = m.MassivePriceProvider
+    monkeypatch.setattr(rpb, "MassivePriceProvider",
+                        lambda **a: real_cls(transport=fractional_volume,
+                                             sleep=lambda s: None, **a))
+    rc, out, doc = run(capsys, "--structure-check")
+    s = doc["structure"][0]
+    assert rc == 0 and s["errors"] == {"adjusted_bars": "MALFORMED_RESPONSE:VOLUME_FRACTIONAL"}
+    assert "raw_bars" not in s and PRICE_MARK not in out
 
 
 def test_empty_tickers_exit_2():

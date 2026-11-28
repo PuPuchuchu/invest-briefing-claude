@@ -133,26 +133,54 @@ def urllib_transport(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
         raise ProviderError(NETWORK_ERROR) from None
 
 
-def _to_decimal(v: object) -> Decimal:
-    if isinstance(v, bool):
-        raise ProviderError(MALFORMED_RESPONSE)
-    if isinstance(v, Decimal):
-        return v
-    if isinstance(v, int):
-        return Decimal(v)
-    raise ProviderError(MALFORMED_RESPONSE)
+def _to_decimal(v: object, field: str = "NUMBER") -> Decimal:
+    if v is None:
+        raise ProviderError(f"{MALFORMED_RESPONSE}:{field}_MISSING")
+    if isinstance(v, bool) or not isinstance(v, (Decimal, int)):
+        raise ProviderError(f"{MALFORMED_RESPONSE}:{field}_TYPE")
+    return v if isinstance(v, Decimal) else Decimal(v)
 
 
 def _to_volume(v: object) -> int:
-    d = _to_decimal(v)
+    d = _to_decimal(v, "VOLUME")
     if d != d.to_integral_value():
-        raise ProviderError(MALFORMED_RESPONSE)
+        raise ProviderError(MALFORMED_RESPONSE + ":VOLUME_FRACTIONAL")
     return int(d)
+
+
+def _json_type(v: object) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, Decimal):
+        return "float"
+    return {str: "str", list: "list", dict: "object"}.get(type(v), "other")
+
+
+def describe_page(data: dict) -> dict:
+    """Shape of one response page for the PoC: key names, JSON types, counts,
+    status and next_url host. Never includes price, volume or date values."""
+    res = data.get("results")
+    first = res[0] if isinstance(res, list) and res and isinstance(res[0], dict) else {}
+    nxt = data.get("next_url")
+    return {
+        "top_level": {k: _json_type(v) for k, v in sorted(data.items())},
+        "status": data.get("status") if isinstance(data.get("status"), str) else None,
+        "counts": {k: data[k] for k in ("resultsCount", "count", "queryCount")
+                   if isinstance(data.get(k), int) and not isinstance(data.get(k), bool)},
+        "results_len": len(res) if isinstance(res, list) else None,
+        "first_row": {k: _json_type(v) for k, v in sorted(first.items())},
+        "next_url_host": (urllib.parse.urlsplit(nxt).netloc
+                          if isinstance(nxt, str) and nxt else None),
+    }
 
 
 def bar_session_date(t_ms: object) -> date:
     """Unix ms (window start, ET-based) -> US/Eastern calendar date."""
-    ms = _to_decimal(t_ms)
+    ms = _to_decimal(t_ms, "TIMESTAMP")
     ts = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
     return ts.astimezone(NY_TZ).date()
 
@@ -217,9 +245,9 @@ class MassivePriceProvider(PriceDataProvider):
         try:
             data = json.loads(body, parse_float=Decimal)
         except (ValueError, UnicodeDecodeError):
-            raise ProviderError(MALFORMED_RESPONSE) from None
+            raise ProviderError(MALFORMED_RESPONSE + ":JSON_DECODE") from None
         if not isinstance(data, dict):
-            raise ProviderError(MALFORMED_RESPONSE)
+            raise ProviderError(MALFORMED_RESPONSE + ":JSON_TYPE")
         return data
 
     @staticmethod
@@ -271,22 +299,34 @@ class MassivePriceProvider(PriceDataProvider):
                                         require_results_count))
             nxt = data.get("next_url")
             if nxt is not None and not isinstance(nxt, str):
-                raise ProviderError(MALFORMED_RESPONSE)
+                raise ProviderError(MALFORMED_RESPONSE + ":NEXT_URL_TYPE")
             if nxt and not nxt.startswith(self._base + "/"):
-                raise ProviderError(MALFORMED_RESPONSE)  # never follow foreign hosts
+                # never follow foreign hosts
+                raise ProviderError(MALFORMED_RESPONSE + ":NEXT_URL_HOST")
             url = nxt or None
         return rows, True
 
     # ----------------------------------------------------------- interface
     def get_daily_bars(self, symbol: str, start: date, end: date,
                        basis: Basis) -> PriceSeriesResponse:
-        adjusted = "true" if basis is Basis.SPLIT_ADJUSTED else "false"
-        url = (f"{self._base}/v2/aggs/ticker/{urllib.parse.quote(symbol)}/range/1/day/"
-               f"{start.isoformat()}/{end.isoformat()}"
-               f"?adjusted={adjusted}&sort=asc&limit=50000")
+        url = self.bars_url(symbol, start, end, basis)
         rows, complete = self._paged(url, statuses=BAR_STATUSES,
                                      allow_omitted_results=True,
                                      require_results_count=True)
+        return self._bars_response(symbol, start, end, basis, rows, complete)
+
+    def bars_url(self, symbol: str, start: date, end: date, basis: Basis) -> str:
+        adjusted = "true" if basis is Basis.SPLIT_ADJUSTED else "false"
+        return (f"{self._base}/v2/aggs/ticker/{urllib.parse.quote(symbol)}/range/1/day/"
+               f"{start.isoformat()}/{end.isoformat()}"
+               f"?adjusted={adjusted}&sort=asc&limit=50000")
+
+    def probe_shape(self, url: str) -> dict:
+        """PoC only: fetch one page and return describe_page() (no values)."""
+        return describe_page(self._get_json(url))
+
+    def _bars_response(self, symbol: str, start: date, end: date, basis: Basis,
+                       rows: list[dict], complete: bool) -> PriceSeriesResponse:
         retrieved = self._clock()
         bars = []
         try:
@@ -295,8 +335,10 @@ class MassivePriceProvider(PriceDataProvider):
                 if d < start or d > end:
                     continue
                 bars.append(NormalizedBar(
-                    date=d, open=_to_decimal(r.get("o")), high=_to_decimal(r.get("h")),
-                    low=_to_decimal(r.get("l")), close=_to_decimal(r.get("c")),
+                    date=d, open=_to_decimal(r.get("o"), "OPEN"),
+                    high=_to_decimal(r.get("h"), "HIGH"),
+                    low=_to_decimal(r.get("l"), "LOW"),
+                    close=_to_decimal(r.get("c"), "CLOSE"),
                     volume=_to_volume(r.get("v")), basis=basis,
                     provider_id=self.provider_id, retrieved_at=retrieved))
             bars_t = tuple(bars)
@@ -311,16 +353,20 @@ class MassivePriceProvider(PriceDataProvider):
             schema_version=self.schema_version, retrieved_at=retrieved,
             is_partial=not complete)
 
-    def get_split_events(self, start: date, end: date,
-                         symbols: Optional[Iterable[str]] = None
-                         ) -> SplitEventsResponse:
-        wanted = None if symbols is None else tuple(sorted(set(symbols)))
+    def splits_url(self, start: date, end: date,
+                   wanted: Optional[tuple[str, ...]]) -> str:
         params = [("execution_date.gte", start.isoformat()),
                   ("execution_date.lte", end.isoformat()),
                   ("limit", "5000")]
         if wanted is not None and len(wanted) == 1:
             params.append(("ticker", wanted[0]))
-        url = f"{self._base}/stocks/v1/splits?" + urllib.parse.urlencode(params)
+        return f"{self._base}/stocks/v1/splits?" + urllib.parse.urlencode(params)
+
+    def get_split_events(self, start: date, end: date,
+                         symbols: Optional[Iterable[str]] = None
+                         ) -> SplitEventsResponse:
+        wanted = None if symbols is None else tuple(sorted(set(symbols)))
+        url = self.splits_url(start, end, wanted)
         rows, complete = self._paged(url, statuses=SPLIT_STATUSES,
                                      allow_omitted_results=False)
         events = []
@@ -328,7 +374,7 @@ class MassivePriceProvider(PriceDataProvider):
             for r in rows:
                 sym = r.get("ticker")
                 if not isinstance(sym, str):
-                    raise ProviderError(MALFORMED_RESPONSE)
+                    raise ProviderError(MALFORMED_RESPONSE + ":SPLIT_TICKER")
                 if wanted is not None and sym not in wanted:
                     continue
                 kind = _ACTION.get(r.get("adjustment_type"))
@@ -340,11 +386,11 @@ class MassivePriceProvider(PriceDataProvider):
                 haf = r.get("historical_adjustment_factor")
                 events.append(SplitEvent(
                     symbol=sym, execution_date=ex,
-                    split_from=_to_decimal(r.get("split_from")),
-                    split_to=_to_decimal(r.get("split_to")), action_type=kind,
-                    historical_adjustment_factor=None if haf is None else _to_decimal(haf)))
+                    split_from=_to_decimal(r.get("split_from"), "SPLIT_FROM"),
+                    split_to=_to_decimal(r.get("split_to"), "SPLIT_TO"), action_type=kind,
+                    historical_adjustment_factor=None if haf is None else _to_decimal(haf, "ADJ_FACTOR")))
         except (PriceDataValidationError, ValueError):
-            raise ProviderError(MALFORMED_RESPONSE) from None
+            raise ProviderError(MALFORMED_RESPONSE + ":SPLIT_FIELD") from None
         return SplitEventsResponse(
             requested_start=start, requested_end=end, events=tuple(events),
             provider_id=self.provider_id, schema_version=self.schema_version,

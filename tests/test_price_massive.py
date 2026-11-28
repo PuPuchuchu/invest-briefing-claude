@@ -85,7 +85,7 @@ def test_pagination_complete_and_foreign_host_rejected():
     p, _, _ = provider(bad)
     with pytest.raises(ProviderError) as e:
         p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
-    assert e.value.reason == m.MALFORMED_RESPONSE
+    assert e.value.reason == m.MALFORMED_RESPONSE + ":NEXT_URL_HOST"
 
 
 def test_too_many_pages_marks_partial():
@@ -363,3 +363,54 @@ def test_bars_second_page_missing_count_fails_whole_response():
 def test_splits_do_not_require_count_field():
     p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [SPLIT_ROW]})])
     assert len(p.get_split_events(date(2026, 1, 1), D2, ["AAPL"]).events) == 1
+
+
+# ------------------------------------------- PoC diagnostics: specific reasons
+def _bar(**over):
+    r = bar_row(D1)
+    r.update(over)
+    return {"status": "OK", "resultsCount": 1, "results": [r]}
+
+
+@pytest.mark.parametrize("payload,reason", [
+    (_bar(v=1000.5), "VOLUME_FRACTIONAL"),
+    (_bar(v=None), "VOLUME_MISSING"),
+    (_bar(v="1000"), "VOLUME_TYPE"),
+    (_bar(c=None), "CLOSE_MISSING"),
+    (_bar(o="1"), "OPEN_TYPE"),
+    (_bar(t=None), "TIMESTAMP_MISSING"),
+    (b"<html>", "JSON_DECODE"),
+    ([1], "JSON_TYPE"),
+    ({"status": "OK", "resultsCount": 0, "results": [], "next_url": 5}, "NEXT_URL_TYPE"),
+])
+def test_bar_malformed_reasons_are_specific(payload, reason):
+    p, _, _ = provider([(lambda u: True, 200, payload)])
+    with pytest.raises(ProviderError) as e:
+        p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+    assert e.value.reason == "MALFORMED_RESPONSE:" + reason
+
+
+@pytest.mark.parametrize("over,reason", [
+    ({"ticker": None}, "SPLIT_TICKER"),
+    ({"execution_date": "x"}, "SPLIT_FIELD"),
+    ({"split_to": "4"}, "SPLIT_TO_TYPE"),
+])
+def test_split_malformed_reasons_are_specific(over, reason):
+    row = dict(SPLIT_ROW, **over)
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [row]})])
+    with pytest.raises(ProviderError) as e:
+        p.get_split_events(date(2026, 1, 1), D2)
+    assert e.value.reason == "MALFORMED_RESPONSE:" + reason
+
+
+def test_describe_page_has_types_not_values():
+    body = {"status": "OK", "resultsCount": 1, "queryCount": 1, "request_id": "r1",
+            "next_url": "https://api.massive.com/v2/x?cursor=SECRETCURSOR",
+            "results": [{"t": ms(D1), "o": D(MARKER), "c": D(MARKER), "v": 77, "otc": False}]}
+    d = m.describe_page(body)
+    assert d["top_level"]["results"] == "list" and d["top_level"]["resultsCount"] == "int"
+    assert d["first_row"] == {"c": "float", "o": "float", "otc": "bool", "t": "int", "v": "int"}
+    assert d["counts"] == {"resultsCount": 1, "queryCount": 1} and d["results_len"] == 1
+    assert d["next_url_host"] == "api.massive.com" and d["status"] == "OK"
+    txt = json.dumps(d)
+    assert MARKER not in txt and "SECRETCURSOR" not in txt and "r1" not in txt
