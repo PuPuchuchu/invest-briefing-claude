@@ -12,9 +12,9 @@ Documented basis (read 2026-11-26/27, see P3 v4 design docs):
   * Auth         `Authorization: Bearer <key>` (or apiKey query; NOT used)
   * Basic plan   end-of-day, ~2 years history, 5 requests / minute
 
-UNVERIFIED until the live PoC: filter parameter names of /stocks/v1/splits
-(`execution_date.gte/.lte`, `ticker`), pagination shape (`next_url`),
-exact price precision, whether "2 years" is rolling, daily call cap.
+UNVERIFIED until the live PoC: exact price precision, whether "2 years" is
+rolling, daily call cap, whether bar resultsCount is per page (assumed:
+equals len(results); a mismatch fails closed and shows in --structure-check).
 
 Auth modes:
   PROXY  -- send no credential; an egress proxy (Claude cloud environment
@@ -27,10 +27,20 @@ Redirects are never followed (any 3xx -> ProviderError(REDIRECT_REFUSED)),
 so a credential can never be forwarded to another origin; the ENV-mode
 Authorization header is additionally marked "unredirected".
 
-Every page must carry status OK/DELAYED and a `results` list of objects
-(an omitted `results` is accepted only with an explicit zero count);
-anything else fails closed, so an API error can never look like
-"no split events".
+Response contract per page (docs read 2026-11-28; anything else fails
+closed, so an API error or inconsistent page can never look like
+"no split events"):
+  * bars   -- status OK or DELAYED; `resultsCount` ("total number of
+              results for this request", integer) if present must equal
+              len(results); `results` may be omitted only together with an
+              explicit resultsCount == 0.
+  * splits -- status OK (documented enum); `results` is mandatory (the
+              endpoint documents no count field).
+  * Any count field present (resultsCount, count, queryCount) must be a
+    non-negative integer (never bool/str); resultsCount and count, if
+    both present, must agree. Every row must be an object.
+Confirmed by the same docs: splits filters execution_date.gte/.lte,
+ticker; limit max 5000; JSON pagination via next_url.
 
 The provider respects the documented rate limit with a minimum interval
 between requests and never retries to circumvent limits (Individuals
@@ -82,7 +92,9 @@ TOO_MANY_PAGES = "TOO_MANY_PAGES"
 KEY_MISSING = "KEY_MISSING"
 UNKNOWN_ADJUSTMENT_TYPE = "UNKNOWN_ADJUSTMENT_TYPE"
 REDIRECT_REFUSED = "REDIRECT_REFUSED"
-OK_STATUSES = ("OK", "DELAYED")
+BAR_STATUSES = ("OK", "DELAYED")
+SPLIT_STATUSES = ("OK",)
+_COUNT_FIELDS = ("resultsCount", "count", "queryCount")
 
 _ACTION = {
     "forward_split": ActionType.FORWARD_SPLIT,
@@ -208,11 +220,40 @@ class MassivePriceProvider(PriceDataProvider):
             raise ProviderError(MALFORMED_RESPONSE) from None
         if not isinstance(data, dict):
             raise ProviderError(MALFORMED_RESPONSE)
-        if data.get("status") not in OK_STATUSES:
-            raise ProviderError(MALFORMED_RESPONSE + ":STATUS")
         return data
 
-    def _paged(self, first_url: str) -> tuple[list[dict], bool]:
+    @staticmethod
+    def _page_rows(data: dict, statuses: tuple[str, ...],
+                   allow_omitted_results: bool) -> list:
+        if data.get("status") not in statuses:
+            raise ProviderError(MALFORMED_RESPONSE + ":STATUS")
+        counts = {}
+        for k in _COUNT_FIELDS:
+            if k in data:
+                v = data[k]
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    raise ProviderError(MALFORMED_RESPONSE + ":COUNT_TYPE")
+                counts[k] = v
+        if ("resultsCount" in counts and "count" in counts
+                and counts["resultsCount"] != counts["count"]):
+            raise ProviderError(MALFORMED_RESPONSE + ":COUNT_CONFLICT")
+        if "results" in data:
+            res = data["results"]
+        elif allow_omitted_results and counts.get("resultsCount") == 0:
+            res = []                           # explicit, verified empty page
+        else:
+            raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_MISSING")
+        if not isinstance(res, list):
+            raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_TYPE")
+        if not all(isinstance(r, dict) for r in res):
+            raise ProviderError(MALFORMED_RESPONSE + ":ROW_TYPE")
+        for k in ("resultsCount", "count"):
+            if k in counts and counts[k] != len(res):
+                raise ProviderError(MALFORMED_RESPONSE + ":COUNT_MISMATCH")
+        return res
+
+    def _paged(self, first_url: str, *, statuses: tuple[str, ...],
+               allow_omitted_results: bool) -> tuple[list[dict], bool]:
         """All `results` across pages. Returns (rows, complete)."""
         rows: list[dict] = []
         url: Optional[str] = first_url
@@ -222,18 +263,7 @@ class MassivePriceProvider(PriceDataProvider):
                 return rows, False
             data = self._get_json(url)
             pages += 1
-            if "results" in data:
-                res = data["results"]
-            elif any(data.get(k) == 0 and not isinstance(data.get(k), bool)
-                     for k in ("resultsCount", "count")):
-                res = []                       # explicit, verified empty page
-            else:
-                raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_MISSING")
-            if not isinstance(res, list):
-                raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_TYPE")
-            if not all(isinstance(r, dict) for r in res):
-                raise ProviderError(MALFORMED_RESPONSE + ":ROW_TYPE")
-            rows.extend(res)
+            rows.extend(self._page_rows(data, statuses, allow_omitted_results))
             nxt = data.get("next_url")
             if nxt is not None and not isinstance(nxt, str):
                 raise ProviderError(MALFORMED_RESPONSE)
@@ -249,7 +279,8 @@ class MassivePriceProvider(PriceDataProvider):
         url = (f"{self._base}/v2/aggs/ticker/{urllib.parse.quote(symbol)}/range/1/day/"
                f"{start.isoformat()}/{end.isoformat()}"
                f"?adjusted={adjusted}&sort=asc&limit=50000")
-        rows, complete = self._paged(url)
+        rows, complete = self._paged(url, statuses=BAR_STATUSES,
+                                     allow_omitted_results=True)
         retrieved = self._clock()
         bars = []
         try:
@@ -284,7 +315,8 @@ class MassivePriceProvider(PriceDataProvider):
         if wanted is not None and len(wanted) == 1:
             params.append(("ticker", wanted[0]))
         url = f"{self._base}/stocks/v1/splits?" + urllib.parse.urlencode(params)
-        rows, complete = self._paged(url)
+        rows, complete = self._paged(url, statuses=SPLIT_STATUSES,
+                                     allow_omitted_results=False)
         events = []
         try:
             for r in rows:

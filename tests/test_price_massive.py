@@ -187,7 +187,9 @@ def test_observed_decimal_places():
     ({"results": []}, "MALFORMED_RESPONSE:STATUS"),                 # no status
     ({"status": "OK"}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
     ({"status": "OK", "count": 3}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
-    ({"status": "OK", "count": False}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
+    ({"status": "OK", "count": False}, "MALFORMED_RESPONSE:COUNT_TYPE"),
+    ({"status": "OK", "resultsCount": 0}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
+    ({"status": "DELAYED", "results": []}, "MALFORMED_RESPONSE:STATUS"),
     ({"status": "OK", "results": None}, "MALFORMED_RESPONSE:RESULTS_TYPE"),
     ({"status": "OK", "results": [None]}, "MALFORMED_RESPONSE:ROW_TYPE"),
 ])
@@ -199,11 +201,56 @@ def test_split_api_errors_never_look_like_empty(payload, reason):
 
 
 def test_explicit_empty_results_are_verified_empty():
-    for payload in ({"status": "OK", "results": []},
-                    {"status": "DELAYED", "resultsCount": 0}):
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": []})])
+    r = p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+    assert r.events == () and not r.is_partial
+    for payload in ({"status": "DELAYED", "resultsCount": 0},
+                    {"status": "OK", "resultsCount": 0, "results": []}):
         p, _, _ = provider([(lambda u: True, 200, payload)])
-        r = p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
-        assert r.events == () and not r.is_partial
+        assert p.get_daily_bars("AAPL", D1, D2, Basis.RAW).bars == ()
+
+
+SPLIT_ROW = {"ticker": "AAPL", "execution_date": "2026-06-03", "split_from": 1,
+             "split_to": 4, "adjustment_type": "forward_split"}
+
+
+@pytest.mark.parametrize("payload,reason", [
+    ({"status": "OK", "results": [], "resultsCount": 2}, "COUNT_MISMATCH"),
+    ({"status": "OK", "results": [SPLIT_ROW], "resultsCount": 3}, "COUNT_MISMATCH"),
+    ({"status": "OK", "results": [SPLIT_ROW], "count": 0}, "COUNT_MISMATCH"),
+    ({"status": "OK", "results": [], "resultsCount": 0, "count": 1}, "COUNT_CONFLICT"),
+    ({"status": "OK", "results": [], "resultsCount": True}, "COUNT_TYPE"),
+    ({"status": "OK", "results": [], "resultsCount": "0"}, "COUNT_TYPE"),
+    ({"status": "OK", "results": [], "resultsCount": -1}, "COUNT_TYPE"),
+    ({"status": "OK", "results": [], "queryCount": 1.5}, "COUNT_TYPE"),
+])
+def test_inconsistent_counts_fail_closed(payload, reason):
+    for call in ("splits", "bars"):
+        p, _, _ = provider([(lambda u: True, 200, payload)])
+        with pytest.raises(ProviderError) as e:
+            if call == "splits":
+                p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+            else:
+                p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+        assert e.value.reason == "MALFORMED_RESPONSE:" + reason
+
+
+def test_consistent_counts_accepted():
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [bar_row(D1)],
+                                               "resultsCount": 1, "queryCount": 1})])
+    assert len(p.get_daily_bars("AAPL", D1, D2, Basis.RAW).bars) == 1
+
+
+def test_count_mismatch_on_second_page_fails_whole_response():
+    nxt = "https://api.massive.com/stocks/v1/splits?cursor=2"
+    routes = [(lambda u: "cursor=2" in u, 200,
+               {"status": "OK", "results": [], "resultsCount": 1}),
+              (lambda u: True, 200, {"status": "OK", "results": [SPLIT_ROW],
+                                     "resultsCount": 1, "next_url": nxt})]
+    p, _, _ = provider(routes)
+    with pytest.raises(ProviderError) as e:
+        p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+    assert e.value.reason == "MALFORMED_RESPONSE:COUNT_MISMATCH"
 
 
 def test_error_on_second_page_fails_whole_response():

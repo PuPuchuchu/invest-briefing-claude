@@ -124,6 +124,15 @@ def test_split_api_error_blocks_momentum(patch_provider, capsys):
         assert set(momentum_statuses(r).values()) <= {"MISSING", "INVALID"}
 
 
+def test_split_count_mismatch_blocks_momentum(patch_provider, capsys):
+    patch_provider(splits_payload={"status": "OK", "results": [], "resultsCount": 1})
+    _, out, doc = run(capsys, "--price-precision", "0.01")
+    assert doc["run"]["splits_error"] == "MALFORMED_RESPONSE:COUNT_MISMATCH"
+    assert "NO_EVENT_VERIFIED" not in out
+    for r in doc["results"]:
+        assert set(momentum_statuses(r).values()) <= {"MISSING", "INVALID"}
+
+
 def test_verified_empty_splits_allow_momentum(patch_provider, capsys):
     patch_provider()
     _, out, doc = run(capsys, "--price-precision", "0.01")
@@ -162,3 +171,22 @@ def test_structure_check_has_no_prices(patch_provider, capsys):
 
 def test_empty_tickers_exit_2():
     assert rpb.main(["--tickers", " , "]) == 2
+
+
+def test_adjusted_partial_does_not_mark_raw_stale(patch_provider, monkeypatch, capsys):
+    from src.price.schema import Basis
+    real = m.MassivePriceProvider.get_daily_bars
+
+    def partial_adjusted(self, symbol, start, end, basis):
+        r = real(self, symbol, start, end, basis)
+        if basis is Basis.SPLIT_ADJUSTED:
+            import dataclasses
+            r = dataclasses.replace(r, is_partial=True)
+        return r
+    patch_provider()
+    monkeypatch.setattr(m.MassivePriceProvider, "get_daily_bars", partial_adjusted)
+    _, out, doc = run(capsys, "--price-precision", "0.01")
+    st = doc["results"][0]["status"]
+    assert st["raw_price"] == "OK" and st["adjusted_price"] != "OK"
+    assert set(momentum_statuses(doc["results"][0]).values()) <= {"MISSING", "INVALID"}
+    assert "BARS_PARTIAL_RESPONSE" in out

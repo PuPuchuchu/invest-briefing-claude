@@ -94,9 +94,10 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
                           latest_bar_date=raw.data_as_of,
                           availability_rule=midnight_et_after_session,
                           last_evaluated_session=last_evaluated)
-    fresh = fr.status is Freshness.FRESH and not (raw.is_partial or adj.is_partial)
-    adj_fresh = fresh and adj.data_as_of == raw.data_as_of
-    if fresh and not adj_fresh:
+    fresh = fr.status is Freshness.FRESH
+    raw_fresh = fresh and not raw.is_partial
+    adj_fresh = fresh and not adj.is_partial and adj.data_as_of == raw.data_as_of
+    if fresh and adj.data_as_of != raw.data_as_of:
         limitations.append("ADJUSTED_LATEST_SESSION_MISSING")
     rp = ap = precision
     qc = check_adjustment_qc(symbol=symbol, raw=raw.bars, adjusted=adj.bars,
@@ -107,7 +108,7 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
                                   qc=qc, coverage=provider.coverage())
     adj_status = AdjustedPriceStatus.OK if adj_fresh else (
         AdjustedPriceStatus.MISSING if adj.data_as_of is None else AdjustedPriceStatus.STALE)
-    raw_status = RawPriceStatus.OK if fresh else (
+    raw_status = RawPriceStatus.OK if raw_fresh else (
         RawPriceStatus.MISSING if raw.data_as_of is None else RawPriceStatus.STALE)
     metrics = compute_momentum(adjusted_bars=adj.bars, adjusted_status=adj_status,
                                corporate_actions=ca, qc=qc, calendar=calendar,
