@@ -11,15 +11,17 @@ reason codes (capture class EPHEMERAL_ONLY).
 
 Usage (repository root on PYTHONPATH):
   python scripts/run_price_briefing.py --tickers AAPL,MSFT,NVDA \
-      [--auth proxy|env] [--price-precision 0.01|auto] [--last-evaluated YYYY-MM-DD]
+      [--auth proxy|env] [--price-precision 0.01] [--last-evaluated YYYY-MM-DD]
   python scripts/run_price_briefing.py --tickers AAPL --structure-check
 
 --structure-check prints only structure facts for the PoC (counts, date
 coverage, decimal places, split-event counts, request count) -- no prices.
 
-Price precision: required for the split-adjustment QC. Until the PoC fixes
-it, omit (QC NOT_AVAILABLE -> momentum withheld) or pass "auto" to infer it
-from the observed decimal places (flagged PRECISION_INFERRED).
+Price precision: required for the split-adjustment QC and accepted ONLY as an
+explicit positive decimal (provider-documented or PoC-verified value). Until
+then omit it: QC NOT_AVAILABLE -> momentum withheld. Observed decimal places
+are reported by --structure-check as diagnostics only and are never used in
+calculations.
 
 Exit codes: 0 done (per-ticker statuses inside), 2 bad arguments.
 """
@@ -71,21 +73,18 @@ def _parse_args(argv):
     return p.parse_args(argv)
 
 
-def _precision(arg, raw_bars, adj_bars):
+def _precision(arg):
+    """Verified precision only; None -> QC NOT_AVAILABLE. Bad input raises."""
     if arg is None:
-        return None, None, []
-    if arg == "auto":
-        rp = observed_decimal_places(raw_bars)
-        ap = observed_decimal_places(adj_bars)
-        if rp is None or ap is None:
-            return None, None, []
-        return (Decimal(1).scaleb(-rp), Decimal(1).scaleb(-ap), ["PRECISION_INFERRED"])
-    d = Decimal(arg)
-    return d, d, []
+        return None
+    d = Decimal(arg)                      # raises InvalidOperation (ArithmeticError)
+    if not d.is_finite() or d <= 0:
+        raise ValueError("PRICE_PRECISION")
+    return d
 
 
 def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
-                    splits_resp, splits_failed, precision_arg, last_evaluated):
+                    splits_resp, splits_failed, precision, last_evaluated):
     limitations: list[str] = []
     raw = provider.get_daily_bars(symbol, start, expected, Basis.RAW)
     adj = provider.get_daily_bars(symbol, start, expected, Basis.SPLIT_ADJUSTED)
@@ -96,15 +95,17 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
                           availability_rule=midnight_et_after_session,
                           last_evaluated_session=last_evaluated)
     fresh = fr.status is Freshness.FRESH and not (raw.is_partial or adj.is_partial)
-    rp, ap, extra = _precision(precision_arg, raw.bars, adj.bars)
-    limitations += extra
+    adj_fresh = fresh and adj.data_as_of == raw.data_as_of
+    if fresh and not adj_fresh:
+        limitations.append("ADJUSTED_LATEST_SESSION_MISSING")
+    rp = ap = precision
     qc = check_adjustment_qc(symbol=symbol, raw=raw.bars, adjusted=adj.bars,
                              events=() if splits_resp is None else splits_resp.events,
                              raw_precision=rp, adjusted_precision=ap)
     ca = assess_corporate_actions(symbol=symbol, window_start=start, window_end=expected,
                                   response=splits_resp, fetch_failed=splits_failed,
                                   qc=qc, coverage=provider.coverage())
-    adj_status = AdjustedPriceStatus.OK if fresh else (
+    adj_status = AdjustedPriceStatus.OK if adj_fresh else (
         AdjustedPriceStatus.MISSING if adj.data_as_of is None else AdjustedPriceStatus.STALE)
     raw_status = RawPriceStatus.OK if fresh else (
         RawPriceStatus.MISSING if raw.data_as_of is None else RawPriceStatus.STALE)
@@ -151,6 +152,10 @@ def main(argv=None) -> int:
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     if not tickers:
         return 2
+    try:
+        precision = _precision(args.price_precision)
+    except (ValueError, ArithmeticError):
+        return 2
     now_utc = (datetime.fromisoformat(args.now_utc) if args.now_utc
                else datetime.now(timezone.utc))
     calendar = load_calendar()
@@ -186,7 +191,7 @@ def main(argv=None) -> int:
     for t in tickers:
         try:
             r = evaluate_ticker(provider, calendar, t, start, expected, now_utc,
-                                splits_resp, splits_failed, args.price_precision, last_eval)
+                                splits_resp, splits_failed, precision, last_eval)
             results.append(r)
             briefing[t] = interpret(r)
         except ProviderError as exc:

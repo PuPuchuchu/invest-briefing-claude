@@ -27,22 +27,26 @@ def sessions(a, b):
         d += timedelta(days=1)
 
 
-def make_transport(fail_splits=False, status=200):
+def make_transport(fail_splits=False, status=200, splits_payload=None, drop_adj_last=False):
     def transport(url, headers):
         if status != 200:
             return status, b""
         if "/stocks/v1/splits" in url:
             if fail_splits:
                 return 500, b""
-            return 200, json.dumps({"results": []}).encode()
+            if splits_payload is not None:
+                return 200, json.dumps(splits_payload).encode()
+            return 200, json.dumps({"status": "OK", "results": []}).encode()
         g = re.search(r"/range/1/day/(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})", url)
         a, b = date.fromisoformat(g.group(1)), date.fromisoformat(g.group(2))
         rows = []
         for i, d in enumerate(sessions(a, b)):
+            if drop_adj_last and d == b and "adjusted=true" in url:
+                continue
             c = PRICE_MARK if d == b else f"{100 + (i % 7) * 0.5:.2f}"
             t = int(datetime.combine(d, time(0), tzinfo=NY_TZ).timestamp() * 1000)
             rows.append({"t": t, "o": c, "h": c, "l": c, "c": c, "v": 1000})
-        body = json.dumps({"results": rows}).replace(f'"{PRICE_MARK}"', PRICE_MARK)
+        body = json.dumps({"status": "OK", "results": rows}).replace(f'"{PRICE_MARK}"', PRICE_MARK)
         body = re.sub(r'"(\d+\.\d+)"', r"\1", body)
         return 200, body.encode()
     return transport
@@ -92,10 +96,47 @@ def test_missing_precision_withholds_momentum(patch_provider, capsys):
     assert "NOT_AVAILABLE" in json.dumps(doc["results"][0])
 
 
-def test_auto_precision_flagged(patch_provider, capsys):
+def momentum_statuses(result):
+    return {f["metric"]: f["calc_status"] for f in result["facts"]
+            if f["metric"] != "PE_TTM"}
+
+
+@pytest.mark.parametrize("bad", ["auto", "0", "-0.01", "NaN", "Infinity", "x"])
+def test_precision_must_be_explicit_positive(bad, patch_provider, capsys):
     patch_provider()
-    _, out, doc = run(capsys, "--price-precision", "auto")
-    assert "PRECISION_INFERRED" in out and PRICE_MARK not in out
+    assert rpb.main(["--tickers", "AAPL", "--now-utc", NOW, "--price-precision", bad]) == 2
+
+
+def test_unverified_precision_never_yields_momentum(patch_provider, capsys):
+    patch_provider()
+    _, out, doc = run(capsys)
+    for r in doc["results"]:
+        assert set(momentum_statuses(r).values()) <= {"MISSING", "INVALID"}
+        assert "PRECISION_INFERRED" not in out
+
+
+def test_split_api_error_blocks_momentum(patch_provider, capsys):
+    patch_provider(splits_payload={"status": "ERROR"})
+    _, out, doc = run(capsys, "--price-precision", "0.01")
+    assert doc["run"]["splits_error"] == "MALFORMED_RESPONSE:STATUS"
+    assert "NO_EVENT_VERIFIED" not in out
+    for r in doc["results"]:
+        assert set(momentum_statuses(r).values()) <= {"MISSING", "INVALID"}
+
+
+def test_verified_empty_splits_allow_momentum(patch_provider, capsys):
+    patch_provider()
+    _, out, doc = run(capsys, "--price-precision", "0.01")
+    assert "NO_EVENT_VERIFIED" in out
+    assert "OK" in momentum_statuses(doc["results"][0]).values()
+
+
+def test_adjusted_latest_missing_blocks_momentum(patch_provider, capsys):
+    patch_provider(drop_adj_last=True)
+    _, out, doc = run(capsys, "--price-precision", "0.01")
+    r = doc["results"][0]
+    assert set(momentum_statuses(r).values()) <= {"MISSING", "INVALID"}
+    assert "ADJUSTED_LATEST_SESSION_MISSING" in out
 
 
 def test_splits_failure_recorded(patch_provider, capsys):

@@ -23,6 +23,15 @@ Auth modes:
             (GitHub Actions secret). The key is never stored on the object,
             never logged and never included in exception messages.
 
+Redirects are never followed (any 3xx -> ProviderError(REDIRECT_REFUSED)),
+so a credential can never be forwarded to another origin; the ENV-mode
+Authorization header is additionally marked "unredirected".
+
+Every page must carry status OK/DELAYED and a `results` list of objects
+(an omitted `results` is accepted only with an explicit zero count);
+anything else fails closed, so an API error can never look like
+"no split events".
+
 The provider respects the documented rate limit with a minimum interval
 between requests and never retries to circumvent limits (Individuals
 ToS 6.1(o)): HTTP 429 raises ProviderError(RATE_LIMITED).
@@ -72,6 +81,8 @@ MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
 TOO_MANY_PAGES = "TOO_MANY_PAGES"
 KEY_MISSING = "KEY_MISSING"
 UNKNOWN_ADJUSTMENT_TYPE = "UNKNOWN_ADJUSTMENT_TYPE"
+REDIRECT_REFUSED = "REDIRECT_REFUSED"
+OK_STATUSES = ("OK", "DELAYED")
 
 _ACTION = {
     "forward_split": ActionType.FORWARD_SPLIT,
@@ -84,10 +95,25 @@ class Transport(Protocol):
     def __call__(self, url: str, headers: dict[str, str]) -> tuple[int, bytes]: ...
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the 3xx surfaces as HTTPError to the caller."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects())
+
+
 def urllib_transport(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, method="GET")
+    for k, v in headers.items():
+        if k.lower() == "authorization":
+            req.add_unredirected_header(k, v)
+        else:
+            req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _OPENER.open(req, timeout=30) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, b""
@@ -168,6 +194,8 @@ class MassivePriceProvider(PriceDataProvider):
         finally:
             self._last_request = self._monotonic()
             self.request_count += 1
+        if 300 <= status < 400:
+            raise ProviderError(REDIRECT_REFUSED)
         if status == 429:
             raise ProviderError(RATE_LIMITED)
         if status in (401, 403):
@@ -180,6 +208,8 @@ class MassivePriceProvider(PriceDataProvider):
             raise ProviderError(MALFORMED_RESPONSE) from None
         if not isinstance(data, dict):
             raise ProviderError(MALFORMED_RESPONSE)
+        if data.get("status") not in OK_STATUSES:
+            raise ProviderError(MALFORMED_RESPONSE + ":STATUS")
         return data
 
     def _paged(self, first_url: str) -> tuple[list[dict], bool]:
@@ -192,10 +222,18 @@ class MassivePriceProvider(PriceDataProvider):
                 return rows, False
             data = self._get_json(url)
             pages += 1
-            res = data.get("results", [])
+            if "results" in data:
+                res = data["results"]
+            elif any(data.get(k) == 0 and not isinstance(data.get(k), bool)
+                     for k in ("resultsCount", "count")):
+                res = []                       # explicit, verified empty page
+            else:
+                raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_MISSING")
             if not isinstance(res, list):
-                raise ProviderError(MALFORMED_RESPONSE)
-            rows.extend(r for r in res if isinstance(r, dict))
+                raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_TYPE")
+            if not all(isinstance(r, dict) for r in res):
+                raise ProviderError(MALFORMED_RESPONSE + ":ROW_TYPE")
+            rows.extend(res)
             nxt = data.get("next_url")
             if nxt is not None and not isinstance(nxt, str):
                 raise ProviderError(MALFORMED_RESPONSE)

@@ -75,13 +75,13 @@ def test_bar_date_uses_eastern_time_across_dst():
 
 def test_pagination_complete_and_foreign_host_rejected():
     page2 = "https://api.massive.com/v2/aggs/next?cursor=abc"
-    routes = [(lambda u: "cursor=abc" in u, 200, {"results": [bar_row(D2)]}),
+    routes = [(lambda u: "cursor=abc" in u, 200, {"status": "OK", "results": [bar_row(D2)]}),
               (lambda u: "/v2/aggs/ticker" in u, 200,
-               {"results": [bar_row(D1)], "next_url": page2})]
+               {"status": "OK", "results": [bar_row(D1)], "next_url": page2})]
     p, t, _ = provider(routes)
     r = p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
     assert len(r.bars) == 2 and not r.is_partial
-    bad = [(lambda u: True, 200, {"results": [], "next_url": "https://evil.example/x"})]
+    bad = [(lambda u: True, 200, {"status": "OK", "results": [], "next_url": "https://evil.example/x"})]
     p, _, _ = provider(bad)
     with pytest.raises(ProviderError) as e:
         p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
@@ -90,7 +90,7 @@ def test_pagination_complete_and_foreign_host_rejected():
 
 def test_too_many_pages_marks_partial():
     loop = "https://api.massive.com/v2/aggs/loop"
-    p, _, _ = provider([(lambda u: True, 200, {"results": [], "next_url": loop})])
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [], "next_url": loop})])
     assert p.get_daily_bars("AAPL", D1, D2, Basis.RAW).is_partial
 
 
@@ -104,9 +104,10 @@ def test_http_errors_carry_reason_only(status, reason):
 
 
 def test_malformed_payloads():
-    for payload in (b"not json", [1, 2], {"results": "x"},
-                    {"results": [{"t": ms(D1), "o": 1, "h": 1, "l": 1, "c": 1, "v": 1.5}]},
-                    {"results": [{"t": ms(D1), "o": -1, "h": 1, "l": -1, "c": 1, "v": 1}]}):
+    for payload in (b"not json", [1, 2], {"status": "OK", "results": "x"},
+                    {"status": "OK", "results": [bar_row(D1), "junk"]},
+                    {"status": "OK", "results": [{"t": ms(D1), "o": 1, "h": 1, "l": 1, "c": 1, "v": 1.5}]},
+                    {"status": "OK", "results": [{"t": ms(D1), "o": -1, "h": 1, "l": -1, "c": 1, "v": 1}]}):
         p, _, _ = provider([(lambda u: True, 200, payload)])
         with pytest.raises(ProviderError) as e:
             p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
@@ -114,7 +115,7 @@ def test_malformed_payloads():
 
 
 def test_rate_limit_spacing():
-    rows = {"results": [bar_row(D1)]}
+    rows = {"status": "OK", "results": [bar_row(D1)]}
     p, _, sleeps = provider([(lambda u: True, 200, rows)])
     for _ in range(3):
         p.get_daily_bars("AAPL", D1, D1, Basis.RAW)
@@ -122,7 +123,7 @@ def test_rate_limit_spacing():
 
 
 def test_auth_modes(monkeypatch):
-    rows = {"results": [bar_row(D1)]}
+    rows = {"status": "OK", "results": [bar_row(D1)]}
     p, t, _ = provider([(lambda u: True, 200, rows)])
     p.get_daily_bars("AAPL", D1, D1, Basis.RAW)
     assert "Authorization" not in t.calls[0][1]                  # PROXY: no credential
@@ -145,7 +146,7 @@ def test_split_events_parse_and_filter():
              "historical_adjustment_factor": 0.25},
             {"ticker": "ZZZ", "execution_date": "2026-06-04", "split_from": 10,
              "split_to": 1, "adjustment_type": "reverse_split"}]
-    p, t, _ = provider([(lambda u: "/stocks/v1/splits" in u, 200, {"results": rows})])
+    p, t, _ = provider([(lambda u: "/stocks/v1/splits" in u, 200, {"status": "OK", "results": rows})])
     r = p.get_split_events(date(2026, 1, 1), D2, ["AAPL", "MSFT"])
     assert [e.symbol for e in r.events] == ["AAPL"]
     assert r.events[0].ratio == D(4) and r.events[0].action_type is ActionType.FORWARD_SPLIT
@@ -159,7 +160,7 @@ def test_split_events_parse_and_filter():
 def test_unknown_adjustment_type_fails_closed():
     rows = [{"ticker": "AAPL", "execution_date": "2026-06-03", "split_from": 1,
              "split_to": 2, "adjustment_type": "spin_off"}]
-    p, _, _ = provider([(lambda u: True, 200, {"results": rows})])
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": rows})])
     with pytest.raises(ProviderError) as e:
         p.get_split_events(date(2026, 1, 1), D2)
     assert e.value.reason == m.UNKNOWN_ADJUSTMENT_TYPE
@@ -177,3 +178,85 @@ def test_observed_decimal_places():
     from src.price.schema import NormalizedBar
     b = NormalizedBar(D1, D("1.5"), D("1.5"), D("1.25"), D("1.250"), 1, Basis.RAW, "x", TS)
     assert m.observed_decimal_places([b]) == 2
+
+
+# ---------------------------------------------------------------- B2: fail closed
+@pytest.mark.parametrize("payload,reason", [
+    ({"status": "ERROR", "error": "x"}, "MALFORMED_RESPONSE:STATUS"),
+    ({"status": "NOT_AUTHORIZED"}, "MALFORMED_RESPONSE:STATUS"),
+    ({"results": []}, "MALFORMED_RESPONSE:STATUS"),                 # no status
+    ({"status": "OK"}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
+    ({"status": "OK", "count": 3}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
+    ({"status": "OK", "count": False}, "MALFORMED_RESPONSE:RESULTS_MISSING"),
+    ({"status": "OK", "results": None}, "MALFORMED_RESPONSE:RESULTS_TYPE"),
+    ({"status": "OK", "results": [None]}, "MALFORMED_RESPONSE:ROW_TYPE"),
+])
+def test_split_api_errors_never_look_like_empty(payload, reason):
+    p, _, _ = provider([(lambda u: True, 200, payload)])
+    with pytest.raises(ProviderError) as e:
+        p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+    assert e.value.reason == reason
+
+
+def test_explicit_empty_results_are_verified_empty():
+    for payload in ({"status": "OK", "results": []},
+                    {"status": "DELAYED", "resultsCount": 0}):
+        p, _, _ = provider([(lambda u: True, 200, payload)])
+        r = p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+        assert r.events == () and not r.is_partial
+
+
+def test_error_on_second_page_fails_whole_response():
+    nxt = "https://api.massive.com/stocks/v1/splits?cursor=2"
+    routes = [(lambda u: "cursor=2" in u, 200, {"status": "ERROR"}),
+              (lambda u: True, 200, {"status": "OK", "results": [], "next_url": nxt})]
+    p, _, _ = provider(routes)
+    with pytest.raises(ProviderError):
+        p.get_split_events(date(2026, 1, 1), D2, ["AAPL"])
+
+
+# ---------------------------------------------------------------- B1: redirects
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_redirect_status_refused(code):
+    p, _, _ = provider([(lambda u: True, code, b"")])
+    with pytest.raises(ProviderError) as e:
+        p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+    assert e.value.reason == m.REDIRECT_REFUSED
+
+
+@pytest.mark.parametrize("code", [301, 302, 307, 308])
+def test_real_transport_never_forwards_key_on_redirect(code):
+    """Local servers on two ports (= two origins): A redirects to B."""
+    import http.server
+    import threading
+
+    seen = []
+
+    class B(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"OK","results":[]}')
+
+        def log_message(self, *a):
+            pass
+
+    sb = http.server.HTTPServer(("127.0.0.1", 0), B)
+
+    class A(B):
+        def do_GET(self):
+            self.send_response(code)
+            self.send_header("Location", f"http://127.0.0.1:{sb.server_port}/x")
+            self.end_headers()
+
+    sa = http.server.HTTPServer(("127.0.0.1", 0), A)
+    for s in (sa, sb):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        status, body = m.urllib_transport(f"http://127.0.0.1:{sa.server_port}/v",
+                                          {"Authorization": "Bearer k-" + MARKER})
+    finally:
+        sa.shutdown(); sb.shutdown()
+    assert status == code and body == b""
+    assert seen == []                                # B never contacted
