@@ -108,7 +108,7 @@ def evaluate_ticker(provider, calendar, symbol, start, expected, now_utc,
     ca = assess_corporate_actions(symbol=symbol, window_start=start, window_end=expected,
                                   response=splits_resp, fetch_failed=splits_failed,
                                   qc=qc, coverage=provider.coverage(),
-                                  raw_bars=raw.bars)
+                                  raw_bars=raw.bars, calendar=calendar)
     if ca.status is CorporateActionStatus.PENDING_SEC:
         limitations.append("SPLIT_IN_WINDOW_PRICE_VERIFIED_SEC_PENDING")
     adj_status = AdjustedPriceStatus.OK if adj_fresh else (

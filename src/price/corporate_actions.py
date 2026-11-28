@@ -30,8 +30,9 @@ Fail-closed classifications that need no extra rules:
                  (a) adjustment QC CONSISTENT (adjusted == raw / factor on
                      every overlapping session, so the adjusted series
                      applies exactly this event), and
-                 (b) RAW JUMP: the raw close moves from the last session
-                     before execution_date to execution_date by roughly
+                 (b) RAW JUMP: the raw close moves from the previous
+                     trading session (per the injected calendar; a data gap
+                     fails) to execution_date by roughly
                      the split ratio -- |ln(raw_ex / raw_prev) + ln(ratio)|
                      < |ln(ratio)| / 2 -- so the split really happened in
                      the traded prices on that date (a fabricated or
@@ -63,6 +64,7 @@ from enum import Enum
 from typing import Optional, Sequence
 
 from src.price.adjustment_qc import QCResult
+from src.price.calendar import TradingCalendar
 from src.price.schema import (
     COVERAGE_SOURCE_DOCUMENTED,
     Basis,
@@ -112,12 +114,19 @@ def _result(status, reasons, n, supported, row):
     return CorporateActionAssessment(status, tuple(reasons), n, supported, row)
 
 
-def raw_jump_matches_split(raw_bars: Sequence[NormalizedBar], event: SplitEvent) -> bool:
+def raw_jump_matches_split(raw_bars: Sequence[NormalizedBar], event: SplitEvent,
+                           calendar: Optional[TradingCalendar]) -> bool:
     """Row 2 condition (b): the raw close jump into execution_date is closer
-    to the split ratio than to no move at all (half-log-ratio band)."""
+    to the split ratio than to no move at all (half-log-ratio band).
+    Requires execution_date to be a trading day and the bar before it to be
+    exactly the previous trading session (no gap); no calendar -> False."""
+    if calendar is None or not calendar.is_trading_day(event.execution_date):
+        return False
     bars = [b for b in raw_bars if b.basis is Basis.RAW]
     idx = next((i for i, b in enumerate(bars) if b.date == event.execution_date), None)
     if idx is None or idx == 0:
+        return False
+    if bars[idx - 1].date != calendar.previous_trading_day(event.execution_date):
         return False
     prev, ex = bars[idx - 1].close, bars[idx].close
     if prev <= 0 or ex <= 0 or event.ratio == 1:
@@ -138,6 +147,7 @@ def assess_corporate_actions(
     shares_evidence: SharesSplitEvidence = SharesSplitEvidence.NOT_AVAILABLE,
     cash_dividend_dates: Sequence[date] = (),
     raw_bars: Sequence[NormalizedBar] = (),
+    calendar: Optional[TradingCalendar] = None,
 ) -> CorporateActionAssessment:
     """
     Classify split-type corporate actions affecting (window_start, window_end].
@@ -189,7 +199,7 @@ def assess_corporate_actions(
             return _result(CorporateActionStatus.CONFIRMED, [], n, True, "1")
         if qc.status is PriceAdjustmentQC.CONSISTENT \
                 and shares_evidence is SharesSplitEvidence.NOT_AVAILABLE:
-            if raw_jump_matches_split(raw_bars, in_window[0]):
+            if raw_jump_matches_split(raw_bars, in_window[0], calendar):
                 return _result(CorporateActionStatus.PENDING_SEC,
                                [Reason.SPLIT_PENDING_SEC], n, True, "2")
             return _result(CorporateActionStatus.UNVERIFIED,
