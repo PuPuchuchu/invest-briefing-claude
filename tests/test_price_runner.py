@@ -27,7 +27,8 @@ def sessions(a, b):
         d += timedelta(days=1)
 
 
-def make_transport(fail_splits=False, status=200, splits_payload=None, drop_adj_last=False):
+def make_transport(fail_splits=False, status=200, splits_payload=None, drop_adj_last=False,
+                   raw_split_day=None, raw_split_mult=2):
     def transport(url, headers):
         if status != 200:
             return status, b""
@@ -44,6 +45,9 @@ def make_transport(fail_splits=False, status=200, splits_payload=None, drop_adj_
             if drop_adj_last and d == b and "adjusted=true" in url:
                 continue
             c = PRICE_MARK if d == b else f"{100 + (i % 7) * 0.5:.2f}"
+            if raw_split_day and d < raw_split_day and "adjusted=false" in url \
+                    and "/ticker/AAPL/" in url:
+                c = f"{float(c) * raw_split_mult:.2f}"
             t = int(datetime.combine(d, time(0), tzinfo=NY_TZ).timestamp() * 1000)
             rows.append({"t": t, "o": c, "h": c, "l": c, "c": c, "v": 1000})
         body = json.dumps({"status": "OK", "resultsCount": len(rows), "results": rows}).replace(f'"{PRICE_MARK}"', PRICE_MARK)
@@ -227,3 +231,49 @@ def test_bars_missing_results_count_is_provider_error(patch_provider, monkeypatc
     rc, out, doc = run(capsys, "--price-precision", "0.01")
     assert rc == 0 and doc["run"]["data_success_all"] is False
     assert all(r["error"] == "MALFORMED_RESPONSE:RESULTS_COUNT_MISSING" for r in doc["results"])
+
+
+SPLIT_DAY = date(2026, 6, 3)
+
+
+def split_payload(ticker="AAPL", frm=1, to=2):
+    return {"status": "OK", "results": [{
+        "ticker": ticker, "execution_date": SPLIT_DAY.isoformat(), "split_from": frm,
+        "split_to": to, "adjustment_type": "forward_split"}]}
+
+
+def _patch(monkeypatch, transport):
+    real_cls = m.MassivePriceProvider
+    monkeypatch.setattr(rpb, "MassivePriceProvider",
+                        lambda **a: real_cls(transport=transport, sleep=lambda s: None, **a))
+
+
+def test_r3_row2_split_unlocks_momentum_but_not_valuation(monkeypatch, capsys):
+    _patch(monkeypatch, make_transport(splits_payload=split_payload(),
+                                       raw_split_day=SPLIT_DAY))
+    rc, out, doc = run(capsys, "--price-precision", "0.01")
+    aapl, msft = doc["results"]
+    assert aapl["status"]["corporate_action"] == "PENDING_SEC"
+    assert set(momentum_statuses(aapl).values()) == {"OK"}
+    pe = [f for f in aapl["facts"] if f["metric"] == "PE_TTM"][0]
+    assert pe["calc_status"] != "OK"
+    assert "SPLIT_IN_WINDOW_PRICE_VERIFIED_SEC_PENDING" in json.dumps(aapl)
+    assert msft["status"]["corporate_action"] == "NO_EVENT_VERIFIED"
+    assert PRICE_MARK not in out
+
+
+def test_raw_jump_without_event_is_candidate(monkeypatch, capsys):
+    _patch(monkeypatch, make_transport(raw_split_day=SPLIT_DAY))
+    rc, out, doc = run(capsys, "--price-precision", "0.01")
+    aapl = doc["results"][0]
+    assert aapl["status"]["corporate_action"] == "CANDIDATE"
+    assert "OK" not in momentum_statuses(aapl).values()
+
+
+def test_r3_row2_event_without_raw_jump_stays_blocked(monkeypatch, capsys):
+    # provider reports a split, adjusted series consistent, but raw prices never jumped
+    _patch(monkeypatch, make_transport(splits_payload=split_payload()))
+    rc, out, doc = run(capsys, "--price-precision", "0.01")
+    aapl = doc["results"][0]
+    assert aapl["status"]["corporate_action"] != "PENDING_SEC"
+    assert "OK" not in momentum_statuses(aapl).values()

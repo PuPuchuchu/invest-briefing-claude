@@ -28,14 +28,36 @@ def resp(events, start=date(2024, 11, 27), end=W1, partial=False, symbols=None):
                                TS, partial, symbols)
 
 
+def raw_series(ex_day, before, after, n_before=5, n_after=5):
+    """RAW bars on consecutive weekdays: `before` closes up to the session
+    preceding ex_day, `after` closes from ex_day on."""
+    from datetime import timedelta
+    from src.price.schema import Basis, NormalizedBar
+    days, d = [], ex_day
+    while len([x for x in days if x < ex_day]) < n_before:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            days.append(d)
+    d = ex_day
+    while len([x for x in days if x >= ex_day]) < n_after:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    out = []
+    for day in sorted(days):
+        c = before if day < ex_day else after
+        out.append(NormalizedBar(day, c, c, c, c, 1, Basis.RAW, "synthetic", TS))
+    return tuple(out)
+
+
 def run(events, qc=OK, shares=SharesSplitEvidence.NOT_AVAILABLE, failed=False,
-        w0=W0, cov=COV, dividends=(), response=None):
+        w0=W0, cov=COV, dividends=(), response=None, raw=()):
     if response is None and events is not None:
         response = resp(events)
     return assess_corporate_actions(symbol="AAA", window_start=w0, window_end=W1,
                                     response=response, fetch_failed=failed, qc=qc,
                                     coverage=cov, shares_evidence=shares,
-                                    cash_dividend_dates=dividends)
+                                    cash_dividend_dates=dividends, raw_bars=raw)
 
 
 def test_row1_confirmed():
@@ -94,9 +116,12 @@ def test_unsupported_scenarios_never_ok():
             shares=SharesSplitEvidence.CONSISTENT),                       # multiple
         run([split(date(2026, 6, 3), 100, 105, ActionType.STOCK_DIVIDEND)],
             shares=SharesSplitEvidence.CONSISTENT),                       # stock div
-        run([split(date(2026, 6, 3))]),                                   # pending SEC
         run([split(date(2026, 6, 3))], shares=SharesSplitEvidence.INCONSISTENT),
         run([split(date(2026, 6, 3))], shares=SharesSplitEvidence.AMBIGUOUS),
+        run([split(date(2026, 6, 3))], shares=SharesSplitEvidence.NO_CHANGE),
+        # rows 4/5 stay blocked even with a perfect raw jump
+        run([split(date(2026, 6, 3))], shares=SharesSplitEvidence.INCONSISTENT,
+            raw=raw_series(date(2026, 6, 3), D(100), D(50))),
     ]
     for r in cases:
         assert r.status is S.UNVERIFIED and not r.supported
@@ -136,3 +161,59 @@ def test_coverage_upper_and_lower_bounds():
         assert r.status is S.UNVERIFIED and r.reasons == (Reason.COVERAGE_UNVERIFIED,)
     # inclusive boundaries: window_start == coverage start, window_end == coverage end
     assert run([], cov=cov(W0, W1)).status is S.NO_EVENT_VERIFIED
+
+
+# ---------------------------------------------------------------- R3 row 2
+EX = date(2026, 6, 3)   # Wednesday
+
+
+def test_row2_pending_sec_when_price_evidence_complete():
+    r = run([split(EX)], raw=raw_series(EX, D(100), D("50.6")))          # 2:1, +1.2% move
+    assert r.status is S.PENDING_SEC and r.r3_row == "2" and r.supported
+    assert r.reasons == (Reason.SPLIT_PENDING_SEC,)
+    assert r.momentum_eligible and not r.valuation_roll_eligible
+
+
+def test_row2_ten_for_one_and_reverse():
+    r = run([split(EX, 1, 10)], raw=raw_series(EX, D(1000), D("96")))     # NFLX-like
+    assert r.status is S.PENDING_SEC
+    r = run([split(EX, 10, 1, ActionType.REVERSE_SPLIT)],
+            raw=raw_series(EX, D(2), D("21")))
+    assert r.status is S.PENDING_SEC
+
+
+def test_row2_without_raw_jump_is_blocked():
+    cases = [
+        raw_series(EX, D(100), D(100)),         # event but no jump (fabricated)
+        raw_series(EX, D(100), D(74)),          # -26%: closer to "no split" than 2:1
+        raw_series(date(2026, 6, 4), D(100), D(50)),   # jump on another date
+        raw_series(EX, D(100), D(50), n_before=0),     # no session before ex date
+        (),                                     # no raw bars passed
+    ]
+    for raw in cases:
+        r = run([split(EX)], raw=raw)
+        assert r.status is S.UNVERIFIED and r.r3_row == "2"
+        assert r.reasons == (Reason.SPLIT_RAW_JUMP_UNVERIFIED,)
+        assert not r.momentum_eligible and not r.valuation_roll_eligible
+
+
+def test_row2_requires_qc_consistent():
+    r = run([split(EX)], qc=NA, raw=raw_series(EX, D(100), D(50)))
+    assert r.status is S.UNVERIFIED and not r.momentum_eligible
+    r = run([split(EX)], qc=BAD, raw=raw_series(EX, D(100), D(50)))
+    assert r.status is S.CANDIDATE and not r.momentum_eligible
+
+
+def test_row2_band_edges():
+    from src.price.corporate_actions import raw_jump_matches_split
+    ev = split(EX)                                   # 2:1 -> |ln 2|/2 ~= 0.3466
+    assert raw_jump_matches_split(raw_series(EX, D(100), D("70.6")), ev)   # 0.348 from 0
+    assert not raw_jump_matches_split(raw_series(EX, D(100), D("70.8")), ev)
+
+
+def test_row2_ex_date_on_first_bar_is_not_verified():
+    from src.price.corporate_actions import raw_jump_matches_split
+    from src.price.schema import Basis, NormalizedBar
+    b = [NormalizedBar(d, c, c, c, c, 1, Basis.RAW, "synthetic", TS)
+         for d, c in ((EX, D(50)), (date(2026, 6, 4), D(100)))]
+    assert not raw_jump_matches_split(b, split(EX))
