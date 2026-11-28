@@ -40,7 +40,7 @@ Absent inputs -> MISSING; integrity violations -> INVALID.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
 
@@ -273,3 +273,306 @@ def compute_pe_ttm(*, prices: Sequence[ClassPriceInput],
                             (Reason.NI_TTM_NONPOSITIVE,) + warnings)
     return MetricResult(METRIC, CalcStatus.OK, market_cap / ni_ttm.value,
                         Interpretability.MEANINGFUL, warnings)
+
+
+# ===========================================================================
+# EPS path (P4 G6, GPT-approved conditional scope 2026-11-28)
+#
+#   PE_TTM = latest-session raw close / sum of FOUR directly reported
+#            3-month diluted EPS values (consecutive, non-overlapping)
+#            -- or, only when fiscal Q4 is not reported as a 3-month value,
+#            the directly reported FY diluted EPS whose period is EXACTLY
+#            the TTM target period (method FY_DIRECT).
+#   PE_FY  = latest-session raw close / latest directly reported FY
+#            diluted EPS (10-K / 10-K/A).
+#
+# Never reconstructed: no FY - 9M, no 9M - 6M, no NI / shares, no share
+# estimate. Missing fiscal Q4 -> MISSING / Q4_EPS_NOT_REPORTED.
+#
+# Period choice (PIT): only facts filed strictly before the price session
+# (same rule as NI_TTM: P4_FILED_STRICTLY_BEFORE_PRICE_DATE). For each
+# (start, end) the latest such filing is used (amendments and split
+# restatements included); equal latest filing date with different values
+# -> INVALID / EPS_VALUE_CONFLICT.
+#
+# Split basis (both metrics): the price is today's raw close, so every EPS
+# value used must be on the post-split basis of every split executed after
+# it was filed. Evidence = provider split events (they define the PRICE
+# basis) plus SEC cover-page shares outstanding (SEC-internal check):
+#   * split evidence for the interval not verified -> EPS_SPLIT_BASIS_UNVERIFIED
+#   * a split executed after an EPS value's filing -> EPS_SPLIT_BASIS_UNRESTATED
+#   * SEC shares jump >= 1.5x (or <= 1/1.5x) between filings with no split
+#     event in between -> EPS_SPLIT_BASIS_MISMATCH
+#   * SEC shares not available -> limitation SEC_SPLIT_EVIDENCE_UNAVAILABLE
+# No manual split-ratio adjustment is ever applied.
+# ===========================================================================
+
+EPS_CONCEPT_DILUTED = "EarningsPerShareDiluted"
+EPS_UNIT = "USD/shares"
+FY_DAYS = (350, 380)
+SPLIT_SHARE_JUMP = Decimal("1.5")
+METRIC_PE_TTM, METRIC_PE_FY = "PE_TTM", "PE_FY"
+METRIC_EPS_TTM, METRIC_EPS_FY = "EPS_TTM", "EPS_FY"
+_FY_FORMS = frozenset({"10-K", "10-K/A"})
+
+
+@dataclass(frozen=True)
+class EpsFact:
+    start: date
+    end: date
+    value: Decimal
+    filed: date
+    accession: str
+    form: str
+    unit: str = EPS_UNIT
+    concept: str = EPS_CONCEPT_DILUTED
+    fy: Optional[int] = None
+    fp: Optional[str] = None
+
+    @property
+    def days(self) -> int:
+        return (self.end - self.start).days + 1
+
+
+@dataclass(frozen=True)
+class SharesFact:
+    """SEC cover-page shares outstanding (dei), instant value."""
+    as_of: date
+    value: Decimal
+    filed: date
+
+
+@dataclass(frozen=True)
+class SplitBasisEvidence:
+    """Price-basis split events for the symbol, from the price provider."""
+    verified_from: Optional[date]     # events are known complete in (from, to]
+    verified_to: Optional[date]
+    execution_dates: tuple[date, ...] = ()
+
+
+@dataclass(frozen=True)
+class EpsSelection:
+    status: CalcStatus
+    value: Optional[Decimal]
+    facts: tuple[EpsFact, ...]
+    method: Optional[str]
+    reasons: tuple[str, ...]
+
+
+def _sel_fail(status: CalcStatus, *reasons: str) -> EpsSelection:
+    return EpsSelection(status, None, (), None, tuple(reasons))
+
+
+def _validate_eps_facts(facts: Sequence[EpsFact]) -> Optional[str]:
+    for f in facts:
+        if f.concept != EPS_CONCEPT_DILUTED:
+            return Reason.EPS_CONCEPT_MISMATCH
+        if f.unit != EPS_UNIT:
+            return Reason.EPS_UNIT_MISMATCH
+        if isinstance(f.value, bool) or not isinstance(f.value, Decimal) \
+                or not f.value.is_finite() or f.end < f.start:
+            return Reason.EPS_SOURCE_MALFORMED
+    return None
+
+
+def _pit_latest(facts: Sequence[EpsFact], session: date):
+    """(start, end) -> latest fact filed strictly before session, or a conflict."""
+    by: dict[tuple[date, date], list[EpsFact]] = {}
+    for f in facts:
+        if f.filed < session:
+            by.setdefault((f.start, f.end), []).append(f)
+    out: dict[tuple[date, date], EpsFact] = {}
+    for k, fs in by.items():
+        last = max(f.filed for f in fs)
+        latest = [f for f in fs if f.filed == last]
+        if len({f.value for f in latest}) > 1:
+            return None
+        out[k] = sorted(latest, key=lambda f: f.accession)[-1]
+    return out
+
+
+def _is_ytd(days: int) -> bool:
+    """Six- or nine-month year-to-date span (never used, never a target)."""
+    return 170 <= days <= 200 or 255 <= days <= 290
+
+
+def select_eps_fy(facts: Sequence[EpsFact], session: date) -> EpsSelection:
+    bad = _validate_eps_facts(facts)
+    if bad:
+        return _sel_fail(CalcStatus.INVALID, bad)
+    latest = _pit_latest(facts, session)
+    if latest is None:
+        return _sel_fail(CalcStatus.INVALID, Reason.EPS_VALUE_CONFLICT)
+    fys = [f for f in latest.values()
+           if f.form in _FY_FORMS and FY_DAYS[0] <= f.days <= FY_DAYS[1]]
+    if not fys:
+        return _sel_fail(CalcStatus.MISSING, Reason.EPS_NOT_REPORTED)
+    fy = max(fys, key=lambda f: f.end)
+    return EpsSelection(CalcStatus.OK, fy.value, (fy,), "FY_DIRECT", ())
+
+
+def select_eps_ttm(facts: Sequence[EpsFact], session: date) -> EpsSelection:
+    bad = _validate_eps_facts(facts)
+    if bad:
+        return _sel_fail(CalcStatus.INVALID, bad)
+    latest = _pit_latest(facts, session)
+    if latest is None:
+        return _sel_fail(CalcStatus.INVALID, Reason.EPS_VALUE_CONFLICT)
+    if not latest:
+        return _sel_fail(CalcStatus.MISSING, Reason.EPS_NOT_REPORTED)
+    quarters = {k: f for k, f in latest.items() if QUARTER_DAYS[0] <= f.days <= QUARTER_DAYS[1]}
+    fys = {k: f for k, f in latest.items()
+           if f.form in _FY_FORMS and FY_DAYS[0] <= f.days <= FY_DAYS[1]}
+    # latest reported period end: 3-month values, 10-K FY values, and any
+    # non-standard-length period (so it is reported as LENGTH_INVALID rather
+    # than silently skipped); H / 9M year-to-date values never set the target
+    reported = [f for f in latest.values() if not _is_ytd(f.days)
+                and not (FY_DAYS[0] <= f.days <= FY_DAYS[1] and f.form not in _FY_FORMS)]
+    if not reported:
+        return _sel_fail(CalcStatus.MISSING, Reason.EPS_NOT_REPORTED)
+    target_end = max(f.end for f in reported)
+    fy_ends = {f.end for f in fys.values()}
+
+    chain: list[EpsFact] = []
+    need_end = target_end
+    failure: Optional[str] = None
+    while len(chain) < 4:
+        cands = [f for f in quarters.values() if f.end == need_end]
+        if len(cands) > 1:
+            failure = Reason.EPS_PERIOD_OVERLAP
+            break
+        if not cands:
+            others = [f for (s, e), f in latest.items()
+                      if e == need_end and not (QUARTER_DAYS[0] <= f.days <= QUARTER_DAYS[1])
+                      and not _is_ytd(f.days)
+                      and not (FY_DAYS[0] <= f.days <= FY_DAYS[1])]
+            if others:
+                failure = Reason.EPS_PERIOD_LENGTH_INVALID
+            elif need_end in fy_ends:
+                failure = Reason.Q4_EPS_NOT_REPORTED
+            elif any(f.start <= need_end < f.end for f in quarters.values()):
+                failure = Reason.EPS_PERIOD_OVERLAP
+            else:
+                failure = Reason.EPS_PERIOD_DISCONTINUITY
+            break
+        q = cands[0]
+        chain.append(q)
+        need_end = q.start - timedelta(days=1)
+
+    if failure is None:
+        chain.reverse()
+        total = sum((f.value for f in chain), Decimal(0))
+        return EpsSelection(CalcStatus.OK, total, tuple(chain), "DIRECT_4Q", ())
+
+    # FY_DIRECT fallback: only when fiscal Q4 is not reported as 3 months and
+    # the latest 10-K FY period IS the TTM target period exactly.
+    if failure == Reason.Q4_EPS_NOT_REPORTED:
+        exact = [f for f in fys.values() if f.end == target_end]
+        if len(exact) == 1 and _fy_matches_quarters(exact[0], quarters.values()):
+            fy = exact[0]
+            return EpsSelection(CalcStatus.OK, fy.value, (fy,), "FY_DIRECT",
+                                (Reason.EPS_TTM_FROM_FY_DIRECT,))
+        return _sel_fail(CalcStatus.MISSING, Reason.Q4_EPS_NOT_REPORTED)
+    return _sel_fail(CalcStatus.INVALID, failure)
+
+
+def _fy_matches_quarters(fy: EpsFact, quarters) -> bool:
+    """The FY period must be exactly the TTM period implied by its own
+    reported quarters: Q1 starts on FY start, Q1-Q3 are contiguous, and the
+    remaining fiscal Q4 span (Q3 end -> FY end) is a plausible quarter.
+    A one-day misalignment, or no reported quarters, blocks the fallback."""
+    qs = {q.start: q for q in quarters if fy.start <= q.start and q.end < fy.end}
+    chain, cur = [], fy.start
+    while cur in qs and len(chain) < 3:
+        chain.append(qs[cur])
+        cur = qs[cur].end + timedelta(days=1)
+    if len(chain) != 3:
+        return False
+    q4_days = (fy.end - chain[-1].end).days
+    return QUARTER_DAYS[0] <= q4_days <= QUARTER_DAYS[1]
+
+
+def check_split_basis(used: Sequence[EpsFact], session: date,
+                      evidence: Optional[SplitBasisEvidence],
+                      sec_shares: Sequence[SharesFact]) -> tuple[Optional[str], tuple[str, ...]]:
+    """(blocking reason or None, non-blocking limitations)."""
+    if not used:
+        return None, ()
+    earliest = min(f.filed for f in used)
+    if evidence is None or evidence.verified_from is None or evidence.verified_to is None \
+            or evidence.verified_from > earliest or evidence.verified_to < session:
+        return Reason.EPS_SPLIT_BASIS_UNVERIFIED, ()
+    events = [d for d in evidence.execution_dates if earliest < d <= session]
+    for d in events:
+        if any(f.filed < d for f in used):
+            return Reason.EPS_SPLIT_BASIS_UNRESTATED, ()
+    shares = sorted((s for s in sec_shares if s.filed < session and s.value > 0),
+                    key=lambda s: (s.as_of, s.filed))
+    if len(shares) < 2:
+        return None, (Reason.SEC_SPLIT_EVIDENCE_UNAVAILABLE,)
+    for a, b in zip(shares, shares[1:]):
+        if b.as_of <= earliest:
+            continue
+        ratio = b.value / a.value
+        if ratio >= SPLIT_SHARE_JUMP or ratio <= 1 / SPLIT_SHARE_JUMP:
+            if not any(a.as_of < d <= b.as_of for d in evidence.execution_dates):
+                return Reason.EPS_SPLIT_BASIS_MISMATCH, ()
+    return None, ()
+
+
+def _evidence(sel: EpsSelection) -> dict:
+    return {
+        "method": sel.method,
+        "concept": EPS_CONCEPT_DILUTED,
+        "unit": EPS_UNIT,
+        "periods": [{"start": f.start.isoformat(), "end": f.end.isoformat(),
+                     "accession": f.accession, "filed": f.filed.isoformat(),
+                     "form": f.form, "fy": f.fy, "fp": f.fp} for f in sel.facts],
+    }
+
+
+def compute_pe_eps(*, raw_close: Optional[Decimal], raw_status: RawPriceStatus,
+                   price_session: date, facts: Optional[Sequence[EpsFact]],
+                   split_evidence: Optional[SplitBasisEvidence],
+                   sec_shares: Sequence[SharesFact] = (),
+                   source_reason: Optional[str] = None) -> dict[str, MetricResult]:
+    """PE_TTM, PE_FY, EPS_TTM, EPS_FY for one ticker (EPS path)."""
+    names = ((METRIC_EPS_TTM, METRIC_PE_TTM, select_eps_ttm, Reason.EPS_NONPOSITIVE_TTM),
+             (METRIC_EPS_FY, METRIC_PE_FY, select_eps_fy, Reason.EPS_NONPOSITIVE_FY))
+    out: dict[str, MetricResult] = {}
+    if facts is None:
+        reason = source_reason or Reason.EPS_SOURCE_MISSING
+        status = CalcStatus.INVALID if reason == Reason.EPS_SOURCE_MALFORMED else CalcStatus.MISSING
+        for eps_name, pe_name, _, _ in names:
+            out[eps_name] = MetricResult(eps_name, status, reasons=(reason,))
+            out[pe_name] = MetricResult(pe_name, status, reasons=(reason,))
+        return out
+    for eps_name, pe_name, select, nonpos in names:
+        sel = select(facts, price_session)
+        if sel.status is not CalcStatus.OK or sel.value is None:
+            out[eps_name] = MetricResult(eps_name, sel.status, reasons=sel.reasons)
+            out[pe_name] = MetricResult(pe_name, sel.status, reasons=sel.reasons)
+            continue
+        ev = _evidence(sel)
+        notes = sel.reasons + (Reason.EPS_ROUNDED_TO_CENTS,)
+        blocking, lims = check_split_basis(sel.facts, price_session, split_evidence, sec_shares)
+        notes += lims
+        if blocking:
+            out[eps_name] = MetricResult(eps_name, CalcStatus.INVALID, reasons=(blocking,),
+                                         evidence=ev)
+            out[pe_name] = MetricResult(pe_name, CalcStatus.INVALID, reasons=(blocking,),
+                                        evidence=ev)
+            continue
+        out[eps_name] = MetricResult(eps_name, CalcStatus.OK, sel.value,
+                                     Interpretability.MEANINGFUL, notes, evidence=ev)
+        if raw_status is not RawPriceStatus.OK or raw_close is None or raw_close <= 0:
+            out[pe_name] = MetricResult(pe_name, CalcStatus.MISSING,
+                                        reasons=(Reason.RAW_PRICE_NOT_OK,), evidence=ev)
+        elif sel.value <= 0:
+            out[pe_name] = MetricResult(pe_name, CalcStatus.OK, None,
+                                        Interpretability.NOT_MEANINGFUL,
+                                        (nonpos,) + notes, evidence=ev)
+        else:
+            out[pe_name] = MetricResult(pe_name, CalcStatus.OK, raw_close / sel.value,
+                                        Interpretability.MEANINGFUL, notes, evidence=ev)
+    return out
