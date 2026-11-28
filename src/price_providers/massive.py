@@ -31,9 +31,9 @@ Response contract per page (docs read 2026-11-28; anything else fails
 closed, so an API error or inconsistent page can never look like
 "no split events"):
   * bars   -- status OK or DELAYED; `resultsCount` ("total number of
-              results for this request", integer) if present must equal
-              len(results); `results` may be omitted only together with an
-              explicit resultsCount == 0.
+              results for this request", documented integer field) is
+              REQUIRED and must equal len(results); `results` may be
+              omitted only together with resultsCount == 0.
   * splits -- status OK (documented enum); `results` is mandatory (the
               endpoint documents no count field).
   * Any count field present (resultsCount, count, queryCount) must be a
@@ -224,7 +224,8 @@ class MassivePriceProvider(PriceDataProvider):
 
     @staticmethod
     def _page_rows(data: dict, statuses: tuple[str, ...],
-                   allow_omitted_results: bool) -> list:
+                   allow_omitted_results: bool,
+                   require_results_count: bool = False) -> list:
         if data.get("status") not in statuses:
             raise ProviderError(MALFORMED_RESPONSE + ":STATUS")
         counts = {}
@@ -250,10 +251,13 @@ class MassivePriceProvider(PriceDataProvider):
         for k in ("resultsCount", "count"):
             if k in counts and counts[k] != len(res):
                 raise ProviderError(MALFORMED_RESPONSE + ":COUNT_MISMATCH")
+        if require_results_count and "resultsCount" not in counts:
+            raise ProviderError(MALFORMED_RESPONSE + ":RESULTS_COUNT_MISSING")
         return res
 
     def _paged(self, first_url: str, *, statuses: tuple[str, ...],
-               allow_omitted_results: bool) -> tuple[list[dict], bool]:
+               allow_omitted_results: bool,
+               require_results_count: bool = False) -> tuple[list[dict], bool]:
         """All `results` across pages. Returns (rows, complete)."""
         rows: list[dict] = []
         url: Optional[str] = first_url
@@ -263,7 +267,8 @@ class MassivePriceProvider(PriceDataProvider):
                 return rows, False
             data = self._get_json(url)
             pages += 1
-            rows.extend(self._page_rows(data, statuses, allow_omitted_results))
+            rows.extend(self._page_rows(data, statuses, allow_omitted_results,
+                                        require_results_count))
             nxt = data.get("next_url")
             if nxt is not None and not isinstance(nxt, str):
                 raise ProviderError(MALFORMED_RESPONSE)
@@ -280,7 +285,8 @@ class MassivePriceProvider(PriceDataProvider):
                f"{start.isoformat()}/{end.isoformat()}"
                f"?adjusted={adjusted}&sort=asc&limit=50000")
         rows, complete = self._paged(url, statuses=BAR_STATUSES,
-                                     allow_omitted_results=True)
+                                     allow_omitted_results=True,
+                                     require_results_count=True)
         retrieved = self._clock()
         bars = []
         try:

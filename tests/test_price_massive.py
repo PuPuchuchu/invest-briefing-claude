@@ -57,7 +57,7 @@ D1, D2 = date(2026, 11, 20), date(2026, 11, 23)
 
 def test_bars_parse_decimal_date_basis_and_query():
     rows = [bar_row(D1, "100.25"), bar_row(D2, "101.5")]
-    p, t, _ = provider([(lambda u: "/v2/aggs/" in u, 200, {"status": "OK", "results": rows})])
+    p, t, _ = provider([(lambda u: "/v2/aggs/" in u, 200, {"status": "OK", "resultsCount": 2, "results": rows})])
     r = p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
     assert [b.date for b in r.bars] == [D1, D2]
     assert r.bars[0].close == D("100.25") and isinstance(r.bars[0].close, D)
@@ -75,13 +75,13 @@ def test_bar_date_uses_eastern_time_across_dst():
 
 def test_pagination_complete_and_foreign_host_rejected():
     page2 = "https://api.massive.com/v2/aggs/next?cursor=abc"
-    routes = [(lambda u: "cursor=abc" in u, 200, {"status": "OK", "results": [bar_row(D2)]}),
+    routes = [(lambda u: "cursor=abc" in u, 200, {"status": "OK", "resultsCount": 1, "results": [bar_row(D2)]}),
               (lambda u: "/v2/aggs/ticker" in u, 200,
-               {"status": "OK", "results": [bar_row(D1)], "next_url": page2})]
+               {"status": "OK", "resultsCount": 1, "results": [bar_row(D1)], "next_url": page2})]
     p, t, _ = provider(routes)
     r = p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
     assert len(r.bars) == 2 and not r.is_partial
-    bad = [(lambda u: True, 200, {"status": "OK", "results": [], "next_url": "https://evil.example/x"})]
+    bad = [(lambda u: True, 200, {"status": "OK", "resultsCount": 0, "results": [], "next_url": "https://evil.example/x"})]
     p, _, _ = provider(bad)
     with pytest.raises(ProviderError) as e:
         p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
@@ -90,7 +90,7 @@ def test_pagination_complete_and_foreign_host_rejected():
 
 def test_too_many_pages_marks_partial():
     loop = "https://api.massive.com/v2/aggs/loop"
-    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [], "next_url": loop})])
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "resultsCount": 0, "results": [], "next_url": loop})])
     assert p.get_daily_bars("AAPL", D1, D2, Basis.RAW).is_partial
 
 
@@ -115,7 +115,7 @@ def test_malformed_payloads():
 
 
 def test_rate_limit_spacing():
-    rows = {"status": "OK", "results": [bar_row(D1)]}
+    rows = {"status": "OK", "resultsCount": 1, "results": [bar_row(D1)]}
     p, _, sleeps = provider([(lambda u: True, 200, rows)])
     for _ in range(3):
         p.get_daily_bars("AAPL", D1, D1, Basis.RAW)
@@ -123,7 +123,7 @@ def test_rate_limit_spacing():
 
 
 def test_auth_modes(monkeypatch):
-    rows = {"status": "OK", "results": [bar_row(D1)]}
+    rows = {"status": "OK", "resultsCount": 1, "results": [bar_row(D1)]}
     p, t, _ = provider([(lambda u: True, 200, rows)])
     p.get_daily_bars("AAPL", D1, D1, Basis.RAW)
     assert "Authorization" not in t.calls[0][1]                  # PROXY: no credential
@@ -307,3 +307,59 @@ def test_real_transport_never_forwards_key_on_redirect(code):
         sa.shutdown(); sb.shutdown()
     assert status == code and body == b""
     assert seen == []                                # B never contacted
+
+
+# ------------------------------------------- B2 final: bars resultsCount required
+@pytest.mark.parametrize("payload,reason", [
+    ({"status": "OK", "results": []}, "RESULTS_COUNT_MISSING"),
+    ({"status": "OK", "results": [bar_row(D1)]}, "RESULTS_COUNT_MISSING"),
+    ({"status": "OK", "resultsCount": 1, "results": []}, "COUNT_MISMATCH"),
+    ({"status": "OK", "resultsCount": 0, "results": [bar_row(D1)]}, "COUNT_MISMATCH"),
+    ({"status": "OK", "resultsCount": True, "results": [bar_row(D1)]}, "COUNT_TYPE"),
+    ({"status": "OK", "resultsCount": "1", "results": [bar_row(D1)]}, "COUNT_TYPE"),
+    ({"status": "OK", "resultsCount": -1, "results": []}, "COUNT_TYPE"),
+    ({"status": "OK"}, "RESULTS_MISSING"),
+])
+def test_bars_results_count_contract(payload, reason):
+    p, _, _ = provider([(lambda u: True, 200, payload)])
+    with pytest.raises(ProviderError) as e:
+        p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+    assert e.value.reason == "MALFORMED_RESPONSE:" + reason
+
+
+@pytest.mark.parametrize("payload,n", [
+    ({"status": "OK", "resultsCount": 0, "results": []}, 0),
+    ({"status": "OK", "resultsCount": 0}, 0),
+    ({"status": "OK", "resultsCount": 1, "results": [bar_row(D1)]}, 1),
+])
+def test_bars_results_count_accepted(payload, n):
+    p, _, _ = provider([(lambda u: True, 200, payload)])
+    assert len(p.get_daily_bars("AAPL", D1, D2, Basis.RAW).bars) == n
+
+
+def test_bars_second_page_count_mismatch_fails_whole_response():
+    page2 = "https://api.massive.com/v2/aggs/next?cursor=abc"
+    routes = [(lambda u: "cursor=abc" in u, 200,
+               {"status": "OK", "resultsCount": 2, "results": [bar_row(D2)]}),
+              (lambda u: True, 200, {"status": "OK", "resultsCount": 1,
+                                     "results": [bar_row(D1)], "next_url": page2})]
+    p, _, _ = provider(routes)
+    with pytest.raises(ProviderError) as e:
+        p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+    assert e.value.reason == "MALFORMED_RESPONSE:COUNT_MISMATCH"
+
+
+def test_bars_second_page_missing_count_fails_whole_response():
+    page2 = "https://api.massive.com/v2/aggs/next?cursor=abc"
+    routes = [(lambda u: "cursor=abc" in u, 200, {"status": "OK", "results": [bar_row(D2)]}),
+              (lambda u: True, 200, {"status": "OK", "resultsCount": 1,
+                                     "results": [bar_row(D1)], "next_url": page2})]
+    p, _, _ = provider(routes)
+    with pytest.raises(ProviderError) as e:
+        p.get_daily_bars("AAPL", D1, D2, Basis.RAW)
+    assert e.value.reason == "MALFORMED_RESPONSE:RESULTS_COUNT_MISSING"
+
+
+def test_splits_do_not_require_count_field():
+    p, _, _ = provider([(lambda u: True, 200, {"status": "OK", "results": [SPLIT_ROW]})])
+    assert len(p.get_split_events(date(2026, 1, 1), D2, ["AAPL"]).events) == 1

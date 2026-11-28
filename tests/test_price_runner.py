@@ -46,7 +46,7 @@ def make_transport(fail_splits=False, status=200, splits_payload=None, drop_adj_
             c = PRICE_MARK if d == b else f"{100 + (i % 7) * 0.5:.2f}"
             t = int(datetime.combine(d, time(0), tzinfo=NY_TZ).timestamp() * 1000)
             rows.append({"t": t, "o": c, "h": c, "l": c, "c": c, "v": 1000})
-        body = json.dumps({"status": "OK", "results": rows}).replace(f'"{PRICE_MARK}"', PRICE_MARK)
+        body = json.dumps({"status": "OK", "resultsCount": len(rows), "results": rows}).replace(f'"{PRICE_MARK}"', PRICE_MARK)
         body = re.sub(r'"(\d+\.\d+)"', r"\1", body)
         return 200, body.encode()
     return transport
@@ -190,3 +190,18 @@ def test_adjusted_partial_does_not_mark_raw_stale(patch_provider, monkeypatch, c
     assert st["raw_price"] == "OK" and st["adjusted_price"] != "OK"
     assert set(momentum_statuses(doc["results"][0]).values()) <= {"MISSING", "INVALID"}
     assert "BARS_PARTIAL_RESPONSE" in out
+
+
+def test_bars_missing_results_count_is_provider_error(patch_provider, monkeypatch, capsys):
+    import re as _re
+    real = make_transport()
+
+    def no_count(url, headers):
+        st, body = real(url, headers)
+        return st, _re.sub(rb'"resultsCount": \d+, ', b"", body)
+    real_cls = m.MassivePriceProvider
+    monkeypatch.setattr(rpb, "MassivePriceProvider",
+                        lambda **a: real_cls(transport=no_count, sleep=lambda s: None, **a))
+    rc, out, doc = run(capsys, "--price-precision", "0.01")
+    assert rc == 0 and doc["run"]["data_success_all"] is False
+    assert all(r["error"] == "MALFORMED_RESPONSE:RESULTS_COUNT_MISSING" for r in doc["results"])
